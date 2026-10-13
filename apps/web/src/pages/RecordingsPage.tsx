@@ -3,12 +3,40 @@ import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { EmptyState, ErrorState, LoadingState } from "../components/States";
 
+const CAPTURE_LABEL: Record<string, string> = {
+  bekleniyor: "Bekleniyor",
+  kaydediliyor: "Kaydediliyor",
+  bitti: "Bitti",
+  bulunamadi: "Yayın bulunamadı",
+  engellendi: "Erişim engellendi",
+  iptal: "İptal",
+  hata: "Hata",
+};
+
+function statusBadge(r: Record<string, unknown>) {
+  const capture = r.capture_status ? String(r.capture_status) : "";
+  const label = capture
+    ? (CAPTURE_LABEL[capture] ?? capture)
+    : String(r.status);
+  const cls =
+    capture === "engellendi" ||
+    capture === "hata" ||
+    r.status === "failed"
+      ? "badge err"
+      : capture === "bitti" || r.status === "complete"
+        ? "badge ok"
+        : "badge warn";
+  return <span className={cls}>{label}</span>;
+}
+
 export function RecordingsPage() {
   const [rows, setRows] = useState<Array<Record<string, unknown>>>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [ok, setOk] = useState<string | null>(null);
+  const [limitation, setLimitation] = useState<string | null>(null);
+  const [showUpload, setShowUpload] = useState(false);
 
   async function refresh() {
     const data = await api.recordings();
@@ -19,17 +47,26 @@ export function RecordingsPage() {
     refresh()
       .catch((e: Error) => setError(e.message))
       .finally(() => setLoading(false));
+    const t = setInterval(() => {
+      void refresh().catch(() => undefined);
+    }, 8000);
+    return () => clearInterval(t);
   }, []);
 
-  async function onSubmit(e: FormEvent<HTMLFormElement>) {
+  async function onLiveSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setBusy(true);
     setError(null);
     setOk(null);
     const fd = new FormData(e.currentTarget);
     try {
-      const res = await api.upload(fd);
-      setOk(`Yüklendi · ${res.recordingId.slice(0, 8)}…`);
+      const res = await api.startLive({
+        input: String(fd.get("input") ?? ""),
+        displayName: String(fd.get("displayName") ?? "") || undefined,
+        notes: String(fd.get("notes") ?? "") || undefined,
+      });
+      setOk(`Canlı oturum açıldı · ${res.recordingId.slice(0, 8)}…`);
+      setLimitation(res.policy?.limitationTr ?? null);
       e.currentTarget.reset();
       await refresh();
     } catch (err) {
@@ -39,21 +76,97 @@ export function RecordingsPage() {
     }
   }
 
+  async function onUploadSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    setOk(null);
+    const fd = new FormData(e.currentTarget);
+    try {
+      const res = await api.upload(fd);
+      setOk(`MP4 yüklendi · ${res.recordingId.slice(0, 8)}…`);
+      e.currentTarget.reset();
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onCancel(id: string) {
+    try {
+      await api.cancelLive(id);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   return (
     <div className="page">
       <div className="page-head">
         <div>
           <h1>Kayıtlar</h1>
           <p className="lead">
-            Satıcıya ait MP4 canlı kaydını yükleyin. Süre ve çözünürlük otomatik
-            algılanır; ses/kare çıkarma kuyruğa alınır.
+            Satıcının canlı yayınını bağlantı veya @kullanıcı ile ekleyin. Yayın
+            çözülebilirse yerelde kaydedilir; bitince analiz kuyruğuna alınır.
           </p>
         </div>
       </div>
 
       <section className="hero-upload">
-        <h2>MP4 yükle</h2>
-        <form className="row" onSubmit={onSubmit}>
+        <h2>Canlı yayın ekle</h2>
+        <p className="muted" style={{ marginTop: 0 }}>
+          Instagram Live URL’si, profil linki veya <code>@kullanici</code>. Giriş
+          veya özel API kullanılmaz — yalnızca herkese açık akışlar.
+        </p>
+        <form className="row" onSubmit={onLiveSubmit}>
+          <label style={{ gridColumn: "1 / -1" }}>
+            Canlı link veya @kullanıcı
+            <input
+              name="input"
+              placeholder="https://www.instagram.com/satici/live/  veya  @satici"
+              required
+            />
+          </label>
+          <label>
+            Görünen ad (ops.)
+            <input name="displayName" placeholder="Satıcı adı" />
+          </label>
+          <label>
+            Not (ops.)
+            <input name="notes" placeholder="opsiyonel" />
+          </label>
+          <button type="submit" disabled={busy}>
+            {busy ? "Ekleniyor…" : "Canlı yayın ekle"}
+          </button>
+        </form>
+        {ok && (
+          <p style={{ marginBottom: 0 }}>
+            <span className="badge ok">{ok}</span>
+          </p>
+        )}
+        {limitation && (
+          <p className="muted" style={{ marginBottom: 0, fontSize: "0.9rem" }}>
+            {limitation}
+          </p>
+        )}
+      </section>
+
+      <details
+        className="panel"
+        open={showUpload}
+        onToggle={(e) => setShowUpload((e.target as HTMLDetailsElement).open)}
+      >
+        <summary style={{ cursor: "pointer", fontWeight: 600 }}>
+          Gelişmiş · Elle MP4 yükle
+        </summary>
+        <p className="muted">
+          Zaten elinizde olan satıcıya ait MP4 kaydı için. Birincil yol canlı
+          yayındır.
+        </p>
+        <form className="row" onSubmit={onUploadSubmit}>
           <label>
             Dosya (.mp4)
             <input name="file" type="file" accept="video/mp4,.mp4" required />
@@ -79,16 +192,11 @@ export function RecordingsPage() {
             Not
             <input name="notes" placeholder="opsiyonel" />
           </label>
-          <button type="submit" disabled={busy}>
-            {busy ? "Yükleniyor…" : "Yükle ve işle"}
+          <button className="secondary" type="submit" disabled={busy}>
+            {busy ? "Yükleniyor…" : "MP4 yükle"}
           </button>
         </form>
-        {ok && (
-          <p style={{ marginBottom: 0 }}>
-            <span className="badge ok">{ok}</span>
-          </p>
-        )}
-      </section>
+      </details>
 
       {error && <ErrorState message={error} />}
       {loading && <LoadingState label="Kayıtlar yükleniyor…" />}
@@ -99,17 +207,17 @@ export function RecordingsPage() {
           {!rows.length ? (
             <EmptyState
               title="Henüz kayıt yok"
-              hint="Yukarıdaki formdan bir MP4 yükleyerek başlayın."
+              hint="Yukarıdan bir canlı yayın ekleyerek başlayın."
             />
           ) : (
             <table>
               <thead>
                 <tr>
                   <th>Satıcı</th>
-                  <th>Dosya</th>
+                  <th>Kaynak</th>
                   <th>Durum</th>
-                  <th>Süre</th>
-                  <th>Çözünürlük</th>
+                  <th>Boyut</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
@@ -118,29 +226,41 @@ export function RecordingsPage() {
                     <td>@{String(r.instagram_username)}</td>
                     <td>
                       <Link to={`/recordings/${r.id}`}>
-                        {String(r.original_filename)}
+                        {String(r.source_type) === "live"
+                          ? "Canlı"
+                          : String(r.original_filename)}
                       </Link>
+                      {r.source_url ? (
+                        <div className="muted" style={{ fontSize: "0.8rem" }}>
+                          {String(r.source_url)}
+                        </div>
+                      ) : null}
+                      {r.last_probe_detail || r.capture_error ? (
+                        <div className="muted" style={{ fontSize: "0.8rem" }}>
+                          {String(r.capture_error || r.last_probe_detail)}
+                        </div>
+                      ) : null}
+                    </td>
+                    <td>{statusBadge(r)}</td>
+                    <td>
+                      {r.capture_bytes != null && Number(r.capture_bytes) > 0
+                        ? `${(Number(r.capture_bytes) / (1024 * 1024)).toFixed(1)} MB`
+                        : r.file_size_bytes != null
+                          ? `${(Number(r.file_size_bytes) / (1024 * 1024)).toFixed(1)} MB`
+                          : "—"}
                     </td>
                     <td>
-                      <span
-                        className={
-                          r.status === "failed"
-                            ? "badge err"
-                            : r.status === "complete"
-                              ? "badge ok"
-                              : "badge warn"
-                        }
-                      >
-                        {String(r.status)}
-                      </span>
-                    </td>
-                    <td>
-                      {r.duration_seconds != null
-                        ? `${Number(r.duration_seconds).toFixed(1)}s`
-                        : "—"}
-                    </td>
-                    <td>
-                      {r.width && r.height ? `${r.width}×${r.height}` : "—"}
+                      {String(r.source_type) === "live" &&
+                      (r.status === "awaiting_live" ||
+                        r.status === "recording") ? (
+                        <button
+                          type="button"
+                          className="secondary"
+                          onClick={() => void onCancel(String(r.id))}
+                        >
+                          İptal
+                        </button>
+                      ) : null}
                     </td>
                   </tr>
                 ))}

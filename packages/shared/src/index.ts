@@ -27,6 +27,8 @@ export type JobStatus =
   | "cancelled";
 
 export type RecordingStatus =
+  | "awaiting_live"
+  | "recording"
   | "uploaded"
   | "probing"
   | "ready"
@@ -35,7 +37,8 @@ export type RecordingStatus =
   | "transcribing"
   | "analyzing"
   | "complete"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export interface MediaProbe {
   durationSeconds: number;
@@ -84,3 +87,9 @@ export {
   type AuctionEventType,
   type ParsedAuctionSignal,
 } from "./auction.ts";
+export {
+  parseLiveSourceInput,
+  CAPTURE_STATUS_TR,
+  type LiveSourceKind,
+  type ParsedLiveSource,
+} from "./live-source.ts";

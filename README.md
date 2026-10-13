@@ -2,7 +2,8 @@
 
 Instagram Live Auction Intelligence MVP — local-first processing for seller-owned live recordings.
 
-**Hard rules:** no paid API calls by default, no Instagram login / private API / unauthorized capture.
+**Hard rules:** no paid API calls by default, no Instagram login / private API /
+credential stuffing / anti-bot bypass. Live capture uses public yt-dlp/ffmpeg only.
 
 ## Stack
 
@@ -69,9 +70,25 @@ FORCE_MOCK_ASR=1 bun run --filter @mezatizle/api benchmark
 | `HYBRID` | Local models preferred; still no paid calls without keys |
 | `API` | Paid backends only if `OPENAI_API_KEY` / `VISION_API_KEY` set; respects `HARD_SPEND_LIMIT_USD` |
 
+## Live capture (Module H)
+
+Primary UI action: **Canlı yayın ekle** (`POST /api/recordings/live`).
+
+1. Paste Instagram Live URL, profile URL, or `@username`
+2. Supervisor probes with **yt-dlp** (no cookies/login from mezatizle)
+3. When a public stream is resolvable → records to `storage/recordings/<id>.mp4`
+4. When the live ends → finalizes file → enqueues the same analysis pipeline as uploads
+5. Manual MP4 upload remains under “Gelişmiş”
+
+**Instagram limit:** many lives require login. Without credentials the session stays in
+`bekleniyor` / `engellendi` and retries until timeout or cancel. See
+`modules/h-capture-adapter/POLICY.md`.
+
+Requires host tools: `yt-dlp`, `ffmpeg`.
+
 ## Modules A–H
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md). Capture adapter (H) is a **stub** — upload MP4s you own.
+See [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## Docs
 

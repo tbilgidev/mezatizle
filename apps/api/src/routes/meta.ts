@@ -3,7 +3,8 @@ import type { Sql } from "@mezatizle/db";
 import { MODULES } from "@mezatizle/shared";
 import type { AppEnv } from "../lib/env.ts";
 import { totalSpendUsd } from "../lib/cost.ts";
-import { CAPTURE_POLICY } from "../modules/capture_stub.ts";
+import { LIVE_CAPTURE_POLICY } from "../modules/live_capture.ts";
+const CAPTURE_POLICY = LIVE_CAPTURE_POLICY;
 
 export function metaRoutes(sql: Sql, env: AppEnv) {
   const app = new Hono();
@@ -71,7 +72,13 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
   });
 
   app.post("/capture/start", (c) =>
-    c.json({ error: CAPTURE_POLICY.message, restrictions: CAPTURE_POLICY.restrictions }, 403),
+    c.json(
+      {
+        error: "POST /api/recordings/live kullanın",
+        policy: CAPTURE_POLICY,
+      },
+      410,
+    ),
   );
 
   return app;

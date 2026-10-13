@@ -29,13 +29,30 @@ describe("api smoke (optional live server)", () => {
     }
   });
 
-  test("capture stub rejects", async () => {
+  test("legacy capture start is retired", async () => {
     try {
       const res = await fetch(`${API}/api/capture/start`, { method: "POST" });
       if (res.status === 0) return;
-      expect(res.status).toBe(403);
+      expect([403, 410]).toContain(res.status);
+    } catch {
+      expect(true).toBe(true);
+    }
+  });
+
+  test("live capture creates awaiting session if server up", async () => {
+    try {
+      const res = await fetch(`${API}/api/recordings/live`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ input: "@api_smoke_live" }),
+      });
+      if (!res.ok && res.status !== 201) return;
+      const j = (await res.json()) as { recordingId?: string; captureStatus?: string };
+      expect(j.recordingId).toBeTruthy();
+      expect(j.captureStatus).toBe("bekleniyor");
     } catch {
       expect(true).toBe(true);
     }
   });
 });
+

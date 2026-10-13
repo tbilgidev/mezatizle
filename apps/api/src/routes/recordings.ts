@@ -2,19 +2,62 @@ import { Hono } from "hono";
 import type { Sql } from "@mezatizle/db";
 import type { AppEnv } from "../lib/env.ts";
 import { createRecordingFromUpload } from "../modules/ingestion.ts";
+import {
+  cancelLiveCapture,
+  createLiveCapture,
+  LIVE_CAPTURE_POLICY,
+} from "../modules/live_capture.ts";
 
 export function recordingsRoutes(sql: Sql, env: AppEnv) {
   const app = new Hono();
 
   app.get("/", async (c) => {
     const rows = await sql`
-      SELECT r.*, s.instagram_username
+      SELECT r.*, s.instagram_username, s.display_name,
+             lc.status AS live_status, lc.attempt_count, lc.last_probe_detail
       FROM recordings r
       JOIN sellers s ON s.id = r.seller_id
+      LEFT JOIN live_captures lc ON lc.recording_id = r.id
       ORDER BY r.uploaded_at DESC
       LIMIT 200
     `;
     return c.json({ recordings: rows });
+  });
+
+  app.post("/live", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      input?: string;
+      displayName?: string;
+      notes?: string;
+    };
+    if (!body.input?.trim()) {
+      return c.json(
+        { error: "Canlı yayın bağlantısı veya @kullanıcı adı gerekli" },
+        400,
+      );
+    }
+    try {
+      const result = await createLiveCapture(sql, env, {
+        input: body.input,
+        displayName: body.displayName,
+        notes: body.notes,
+      });
+      return c.json(result, 201);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg, policy: LIVE_CAPTURE_POLICY }, 400);
+    }
+  });
+
+  app.post("/:id/cancel-live", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const result = await cancelLiveCapture(sql, id);
+      return c.json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
   });
 
   app.get("/:id", async (c) => {

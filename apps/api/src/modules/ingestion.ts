@@ -67,18 +67,21 @@ export async function createRecordingFromUpload(
     RETURNING id
   `;
 
-  const probeJob = await enqueueJob(sql, id, "probe_media", 10);
-  const extractJob = await enqueueJob(sql, id, "extract_audio_frames", 20);
-  await enqueueJob(sql, id, "transcribe", 30);
-  await enqueueJob(sql, id, "ocr_frames", 40);
-  await enqueueJob(sql, id, "segment_auction", 50);
-  await enqueueJob(sql, id, "reconcile_sales", 60);
+  await enqueueAnalysisPipeline(sql, id);
 
   return {
     recordingId: rows[0]!.id,
     sellerId: seller.id,
-    jobs: { probeJob, extractJob },
   };
+}
+
+export async function enqueueAnalysisPipeline(sql: Sql, recordingId: string) {
+  await enqueueJob(sql, recordingId, "probe_media", 10);
+  await enqueueJob(sql, recordingId, "extract_audio_frames", 20);
+  await enqueueJob(sql, recordingId, "transcribe", 30);
+  await enqueueJob(sql, recordingId, "ocr_frames", 40);
+  await enqueueJob(sql, recordingId, "segment_auction", 50);
+  await enqueueJob(sql, recordingId, "reconcile_sales", 60);
 }
 
 export async function runProbeJob(

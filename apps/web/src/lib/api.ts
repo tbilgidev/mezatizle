@@ -70,5 +70,25 @@ export const api = {
     if (!res.ok) throw new Error(data.error || "Yükleme başarısız");
     return data as { recordingId: string };
   },
+  startLive: (body: {
+    input: string;
+    displayName?: string;
+    notes?: string;
+  }) =>
+    request<{
+      recordingId: string;
+      username: string;
+      watchUrl: string;
+      captureStatus: string;
+      policy?: { limitationTr?: string; message?: string };
+    }>("/api/recordings/live", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  cancelLive: (id: string) =>
+    request<{ ok: boolean }>(`/api/recordings/${id}/cancel-live`, {
+      method: "POST",
+    }),
   csvUrl: () => url("/api/sales/export.csv"),
 };

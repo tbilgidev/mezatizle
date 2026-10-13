@@ -61,12 +61,23 @@ export function SettingsPage() {
           </div>
           <div className="panel">
             <h2>Yakalama (Modül H)</h2>
+            <p>
+              <span className="badge ok">
+                {String(capture.status ?? "public_stream_only")}
+              </span>
+            </p>
             <p>{String(capture.message)}</p>
+            {capture.limitationTr ? (
+              <p className="muted">{String(capture.limitationTr)}</p>
+            ) : null}
             <ul>
               {((capture.restrictions as string[]) ?? []).map((r) => (
                 <li key={r}>{r}</li>
               ))}
             </ul>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              Araçlar: {((capture.tools as string[]) ?? []).join(", ") || "—"}
+            </p>
           </div>
           <div className="panel">
             <h2>Metrikler</h2>

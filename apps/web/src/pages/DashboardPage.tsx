@@ -27,8 +27,8 @@ export function DashboardPage() {
           mezat<span>izle</span>
         </p>
         <p>
-          Canlı mezât kayıtlarını yerelde çözün: yükleyin, olayları çıkarın,
-          satış adaylarını doğrulayın — Instagram girişi ve ücretli API olmadan.
+          Canlı mezât yayınını yerelde kaydedin, olayları çıkarın, satış
+          adaylarını doğrulayın — Instagram girişi ve ücretli API olmadan.
         </p>
       </section>
 
@@ -42,7 +42,7 @@ export function DashboardPage() {
         </div>
         <div className="actions" style={{ marginTop: 0 }}>
           <Link className="btn" to="/recordings">
-            MP4 yükle
+            Canlı yayın ekle
           </Link>
           <Link className="btn secondary" to="/sales">
             Satışlar
@@ -83,7 +83,7 @@ export function DashboardPage() {
             </p>
             <div className="actions">
               <Link className="btn" to="/recordings">
-                Yeni kayıt yükle
+                Canlı yayın ekle
               </Link>
               <Link className="btn secondary" to="/evidence">
                 Kanıt incele

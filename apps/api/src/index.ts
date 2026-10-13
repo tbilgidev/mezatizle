@@ -8,6 +8,7 @@ import { salesRoutes } from "./routes/sales.ts";
 import { commentsRoutes } from "./routes/comments.ts";
 import { metaRoutes } from "./routes/meta.ts";
 import { workerLoop } from "./worker.ts";
+import { liveCaptureLoop } from "./modules/live_capture.ts";
 
 const env = loadEnv();
 await ensureStorageDirs(env.storageRoot);
@@ -43,6 +44,9 @@ app.get("/", (c) =>
 const embeddedWorker = process.env.EMBEDDED_WORKER !== "0";
 if (embeddedWorker) {
   workerLoop().catch((e) => console.error("[embedded-worker]", e));
+}
+if (process.env.LIVE_CAPTURE_SUPERVISOR !== "0") {
+  liveCaptureLoop(sql, env).catch((e) => console.error("[live-capture]", e));
 }
 
 console.log(
