@@ -74,12 +74,14 @@ export const api = {
     input: string;
     displayName?: string;
     notes?: string;
+    maxDurationMinutes?: number | null;
   }) =>
     request<{
       recordingId: string;
       username: string;
       watchUrl: string;
       captureStatus: string;
+      maxDurationMinutes?: number | null;
       policy?: { limitationTr?: string; message?: string };
     }>("/api/recordings/live", {
       method: "POST",
@@ -125,6 +127,16 @@ export const api = {
   clearIgSession: () =>
     request<Record<string, unknown>>("/api/settings/ig-session", {
       method: "DELETE",
+    }),
+  playwrightIgLogin: (body: {
+    username: string;
+    password: string;
+    headless?: boolean;
+  }) =>
+    request<Record<string, unknown>>("/api/settings/ig-session/playwright-login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     }),
   csvUrl: () => url("/api/sales/export.csv"),
 };

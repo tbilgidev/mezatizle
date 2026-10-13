@@ -254,9 +254,66 @@ export function SettingsPage() {
               </button>
             </form>
 
+            <h3 style={{ marginTop: "1.25rem" }}>2) Playwright ile giriş (yedek izleyici)</h3>
+            <p className="muted">
+              Yalnızca izleme/kayıt için yedek hesap. Normal tarayıcı girişi —
+              özel API veya bot aşımı yok. Başarılı olursa çerezler kaydedilir;
+              parola sunucuda şifreli kalır (<strong>••••</strong>), yanıtta dönmez.
+            </p>
+            <form
+              className="row"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void (async () => {
+                  setBusy(true);
+                  setError(null);
+                  setOk(null);
+                  const fd = new FormData(e.currentTarget);
+                  try {
+                    const st = (await api.playwrightIgLogin({
+                      username: String(fd.get("username") ?? ""),
+                      password: String(fd.get("password") ?? ""),
+                    })) as unknown as IgSession;
+                    setIg(st);
+                    setOk(
+                      "Playwright girişi tamam — çerezler yüklü. Parola saklandı (••••).",
+                    );
+                    e.currentTarget.reset();
+                  } catch (err) {
+                    setError(err instanceof Error ? err.message : String(err));
+                    try {
+                      setIg(await api.igSession());
+                    } catch {
+                      /* ignore */
+                    }
+                  } finally {
+                    setBusy(false);
+                  }
+                })();
+              }}
+            >
+              <label>
+                Kullanıcı adı
+                <input name="username" autoComplete="username" placeholder="yedek_hesap" required />
+              </label>
+              <label>
+                Parola
+                <input
+                  name="password"
+                  type="password"
+                  autoComplete="current-password"
+                  placeholder="••••••••"
+                  required
+                />
+              </label>
+              <button type="submit" disabled={busy}>
+                {busy ? "Giriş yapılıyor…" : "Playwright ile giriş yap"}
+              </button>
+            </form>
+
             <details style={{ marginTop: "1.25rem" }}>
               <summary style={{ cursor: "pointer", fontWeight: 600 }}>
-                İsteğe bağlı: kullanıcı adı + parola
+                İsteğe bağlı: yalnızca kullanıcı/parola sakla (Playwright’suz)
               </summary>
               <p className="muted">
                 Çerez yoksa yt-dlp <code>--username/--password</code> dener.

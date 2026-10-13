@@ -13,6 +13,7 @@
     "@mezatizle/db": "workspace:*",
     "@mezatizle/shared": "workspace:*",
     "hono": "^4.9.6",
+    "playwright": "1.49.1",
     "postgres": "^3.4.7"
   },
   "devDependencies": {

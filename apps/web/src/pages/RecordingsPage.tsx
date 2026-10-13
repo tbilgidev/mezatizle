@@ -60,12 +60,24 @@ export function RecordingsPage() {
     setOk(null);
     const fd = new FormData(e.currentTarget);
     try {
+      const durRaw = String(fd.get("maxDurationMinutes") ?? "").trim();
+      const maxDurationMinutes = durRaw === "" ? null : Number(durRaw);
       const res = await api.startLive({
         input: String(fd.get("input") ?? ""),
         displayName: String(fd.get("displayName") ?? "") || undefined,
         notes: String(fd.get("notes") ?? "") || undefined,
+        maxDurationMinutes:
+          maxDurationMinutes != null &&
+          Number.isFinite(maxDurationMinutes) &&
+          maxDurationMinutes > 0
+            ? maxDurationMinutes
+            : null,
       });
-      setOk(`Canlı oturum açıldı · ${res.recordingId.slice(0, 8)}…`);
+      const durNote =
+        res.maxDurationMinutes && res.maxDurationMinutes > 0
+          ? ` · en fazla ${res.maxDurationMinutes} dk`
+          : " · yayının tamamı";
+      setOk(`Canlı oturum açıldı · ${res.recordingId.slice(0, 8)}…${durNote}`);
       setLimitation(res.policy?.limitationTr ?? null);
       e.currentTarget.reset();
       await refresh();
@@ -137,12 +149,29 @@ export function RecordingsPage() {
             <input name="displayName" placeholder="Satıcı adı" />
           </label>
           <label>
+            Kayıt süresi (dk)
+            <input
+              name="maxDurationMinutes"
+              type="number"
+              min={0}
+              max={1440}
+              step={1}
+              placeholder="boş = tüm yayın"
+              title="Boş veya 0: canlı bitene kadar. Örn. 10, 180."
+            />
+          </label>
+          <label>
             Not (ops.)
             <input name="notes" placeholder="opsiyonel" />
           </label>
           <button type="submit" disabled={busy}>
             {busy ? "Ekleniyor…" : "Canlı yayın ekle"}
           </button>
+          <p className="muted" style={{ gridColumn: "1 / -1", margin: 0, fontSize: "0.85rem" }}>
+            Varsayılan: yayının tamamı. Süre dolunca veya yayın bitince (hangisi önce)
+            kayıt sonlanır → analiz kuyruğu. Dosya kalitesi ~720p / CRF28 / AAC 80kbps
+            (disk dostu, ASR+OCR için yeterli).
+          </p>
         </form>
         {ok && (
           <p style={{ marginBottom: 0 }}>

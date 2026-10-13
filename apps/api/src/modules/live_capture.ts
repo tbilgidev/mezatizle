@@ -17,13 +17,17 @@ import {
   setIgSessionLastError,
   ytDlpAuthArgs,
 } from "./ig_session.ts";
+import {
+  CAPTURE_QUALITY,
+  ffmpegCaptureArgs,
+} from "./capture_quality.ts";
 
 export const LIVE_CAPTURE_POLICY = {
   status: "operator_session_optional" as const,
-  playwright: "not_enabled",
-  tools: ["yt-dlp", "ffmpeg"],
+  playwright: "login_export_cookies",
+  tools: ["yt-dlp", "ffmpeg", "playwright"],
   message:
-    "Canlı kayıt yt-dlp ile yapılır. Giriş gerektiren yayınlar için Ayarlar → Instagram oturumu (yedek hesap) altında çerez/oturum tanımlayın. Özel API veya bot aşımı yok.",
+    "Canlı kayıt yt-dlp+ffmpeg ile yapılır. Giriş için Ayarlar → Instagram oturumu: cookies.txt veya Playwright ile yedek hesap girişi. Özel API / bot aşımı yok.",
   restrictions: [
     "Özel / belgesiz Instagram API yok",
     "Anti-bot aşımı / CAPTCHA bypass yok",
@@ -170,7 +174,13 @@ export async function probePublicLive(
 export async function createLiveCapture(
   sql: Sql,
   env: AppEnv,
-  opts: { input: string; displayName?: string; notes?: string },
+  opts: {
+    input: string;
+    displayName?: string;
+    notes?: string;
+    /** Empty/0 = entire live until it ends. */
+    maxDurationMinutes?: number | null;
+  },
 ) {
   const parsed = parseLiveSourceInput(opts.input);
   const seller = await upsertSeller(sql, parsed.username);
@@ -180,6 +190,18 @@ export async function createLiveCapture(
       SET display_name = ${opts.displayName.trim()}, updated_at = now()
       WHERE id = ${seller.id}
     `;
+  }
+
+  let maxDurationMinutes: number | null = null;
+  if (
+    opts.maxDurationMinutes != null &&
+    Number.isFinite(opts.maxDurationMinutes) &&
+    opts.maxDurationMinutes > 0
+  ) {
+    maxDurationMinutes = Math.min(
+      Math.floor(opts.maxDurationMinutes),
+      24 * 60,
+    );
   }
 
   const id = crypto.randomUUID();
@@ -204,10 +226,10 @@ export async function createLiveCapture(
   await sql`
     INSERT INTO live_captures (
       recording_id, input_raw, source_kind, resolved_username, watch_url,
-      status, max_bytes
+      status, max_bytes, max_duration_minutes
     ) VALUES (
       ${id}, ${parsed.inputRaw}, ${parsed.kind}, ${parsed.username}, ${parsed.watchUrl},
-      'waiting', ${maxBytes}
+      'waiting', ${maxBytes}, ${maxDurationMinutes}
     )
   `;
 
@@ -216,6 +238,8 @@ export async function createLiveCapture(
     username: parsed.username,
     watchUrl: parsed.watchUrl,
     captureStatus: "bekleniyor",
+    maxDurationMinutes,
+    quality: CAPTURE_QUALITY,
     policy: LIVE_CAPTURE_POLICY,
   };
 }
@@ -256,6 +280,50 @@ async function fileSize(path: string): Promise<number> {
   }
 }
 
+async function resolveStreamUrl(
+  env: AppEnv,
+  watchUrl: string,
+): Promise<{ url: string } | { error: string; kind: "blocked" | "not_found" }> {
+  const bin = ytDlpBin();
+  const auth = await ytDlpAuthArgs(env);
+  const r = await runCapture(
+    [
+      bin,
+      "--ignore-config",
+      "--no-playlist",
+      "--no-warnings",
+      ...auth,
+      "-f",
+      CAPTURE_QUALITY.ytdlpFormat,
+      "-g",
+      watchUrl,
+    ],
+    60_000,
+  );
+  const lines = r.stdout
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => /^https?:\/\//i.test(l));
+  if (lines[0]) return { url: lines[0]! };
+  const low = `${r.stdout}\n${r.stderr}`.toLowerCase();
+  if (
+    low.includes("login required") ||
+    low.includes("http error 401") ||
+    low.includes("http error 403") ||
+    low.includes("sign in")
+  ) {
+    return {
+      kind: "blocked",
+      error:
+        "Akış URL’si alınamadı — Ayarlar → Instagram oturumu (çerez / Playwright giriş) kontrol edin.",
+    };
+  }
+  return {
+    kind: "not_found",
+    error: "Aktif yayın akış URL’si çözülemedi.",
+  };
+}
+
 async function startRecordingProcess(
   sql: Sql,
   env: AppEnv,
@@ -263,6 +331,7 @@ async function startRecordingProcess(
   watchUrl: string,
   destAbs: string,
   maxBytes: number,
+  maxDurationMinutes: number | null,
 ) {
   const partAbs = `${destAbs}.part.mp4`;
   try {
@@ -271,33 +340,55 @@ async function startRecordingProcess(
     /* ok */
   }
 
-  const bin = ytDlpBin();
-  const auth = await ytDlpAuthArgs(env);
-  const args = [
-    bin,
-    "--ignore-config",
-    "--no-playlist",
-    "--no-warnings",
-    "--no-part",
-    ...auth,
-    "-f",
-    "best",
-    "-o",
-    partAbs,
-    "--newline",
-    watchUrl,
-  ];
+  const resolved = await resolveStreamUrl(env, watchUrl);
+  if ("error" in resolved) {
+    await sql`
+      UPDATE live_captures
+      SET status = 'waiting',
+          last_probe_detail = ${resolved.error},
+          updated_at = now()
+      WHERE recording_id = ${recordingId}
+    `;
+    await sql`
+      UPDATE recordings
+      SET status = 'awaiting_live',
+          capture_status = ${resolved.kind === "blocked" ? "engellendi" : "bekleniyor"},
+          capture_error = ${resolved.error},
+          updated_at = now()
+      WHERE id = ${recordingId}
+    `;
+    if (resolved.kind === "blocked") {
+      await setIgSessionLastError(env, resolved.error);
+    }
+    return;
+  }
+
+  const maxDurationSeconds =
+    maxDurationMinutes && maxDurationMinutes > 0
+      ? maxDurationMinutes * 60
+      : null;
+
+  const args = ffmpegCaptureArgs({
+    ffmpegPath: env.ffmpegPath,
+    inputUrl: resolved.url,
+    outputPath: partAbs,
+    maxDurationSeconds,
+  });
 
   const child = spawn(args[0]!, args.slice(1), {
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, PYTHONWARNINGS: "ignore" },
+    env: { ...process.env },
   });
   activeProcs.set(recordingId, child);
+
+  const detail = maxDurationSeconds
+    ? `recording_started max=${maxDurationMinutes}dk quality<=${CAPTURE_QUALITY.maxHeight}p`
+    : `recording_started full_live quality<=${CAPTURE_QUALITY.maxHeight}p`;
 
   await sql`
     UPDATE live_captures
     SET status = 'recording', process_pid = ${child.pid ?? null},
-        updated_at = now(), last_probe_detail = ${"recording_started"}
+        updated_at = now(), last_probe_detail = ${detail}
     WHERE recording_id = ${recordingId}
   `;
   await sql`
@@ -316,6 +407,7 @@ async function startRecordingProcess(
     if (stderr.length > 120_000) stderr = stderr.slice(-60_000);
   });
 
+  const startedAt = Date.now();
   const sizeTimer = setInterval(() => {
     void (async () => {
       const bytes = await fileSize(partAbs);
@@ -324,7 +416,11 @@ async function startRecordingProcess(
         SET capture_bytes = ${bytes}, file_size_bytes = ${bytes}, updated_at = now()
         WHERE id = ${recordingId}
       `;
-      if (bytes >= maxBytes) {
+      const overBytes = bytes >= maxBytes;
+      const overTime =
+        maxDurationSeconds != null &&
+        Date.now() - startedAt >= maxDurationSeconds * 1000 + 5000;
+      if (overBytes || overTime) {
         try {
           child.kill("SIGTERM");
         } catch {
@@ -458,6 +554,7 @@ async function tickCapture(sql: Sql, env: AppEnv, row: {
   status: string;
   created_at: Date | string;
   max_bytes: number | string;
+  max_duration_minutes: number | null;
   attempt_count: number;
 }) {
   const recordingId = row.recording_id;
@@ -530,6 +627,9 @@ async function tickCapture(sql: Sql, env: AppEnv, row: {
     row.watch_url,
     destAbs,
     Number(row.max_bytes),
+    row.max_duration_minutes != null && Number(row.max_duration_minutes) > 0
+      ? Number(row.max_duration_minutes)
+      : null,
   );
 }
 
@@ -558,9 +658,11 @@ export async function liveCaptureLoop(sql: Sql, env: AppEnv) {
         status: string;
         created_at: Date;
         max_bytes: number;
+        max_duration_minutes: number | null;
         attempt_count: number;
       }[]>`
-        SELECT recording_id, watch_url, status, created_at, max_bytes, attempt_count
+        SELECT recording_id, watch_url, status, created_at, max_bytes,
+               max_duration_minutes, attempt_count
         FROM live_captures
         WHERE status IN ('pending', 'waiting')
         ORDER BY created_at ASC

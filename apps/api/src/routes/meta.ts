@@ -11,6 +11,8 @@ import {
   saveIgCookiesText,
   saveIgCredentials,
 } from "../modules/ig_session.ts";
+import { playwrightIgLogin } from "../modules/ig_playwright_login.ts";
+import { CAPTURE_QUALITY } from "../modules/capture_quality.ts";
 const CAPTURE_POLICY = LIVE_CAPTURE_POLICY;
 
 export function metaRoutes(sql: Sql, env: AppEnv) {
@@ -30,6 +32,7 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
       maxUploadBytes: env.maxUploadBytes,
       modules: MODULES,
       capture: CAPTURE_POLICY,
+      captureQuality: CAPTURE_QUALITY,
       igSession,
       storageRoot: env.storageRoot,
     });
@@ -83,6 +86,32 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
 
   app.delete("/settings/ig-session", async (c) => {
     return c.json(await clearIgSession(env));
+  });
+
+  app.post("/settings/ig-session/playwright-login", async (c) => {
+    try {
+      const body = (await c.req.json()) as {
+        username?: string;
+        password?: string;
+        headless?: boolean;
+      };
+      if (!body.username?.trim() || !body.password) {
+        return c.json({ error: "username ve password gerekli" }, 400);
+      }
+      const status = await playwrightIgLogin(env, {
+        username: body.username,
+        password: body.password,
+        headless: body.headless !== false,
+      });
+      return c.json({
+        ...status,
+        noteTr:
+          "Playwright ile giriş tamamlandı. Parola saklandı (••••); çerezler yt-dlp için yazıldı. Parola yanıtta yok.",
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
   });
 
   app.get("/metrics", async (c) => {

@@ -80,9 +80,12 @@ Primary UI action: **Canlı yayın ekle** (`POST /api/recordings/live`).
 4. When the live ends → finalizes file → enqueues the same analysis pipeline as uploads
 5. Manual MP4 upload remains under “Gelişmiş”
 
-**Instagram session:** configure under **Ayarlar → Instagram oturumu (yedek hesap)** —
-prefer Netscape `cookies.txt` (used as `yt-dlp --cookies`). Optional username/password
-is encrypted under `storage/secrets/` and never returned to the UI after save.
+**Instagram session:** **Ayarlar → Instagram oturumu (yedek hesap)** — cookies.txt,
+Playwright login (spare watcher account), or encrypted username/password. Used as
+`yt-dlp --cookies` / credentials. Secrets never returned after save.
+
+**Capture quality default:** ≤720p, ~20 fps, H.264 CRF 28, AAC 80 kbps mono.
+**Duration:** optional minutes on Canlı yayın ekle (empty = entire live).
 
 **Instagram limit:** without a session many lives stay in `bekleniyor` / `engellendi`.
 See `modules/h-capture-adapter/POLICY.md`.

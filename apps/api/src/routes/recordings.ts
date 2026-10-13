@@ -29,6 +29,7 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
       input?: string;
       displayName?: string;
       notes?: string;
+      maxDurationMinutes?: number | string | null;
     };
     if (!body.input?.trim()) {
       return c.json(
@@ -36,11 +37,19 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
         400,
       );
     }
+    const rawDur = body.maxDurationMinutes;
+    const maxDurationMinutes =
+      rawDur === "" || rawDur == null
+        ? null
+        : Number(rawDur);
     try {
       const result = await createLiveCapture(sql, env, {
         input: body.input,
         displayName: body.displayName,
         notes: body.notes,
+        maxDurationMinutes: Number.isFinite(maxDurationMinutes as number)
+          ? (maxDurationMinutes as number)
+          : null,
       });
       return c.json(result, 201);
     } catch (err) {
