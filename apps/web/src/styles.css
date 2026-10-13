@@ -641,3 +641,25 @@ tbody tr:hover {
     display: none;
   }
 }
+
+/* Funnel/remote: fill-mode:both + opacity:0 keyframes can leave a blank white page
+   when motion is reduced or animations fail to run. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  .brand-block,
+  .page,
+  .dash-hero,
+  .stat,
+  .panel,
+  .page-head {
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}
+

@@ -6,6 +6,8 @@
     "dev": "bun run --filter @mezatizle/api --filter @mezatizle/web dev",
     "dev:api": "bun run --filter @mezatizle/api dev",
     "dev:web": "bun run --filter @mezatizle/web dev",
+    "build:web": "bun run --filter @mezatizle/web build",
+    "serve:web": "bun run scripts/serve-web.ts",
     "migrate": "bun run --filter @mezatizle/db migrate",
     "test": "bun test",
     "test:api": "bun test apps/api packages/db packages/shared",
