@@ -1,0 +1,6 @@
+# Optional heavy deps — LOCAL profile falls back to mock if missing.
+# Install only when you want real ASR/OCR on a machine with enough disk/RAM.
+# faster-whisper>=1.0.3
+# paddleocr>=2.7.0
+# paddlepaddle>=2.6.0
+psycopg[binary]>=3.2.0

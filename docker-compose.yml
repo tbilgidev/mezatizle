@@ -1,0 +1,64 @@
+# Requires Docker. This Cloud Agent VM has no Docker — use local Postgres + Bun + Python instead.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mezatizle
+      POSTGRES_PASSWORD: mezatizle
+      POSTGRES_DB: mezatizle
+    ports:
+      - "5432:5432"
+    volumes:
+      - mezatizle_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mezatizle -d mezatizle"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://mezatizle:mezatizle@db:5432/mezatizle
+      STORAGE_ROOT: /data/storage
+      API_PORT: "43127"
+    ports:
+      - "43127:43127"
+    volumes:
+      - ./storage:/data/storage
+    depends_on:
+      db:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: workers/extractor/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://mezatizle:mezatizle@db:5432/mezatizle
+      STORAGE_ROOT: /data/storage
+    volumes:
+      - ./storage:/data/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    environment:
+      VITE_API_BASE: http://127.0.0.1:43127
+    ports:
+      - "43128:43128"
+    depends_on:
+      - api
+
+volumes:
+  mezatizle_pg:

@@ -1,0 +1,23 @@
+{
+  "name": "mezatizle",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "bun run --filter @mezatizle/api --filter @mezatizle/web dev",
+    "dev:api": "bun run --filter @mezatizle/api dev",
+    "dev:web": "bun run --filter @mezatizle/web dev",
+    "migrate": "bun run --filter @mezatizle/db migrate",
+    "test": "bun test",
+    "test:api": "bun test apps/api packages/db packages/shared",
+    "typecheck": "bun run --filter '*' typecheck",
+    "worker": "cd workers/extractor && python3 worker.py"
+  },
+  "dependencies": {
+    "@mezatizle/db": "workspace:*",
+    "@mezatizle/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}

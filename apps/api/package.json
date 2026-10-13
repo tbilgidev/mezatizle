@@ -1,0 +1,21 @@
+{
+  "name": "@mezatizle/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "benchmark": "bun run src/benchmark.ts"
+  },
+  "dependencies": {
+    "@mezatizle/db": "workspace:*",
+    "@mezatizle/shared": "workspace:*",
+    "hono": "^4.9.6",
+    "postgres": "^3.4.7"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}
