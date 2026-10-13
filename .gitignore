@@ -28,4 +28,6 @@ apps/web/dist/
 apps/api/dist/
 storage/products/*
 !storage/products/.gitkeep
+storage/secrets/*
+!storage/secrets/.gitkeep
 BENCHMARK.results.json

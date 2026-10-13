@@ -90,5 +90,41 @@ export const api = {
     request<{ ok: boolean }>(`/api/recordings/${id}/cancel-live`, {
       method: "POST",
     }),
+  igSession: () =>
+    request<{
+      status: string;
+      hasCookies: boolean;
+      hasCredentials: boolean;
+      usernameMasked: string | null;
+      updatedAt: string | null;
+      lastError: string | null;
+      hintTr: string;
+    }>("/api/settings/ig-session"),
+  saveIgSessionJson: (body: {
+    cookiesText?: string;
+    cookiesPath?: string;
+    username?: string;
+    password?: string;
+  }) =>
+    request<Record<string, unknown>>("/api/settings/ig-session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  saveIgCookiesFile: async (file: File) => {
+    const fd = new FormData();
+    fd.append("cookiesFile", file);
+    const res = await fetch(url("/api/settings/ig-session"), {
+      method: "POST",
+      body: fd,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Çerez kaydı başarısız");
+    return data as Record<string, unknown>;
+  },
+  clearIgSession: () =>
+    request<Record<string, unknown>>("/api/settings/ig-session", {
+      method: "DELETE",
+    }),
   csvUrl: () => url("/api/sales/export.csv"),
 };

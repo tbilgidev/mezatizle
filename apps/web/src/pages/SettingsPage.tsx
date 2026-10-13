@@ -1,21 +1,47 @@
-import { useEffect, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { ErrorState, LoadingState } from "../components/States";
+
+type IgSession = {
+  status: string;
+  hasCookies: boolean;
+  hasCredentials: boolean;
+  usernameMasked: string | null;
+  updatedAt: string | null;
+  lastError: string | null;
+  hintTr: string;
+};
+
+const STATUS_TR: Record<string, string> = {
+  yok: "Yok",
+  yuklu: "Yüklü",
+  hata: "Son hata",
+};
 
 export function SettingsPage() {
   const [settings, setSettings] = useState<Record<string, unknown> | null>(
     null,
   );
   const [metrics, setMetrics] = useState<Record<string, unknown> | null>(null);
+  const [ig, setIg] = useState<IgSession | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [ok, setOk] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  async function refresh() {
+    const [s, m, session] = await Promise.all([
+      api.settings(),
+      api.metrics(),
+      api.igSession(),
+    ]);
+    setSettings(s);
+    setMetrics(m);
+    setIg(session);
+  }
 
   useEffect(() => {
-    Promise.all([api.settings(), api.metrics()])
-      .then(([s, m]) => {
-        setSettings(s);
-        setMetrics(m);
-      })
+    refresh()
       .catch((e: Error) => setError(e.message))
       .finally(() => setLoading(false));
   }, []);
@@ -23,23 +49,247 @@ export function SettingsPage() {
   const profile = (settings?.profile ?? {}) as Record<string, unknown>;
   const capture = (settings?.capture ?? {}) as Record<string, unknown>;
 
+  async function onCookiesFile(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    setOk(null);
+    const fd = new FormData(e.currentTarget);
+    const file = fd.get("cookiesFile");
+    try {
+      if (!(file instanceof File) || !file.size) {
+        throw new Error("cookies.txt dosyası seçin");
+      }
+      const st = (await api.saveIgCookiesFile(file)) as unknown as IgSession;
+      setIg(st);
+      setOk("Çerez oturumu kaydedildi (içerik bir daha gösterilmez).");
+      e.currentTarget.reset();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onCookiesPaste(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    setOk(null);
+    const fd = new FormData(e.currentTarget);
+    try {
+      const st = (await api.saveIgSessionJson({
+        cookiesText: String(fd.get("cookiesText") ?? ""),
+      })) as unknown as IgSession;
+      setIg(st);
+      setOk("Yapıştırılan çerezler kaydedildi.");
+      e.currentTarget.reset();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onCookiesPath(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    setOk(null);
+    const fd = new FormData(e.currentTarget);
+    try {
+      const st = (await api.saveIgSessionJson({
+        cookiesPath: String(fd.get("cookiesPath") ?? ""),
+      })) as unknown as IgSession;
+      setIg(st);
+      setOk("Çerez dosya yolu okundu ve güvenli alana kopyalandı.");
+      e.currentTarget.reset();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onCredentials(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    setOk(null);
+    const fd = new FormData(e.currentTarget);
+    try {
+      const st = (await api.saveIgSessionJson({
+        username: String(fd.get("username") ?? ""),
+        password: String(fd.get("password") ?? ""),
+      })) as unknown as IgSession;
+      setIg(st);
+      setOk("Kullanıcı/parola sunucuda şifreli saklandı (••••).");
+      e.currentTarget.reset();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onClear() {
+    if (!confirm("Instagram oturumunu (çerezler + parola) kaldırmak istiyor musunuz?")) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setOk(null);
+    try {
+      const st = (await api.clearIgSession()) as unknown as IgSession;
+      setIg(st);
+      setOk("Oturum kaldırıldı.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="page">
       <div className="page-head">
         <div>
           <h1>Ayarlar</h1>
           <p className="lead">
-            İşleme profili, harcama limiti ve yakalama politikası. Gizli
-            anahtarlar yalnızca ortam değişkenlerinden okunur.
+            İşleme profili, yakalama politikası ve yedek Instagram oturumu.
+            Gizli bilgiler kayıttan sonra arayüzde gösterilmez.
           </p>
         </div>
       </div>
 
       {loading && <LoadingState label="Ayarlar yükleniyor…" />}
       {error && <ErrorState message={error} />}
+      {ok && (
+        <p>
+          <span className="badge ok">{ok}</span>
+        </p>
+      )}
 
       {!loading && settings && (
         <>
+          <div className="panel" id="ig-oturum">
+            <h2>Instagram oturumu (yedek hesap)</h2>
+            <p className="muted" style={{ marginTop: 0 }}>
+              {ig?.hintTr ||
+                "Canlı kayıt için yedek hesabınızın oturumunu buraya ekleyin."}
+            </p>
+            <p>
+              Durum:{" "}
+              <span
+                className={
+                  ig?.status === "yuklu"
+                    ? "badge ok"
+                    : ig?.status === "hata"
+                      ? "badge err"
+                      : "badge warn"
+                }
+              >
+                {STATUS_TR[ig?.status ?? "yok"] ?? ig?.status ?? "Yok"}
+              </span>
+              {ig?.hasCookies ? (
+                <span className="badge ok" style={{ marginLeft: 8 }}>
+                  cookies.txt
+                </span>
+              ) : null}
+              {ig?.hasCredentials ? (
+                <span className="badge warn" style={{ marginLeft: 8 }}>
+                  kullanıcı/parola ••••
+                </span>
+              ) : null}
+            </p>
+            <ul className="muted">
+              <li>
+                Maskeli kullanıcı: {ig?.usernameMasked ?? "—"}
+              </li>
+              <li>Son güncelleme: {ig?.updatedAt ?? "—"}</li>
+              <li>Son hata: {ig?.lastError ?? "—"}</li>
+            </ul>
+            <p className="muted" style={{ fontSize: "0.9rem" }}>
+              Yalnızca kendi yedek hesabınızı kullanın. Kayıt izni / KVKK /
+              platform kuralları operatörün sorumluluğundadır. Çerez ve parola
+              loglanmaz; kayıttan sonra API yanıtında da dönmez.
+            </p>
+
+            <h3 style={{ marginTop: "1.25rem" }}>1) Tercih edilen: cookies.txt</h3>
+            <form className="row" onSubmit={onCookiesFile}>
+              <label style={{ gridColumn: "1 / -1" }}>
+                Netscape cookies.txt yükle
+                <input name="cookiesFile" type="file" accept=".txt,text/plain" />
+              </label>
+              <button type="submit" disabled={busy}>
+                Çerezleri kaydet
+              </button>
+            </form>
+
+            <form className="row" onSubmit={onCookiesPaste} style={{ marginTop: "0.75rem" }}>
+              <label style={{ gridColumn: "1 / -1" }}>
+                Veya yapıştır
+                <textarea
+                  name="cookiesText"
+                  rows={5}
+                  placeholder="# Netscape HTTP Cookie File …"
+                  style={{ width: "100%", fontFamily: "monospace", fontSize: "0.8rem" }}
+                />
+              </label>
+              <button type="submit" disabled={busy}>
+                Yapıştırmayı kaydet
+              </button>
+            </form>
+
+            <form className="row" onSubmit={onCookiesPath} style={{ marginTop: "0.75rem" }}>
+              <label style={{ gridColumn: "1 / -1" }}>
+                Veya sunucudaki dosya yolu
+                <input
+                  name="cookiesPath"
+                  placeholder="/home/…/instagram-cookies.txt"
+                />
+              </label>
+              <button type="submit" className="secondary" disabled={busy}>
+                Yoldan içe aktar
+              </button>
+            </form>
+
+            <details style={{ marginTop: "1.25rem" }}>
+              <summary style={{ cursor: "pointer", fontWeight: 600 }}>
+                İsteğe bağlı: kullanıcı adı + parola
+              </summary>
+              <p className="muted">
+                Çerez yoksa yt-dlp <code>--username/--password</code> dener.
+                Parola sunucuda AES ile saklanır; kayıttan sonra yalnızca{" "}
+                <strong>••••</strong> görünür.
+              </p>
+              <form className="row" onSubmit={onCredentials}>
+                <label>
+                  Kullanıcı adı
+                  <input name="username" autoComplete="username" placeholder="yedek_hesap" />
+                </label>
+                <label>
+                  Parola
+                  <input
+                    name="password"
+                    type="password"
+                    autoComplete="current-password"
+                    placeholder="••••••••"
+                  />
+                </label>
+                <button type="submit" className="secondary" disabled={busy}>
+                  Kullanıcı/parola kaydet
+                </button>
+              </form>
+            </details>
+
+            <div className="actions" style={{ marginTop: "1.25rem" }}>
+              <button type="button" className="secondary" disabled={busy} onClick={() => void onClear()}>
+                Oturumu kaldır
+              </button>
+            </div>
+          </div>
+
           <div className="panel">
             <h2>Profil</h2>
             <p>
@@ -63,10 +313,15 @@ export function SettingsPage() {
             <h2>Yakalama (Modül H)</h2>
             <p>
               <span className="badge ok">
-                {String(capture.status ?? "public_stream_only")}
+                {String(capture.status ?? "operator_session_optional")}
               </span>
             </p>
             <p>{String(capture.message)}</p>
+            {capture.settingsPathTr ? (
+              <p>
+                <strong>{String(capture.settingsPathTr)}</strong>
+              </p>
+            ) : null}
             {capture.limitationTr ? (
               <p className="muted">{String(capture.limitationTr)}</p>
             ) : null}

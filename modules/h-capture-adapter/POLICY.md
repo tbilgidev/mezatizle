@@ -1,20 +1,21 @@
 # Capture policy (Module H)
 
-Public-stream capture only via **yt-dlp + ffmpeg** on the operator machine.
+Live capture via **yt-dlp + ffmpeg** on the operator machine.
 
 ## Allowed
 - Operator pastes a public Instagram Live URL, profile URL, or `@username`
-- Resolve/monitor with yt-dlp (no login cookies injected by mezatizle)
-- Record to `storage/recordings/<id>.mp4` when a public stream URL is obtainable
-- Auto-stop when the live ends (yt-dlp/ffmpeg exit) → enqueue analysis pipeline
-- Manual MP4 upload remains as advanced fallback
+- Operator-provided **backup account session** under Ayarlar → Instagram oturumu:
+  - Netscape cookies.txt (preferred) → `yt-dlp --cookies`
+  - Optional username/password stored encrypted in `storage/secrets/` (never re-sent to UI)
+- Record to `storage/recordings/<id>.mp4` when the stream resolves
+- Auto-stop when the live ends → enqueue analysis pipeline
+- Manual MP4 upload as advanced fallback
 
 ## Forbidden
-- Instagram login / credential stuffing
 - Private or undocumented Instagram APIs
-- Anti-bot circumvention / CAPTCHA bypass
-- Playwright credentialed sessions
+- Anti-bot circumvention / CAPTCHA bypass kits
+- Using someone else’s account without authorization
 
 ## Limitation
-Instagram often requires login for live playback. When blocked, the UI shows
-**yayın bulunamadı / erişim engellendi** and keeps retrying until timeout or cancel.
+Instagram may still challenge or block even with cookies. Operator is responsible
+for consent/compliance. Secrets must not be logged.

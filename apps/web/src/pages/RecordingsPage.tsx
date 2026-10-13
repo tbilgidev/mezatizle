@@ -118,8 +118,10 @@ export function RecordingsPage() {
       <section className="hero-upload">
         <h2>Canlı yayın ekle</h2>
         <p className="muted" style={{ marginTop: 0 }}>
-          Instagram Live URL’si, profil linki veya <code>@kullanici</code>. Giriş
-          veya özel API kullanılmaz — yalnızca herkese açık akışlar.
+          Instagram Live URL’si, profil linki veya <code>@kullanici</code>. Özel
+          API yok. Giriş gerektiren yayınlar için{" "}
+          <Link to="/settings#ig-oturum">Ayarlar → Instagram oturumu</Link>{" "}
+          altına yedek hesap çerezlerini ekleyin.
         </p>
         <form className="row" onSubmit={onLiveSubmit}>
           <label style={{ gridColumn: "1 / -1" }}>

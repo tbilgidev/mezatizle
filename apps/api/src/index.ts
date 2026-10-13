@@ -24,7 +24,7 @@ app.use(
       env.corsOrigin === "*"
         ? "*"
         : env.corsOrigin.split(",").map((s) => s.trim()),
-    allowMethods: ["GET", "POST", "PATCH", "OPTIONS"],
+    allowMethods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   }),
 );
 

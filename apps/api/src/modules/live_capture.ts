@@ -1,13 +1,9 @@
 /**
- * Module H — Public live capture (no Instagram login / private API).
+ * Module H — Live capture via yt-dlp/ffmpeg.
  *
- * Resolves a public Instagram Live / profile / @username via yt-dlp,
- * records to local disk with yt-dlp/ffmpeg, finalizes MP4 when the stream
- * ends, then enqueues the existing analysis pipeline.
- *
- * If Instagram blocks unauthenticated access, sessions stay in waiting /
- * blocked with Turkish operator-facing errors and keep retrying while
- * announced — never credential stuffing or anti-bot bypass.
+ * Operator may supply their own backup Instagram session under
+ * Ayarlar → Instagram oturumu (cookies preferred). No private API,
+ * no anti-bot kits — only the session the operator provides.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdir, stat, rename, unlink } from "node:fs/promises";
@@ -17,21 +13,26 @@ import { parseLiveSourceInput } from "@mezatizle/shared";
 import type { AppEnv } from "../lib/env.ts";
 import { safeJoinStorage, toStorageKey } from "../lib/storage.ts";
 import { enqueueAnalysisPipeline, upsertSeller } from "./ingestion.ts";
+import {
+  setIgSessionLastError,
+  ytDlpAuthArgs,
+} from "./ig_session.ts";
 
 export const LIVE_CAPTURE_POLICY = {
-  status: "public_stream_only" as const,
+  status: "operator_session_optional" as const,
   playwright: "not_enabled",
   tools: ["yt-dlp", "ffmpeg"],
   message:
-    "Canlı kayıt yalnızca herkese açık, giriş gerektirmeyen yayın URL’si çözülebildiğinde yapılır. Instagram girişi / özel API / bot aşımı yok.",
+    "Canlı kayıt yt-dlp ile yapılır. Giriş gerektiren yayınlar için Ayarlar → Instagram oturumu (yedek hesap) altında çerez/oturum tanımlayın. Özel API veya bot aşımı yok.",
   restrictions: [
-    "Instagram hesabı ile giriş yok",
     "Özel / belgesiz Instagram API yok",
-    "Anti-bot aşımı yok",
-    "Giriş duvarı arkasındaki yayınlar kaydedilemez",
+    "Anti-bot aşımı / CAPTCHA bypass yok",
+    "Yalnızca operatörün verdiği yedek hesap oturumu (cookies veya kullanıcı/parola)",
+    "Kayıt için yasal/izin yükümlülüğü operatörde",
   ],
   limitationTr:
-    "Instagram çoğu canlıyı giriş olmadan göstermez. Yayın herkese açıksa ve yt-dlp çözebilirse otomatik kayıt başlar; aksi halde “yayın bulunamadı / erişim engellendi” durumuna düşer ve yeniden dener.",
+    "Oturum yoksa Instagram çoğu canlıyı engeller. Ayarlar → Instagram oturumu bölümüne yedek hesabınızın cookies.txt dosyasını yükleyin; yt-dlp --cookies ile dener.",
+  settingsPathTr: "Ayarlar → Instagram oturumu (yedek hesap)",
 };
 
 const activeProcs = new Map<string, ChildProcessWithoutNullStreams>();
@@ -94,8 +95,12 @@ type ProbeResult =
   | { ok: true; detail: string }
   | { ok: false; kind: "blocked" | "not_found" | "error"; detail: string };
 
-export async function probePublicLive(watchUrl: string): Promise<ProbeResult> {
+export async function probePublicLive(
+  env: AppEnv,
+  watchUrl: string,
+): Promise<ProbeResult> {
   const bin = ytDlpBin();
+  const auth = await ytDlpAuthArgs(env);
   const r = await runCapture(
     [
       bin,
@@ -103,10 +108,11 @@ export async function probePublicLive(watchUrl: string): Promise<ProbeResult> {
       "--no-playlist",
       "--no-warnings",
       "--skip-download",
+      ...auth,
       "-J",
       watchUrl,
     ],
-    45_000,
+    60_000,
   );
   const blob = `${r.stdout}\n${r.stderr}`;
   const low = blob.toLowerCase();
@@ -119,12 +125,16 @@ export async function probePublicLive(watchUrl: string): Promise<ProbeResult> {
     low.includes("consent") ||
     low.includes("http error 401") ||
     low.includes("http error 403") ||
-    low.includes("cookies")
+    (low.includes("cookies") && r.code !== 0)
   ) {
+    const detail = auth.length
+      ? "Instagram erişim engeli — yedek oturum/çerezler geçersiz veya yetersiz olabilir (Ayarlar → Instagram oturumu)."
+      : "Instagram giriş veya erişim engeli — Ayarlar → Instagram oturumu altına yedek hesap çerezlerini ekleyin.";
+    await setIgSessionLastError(env, detail);
     return {
       ok: false,
       kind: "blocked",
-      detail: "Instagram giriş veya erişim engeli (kimlik bilgisiz yakalama mümkün değil).",
+      detail,
     };
   }
 
@@ -262,12 +272,14 @@ async function startRecordingProcess(
   }
 
   const bin = ytDlpBin();
+  const auth = await ytDlpAuthArgs(env);
   const args = [
     bin,
     "--ignore-config",
     "--no-playlist",
     "--no-warnings",
     "--no-part",
+    ...auth,
     "-f",
     "best",
     "-o",
@@ -473,7 +485,10 @@ async function tickCapture(sql: Sql, env: AppEnv, row: {
     return;
   }
 
-  const probe = await probePublicLive(row.watch_url);
+  const probe = await probePublicLive(env, row.watch_url);
+  if (probe.ok) {
+    await setIgSessionLastError(env, null);
+  }
   await sql`
     UPDATE live_captures
     SET attempt_count = attempt_count + 1,

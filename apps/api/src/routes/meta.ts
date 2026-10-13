@@ -4,6 +4,13 @@ import { MODULES } from "@mezatizle/shared";
 import type { AppEnv } from "../lib/env.ts";
 import { totalSpendUsd } from "../lib/cost.ts";
 import { LIVE_CAPTURE_POLICY } from "../modules/live_capture.ts";
+import {
+  clearIgSession,
+  getIgSessionStatus,
+  saveIgCookiesFilePath,
+  saveIgCookiesText,
+  saveIgCredentials,
+} from "../modules/ig_session.ts";
 const CAPTURE_POLICY = LIVE_CAPTURE_POLICY;
 
 export function metaRoutes(sql: Sql, env: AppEnv) {
@@ -15,6 +22,7 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
 
   app.get("/settings", async (c) => {
     const spent = await totalSpendUsd(sql);
+    const igSession = await getIgSessionStatus(env);
     return c.json({
       profile: env.profile,
       hardSpendLimitUsd: env.hardSpendLimitUsd,
@@ -22,8 +30,59 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
       maxUploadBytes: env.maxUploadBytes,
       modules: MODULES,
       capture: CAPTURE_POLICY,
+      igSession,
       storageRoot: env.storageRoot,
     });
+  });
+
+  app.get("/settings/ig-session", async (c) => {
+    return c.json(await getIgSessionStatus(env));
+  });
+
+  app.post("/settings/ig-session", async (c) => {
+    try {
+      const ct = c.req.header("content-type") || "";
+      if (ct.includes("multipart/form-data")) {
+        const body = await c.req.parseBody();
+        const file = body["cookiesFile"];
+        if (file instanceof File) {
+          const text = await file.text();
+          return c.json(await saveIgCookiesText(env, text));
+        }
+        return c.json({ error: "cookiesFile gerekli" }, 400);
+      }
+      const body = (await c.req.json()) as {
+        cookiesText?: string;
+        cookiesPath?: string;
+        username?: string;
+        password?: string;
+      };
+      if (body.cookiesText?.trim()) {
+        return c.json(await saveIgCookiesText(env, body.cookiesText));
+      }
+      if (body.cookiesPath?.trim()) {
+        return c.json(await saveIgCookiesFilePath(env, body.cookiesPath));
+      }
+      if (body.username?.trim() && body.password) {
+        return c.json(
+          await saveIgCredentials(env, body.username, body.password),
+        );
+      }
+      return c.json(
+        {
+          error:
+            "cookiesText, cookiesPath veya username+password alanlarından biri gerekli",
+        },
+        400,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
+  });
+
+  app.delete("/settings/ig-session", async (c) => {
+    return c.json(await clearIgSession(env));
   });
 
   app.get("/metrics", async (c) => {

@@ -3,8 +3,9 @@ import { join, resolve, relative, isAbsolute } from "node:path";
 import { assertSafeRelativePath } from "@mezatizle/shared";
 
 export async function ensureStorageDirs(root: string) {
-  for (const sub of ["recordings", "audio", "frames", "products"]) {
-    await mkdir(join(root, sub), { recursive: true });
+  for (const sub of ["recordings", "audio", "frames", "products", "secrets"]) {
+    const mode = sub === "secrets" ? 0o700 : undefined;
+    await mkdir(join(root, sub), { recursive: true, ...(mode ? { mode } : {}) });
   }
 }
 
