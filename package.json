@@ -12,8 +12,12 @@
     "test": "bun test",
     "test:api": "bun test apps/api packages/db packages/shared",
     "typecheck": "bun run --filter '*' typecheck",
-    "worker": "cd workers/extractor && python3 worker.py"
+    "worker": "cd workers/extractor && ../../.venv/bin/python3 worker.py",
+    "start:live": "bash scripts/start-live.sh",
+    "synth:fixture": "./.venv/bin/python3 scripts/make-synthetic-live.py",
+    "smoke": "bun run scripts/smoke-pipeline.ts"
   },
+
   "dependencies": {
     "@mezatizle/db": "workspace:*",
     "@mezatizle/shared": "workspace:*"

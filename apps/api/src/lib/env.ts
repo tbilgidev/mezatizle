@@ -17,7 +17,8 @@ export function loadEnv() {
     corsOrigin: process.env.CORS_ORIGIN ?? "*",
     ffmpegPath: process.env.FFMPEG_PATH ?? "ffmpeg",
     ffprobePath: process.env.FFPROBE_PATH ?? "ffprobe",
-    frameIntervalSeconds: Number(process.env.FRAME_INTERVAL_SECONDS ?? "5"),
+    // Default 1s → 1 fps comment/product frames (override via FRAME_INTERVAL_SECONDS)
+    frameIntervalSeconds: Number(process.env.FRAME_INTERVAL_SECONDS ?? "1"),
     profile,
     hardSpendLimitUsd: profile.hardSpendLimitUsd,
   };

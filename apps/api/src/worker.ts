@@ -16,7 +16,7 @@ import {
   ocrFramesMock,
   tryPythonWorker,
 } from "./modules/asr_ocr.ts";
-import { assertUnderSpendLimit } from "./lib/cost.ts";
+import { assertUnderSpendLimit, recordApiUsage, recordMetric } from "./lib/cost.ts";
 
 const env = loadEnv();
 const sql = createSql(env.databaseUrl);
@@ -58,10 +58,26 @@ async function processJob() {
           result = await transcribeMock(sql, env, job.recording_id);
         } else {
           const py = await tryPythonWorker("transcribe", job.recording_id, env);
-          result = py.ok
-            ? (py as Record<string, unknown>)
-            : await transcribeMock(sql, env, job.recording_id);
-          if (!py.ok) result = { ...result, pythonError: py.detail };
+          if (!py.ok) {
+            throw new Error(`ASR failed (faster-whisper): ${py.detail}`);
+          }
+          result = py as Record<string, unknown>;
+          await recordApiUsage(sql, {
+            provider: "local",
+            operation: "asr_faster_whisper",
+            units: Number(py.segments ?? 0),
+            unitCostUsd: 0,
+            recordingId: job.recording_id,
+            meta: { backend: py.backend, model: py.model ?? null },
+          });
+          await recordMetric(sql, {
+            name: "asr_segments",
+            value: Number(py.segments ?? 0),
+            unit: "count",
+            recordingId: job.recording_id,
+            jobId: job.id,
+            labels: { backend: String(py.backend ?? "") },
+          });
         }
         break;
       }
@@ -71,9 +87,26 @@ async function processJob() {
           result = await ocrFramesMock(sql, env, job.recording_id);
         } else {
           const py = await tryPythonWorker("ocr", job.recording_id, env);
-          result = py.ok
-            ? (py as Record<string, unknown>)
-            : await ocrFramesMock(sql, env, job.recording_id);
+          if (!py.ok) {
+            throw new Error(`OCR failed: ${py.detail}`);
+          }
+          result = py as Record<string, unknown>;
+          await recordApiUsage(sql, {
+            provider: "local",
+            operation: "ocr_local",
+            units: Number(py.texts ?? py.frames ?? 0),
+            unitCostUsd: 0,
+            recordingId: job.recording_id,
+            meta: { backend: py.backend, crop: py.crop ?? null },
+          });
+          await recordMetric(sql, {
+            name: "ocr_texts",
+            value: Number(py.texts ?? 0),
+            unit: "count",
+            recordingId: job.recording_id,
+            jobId: job.id,
+            labels: { backend: String(py.backend ?? "") },
+          });
         }
         break;
       }
@@ -84,11 +117,25 @@ async function processJob() {
           WHERE id = ${job.recording_id}
         `;
         result = await segmentAuctionFromSignals(sql, job.recording_id);
+        await recordMetric(sql, {
+          name: "auction_events",
+          value: Number((result as { eventsCreated?: number }).eventsCreated ?? 0),
+          unit: "count",
+          recordingId: job.recording_id,
+          jobId: job.id,
+        });
         break;
       }
       case "reconcile_sales": {
         await updateJobProgress(sql, job.id, 80, "reconcile");
-        result = await reconcileSales(sql, job.recording_id);
+        result = await reconcileSales(sql, job.recording_id, env.storageRoot);
+        await recordMetric(sql, {
+          name: "sales_created",
+          value: Number((result as { salesCreated?: number }).salesCreated ?? 0),
+          unit: "count",
+          recordingId: job.recording_id,
+          jobId: job.id,
+        });
         break;
       }
       default:
@@ -99,11 +146,17 @@ async function processJob() {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     await failJob(sql, job.id, msg);
-    await sql`
-      UPDATE recordings SET status = 'failed', error_message = ${msg}, updated_at = now()
-      WHERE id = ${job.recording_id}
-        AND status NOT IN ('complete')
+    const terminal = await sql<{ status: string }[]>`
+      SELECT status FROM processing_jobs WHERE id = ${job.id}
     `;
+    // Only mark recording failed when the job is permanently failed (not retrying).
+    if (terminal[0]?.status === "failed") {
+      await sql`
+        UPDATE recordings SET status = 'failed', error_message = ${msg}, updated_at = now()
+        WHERE id = ${job.recording_id}
+          AND status NOT IN ('complete')
+      `;
+    }
   }
   return true;
 }

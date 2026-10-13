@@ -4,7 +4,7 @@ export interface ProfileConfig {
   profile: ProcessingProfile;
   allowPaidApis: boolean;
   asrBackend: "faster-whisper" | "mock" | "openai-whisper-api";
-  ocrBackend: "paddleocr" | "tesseract" | "mock" | "vision-api";
+  ocrBackend: "paddleocr" | "tesseract" | "auto" | "mock" | "vision-api";
   llmBackend: "none" | "local-rules" | "openai";
   hardSpendLimitUsd: number;
 }
@@ -45,11 +45,20 @@ export function resolveProfile(
     };
   }
   // LOCAL default — never call paid APIs
+  const ocrEngine = (env.OCR_ENGINE ?? "tesseract").toLowerCase();
+  const ocrBackend =
+    env.FORCE_MOCK_OCR === "1"
+      ? "mock"
+      : ocrEngine === "paddle" || ocrEngine === "paddleocr"
+        ? "paddleocr"
+        : ocrEngine === "auto"
+          ? "auto"
+          : "tesseract";
   return {
     profile: "LOCAL",
     allowPaidApis: false,
     asrBackend: env.FORCE_MOCK_ASR === "1" ? "mock" : "faster-whisper",
-    ocrBackend: env.FORCE_MOCK_OCR === "1" ? "mock" : "paddleocr",
+    ocrBackend,
     llmBackend: "local-rules",
     hardSpendLimitUsd: 0,
   };

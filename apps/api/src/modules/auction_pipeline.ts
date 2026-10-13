@@ -7,6 +7,7 @@ async function attachProductImage(
   storageRoot: string,
   recordingId: string,
   productId: string,
+  offsetMs: number | null = null,
 ) {
   const framesDir = join(storageRoot, "frames", recordingId);
   const outDir = join(storageRoot, "products");
@@ -16,8 +17,27 @@ async function attachProductImage(
       .filter((f) => f.endsWith(".jpg"))
       .sort();
     if (!files[0]) return null;
+    // Prefer frame nearest to sale offset (frame_NNNNN @ OCR_FPS, default 1fps)
+    const fps = Number(process.env.OCR_FPS ?? process.env.FRAME_FPS ?? "1");
+    let pick = files[0]!;
+    if (offsetMs != null && Number.isFinite(offsetMs) && fps > 0) {
+      const targetIdx = Math.max(1, Math.round((offsetMs / 1000) * fps) + 1);
+      let best = files[0]!;
+      let bestDist = Infinity;
+      for (const f of files) {
+        const m = f.match(/(\d+)/);
+        if (!m) continue;
+        const idx = Number(m[1]);
+        const dist = Math.abs(idx - targetIdx);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = f;
+        }
+      }
+      pick = best;
+    }
     const dest = join(outDir, `${productId}.jpg`);
-    await copyFile(join(framesDir, files[0]), dest);
+    await copyFile(join(framesDir, pick), dest);
     return `products/${productId}.jpg`;
   } catch {
     return null;
@@ -135,6 +155,7 @@ export async function reconcileSales(
       storageRoot,
       recordingId,
       product[0]!.id,
+      ev.offset_ms,
     );
     if (imagePath) {
       await sql`

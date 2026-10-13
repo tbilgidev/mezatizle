@@ -1,6 +1,12 @@
-# Optional heavy deps — LOCAL profile falls back to mock if missing.
-# Install only when you want real ASR/OCR on a machine with enough disk/RAM.
-# faster-whisper>=1.0.3
-# paddleocr>=2.7.0
-# paddlepaddle>=2.6.0
+# LOCAL profile real providers (install into repo .venv)
 psycopg[binary]>=3.2.0
+faster-whisper>=1.0.3
+av>=12,<14
+pillow>=10.0.0
+pytesseract>=0.3.10
+numpy>=1.26.0,<2
+# Fixture / smoke TTS (not used in production path)
+edge-tts>=6.1.0
+# Optional: PaddleOCR — currently incompatible with this host's Python 3.12 + numpy stack.
+# When workable: pip install paddlepaddle==2.6.2 paddleocr==2.7.3 && OCR_ENGINE=paddle
+# Default OCR is system tesseract (tur+eng) via pytesseract.

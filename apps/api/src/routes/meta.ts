@@ -35,6 +35,20 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
       captureQuality: CAPTURE_QUALITY,
       igSession,
       storageRoot: env.storageRoot,
+      localProviders: {
+        asr: {
+          backend: env.profile.asrBackend,
+          model: process.env.WHISPER_MODEL ?? "base",
+          mockForced: process.env.FORCE_MOCK_ASR === "1",
+        },
+        ocr: {
+          backend: env.profile.ocrBackend,
+          engine: process.env.OCR_ENGINE ?? "tesseract",
+          fps: Number(process.env.OCR_FPS ?? "1"),
+          crop: process.env.OCR_CROP_FRAC ?? "0.45,0.35,0.98,0.95",
+          mockForced: process.env.FORCE_MOCK_OCR === "1",
+        },
+      },
     });
   });
 

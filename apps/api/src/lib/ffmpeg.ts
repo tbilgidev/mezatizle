@@ -74,6 +74,12 @@ export async function extractAudioAndFrames(opts: {
     throw new Error(await new Response(audio.stderr).text());
   }
   const framesPattern = `${opts.framesDir}/frame_%05d.jpg`;
+  // Prefer explicit fps (OCR_FPS / FRAME_FPS); else 1/intervalSeconds
+  const fpsEnv = Number(process.env.OCR_FPS ?? process.env.FRAME_FPS ?? "");
+  const fps =
+    Number.isFinite(fpsEnv) && fpsEnv > 0
+      ? fpsEnv
+      : 1 / Math.max(0.1, opts.intervalSeconds);
   const frames = Bun.spawn(
     [
       opts.ffmpegPath,
@@ -81,7 +87,7 @@ export async function extractAudioAndFrames(opts: {
       "-i",
       opts.inputPath,
       "-vf",
-      `fps=1/${opts.intervalSeconds}`,
+      `fps=${fps}`,
       "-q:v",
       "3",
       framesPattern,
