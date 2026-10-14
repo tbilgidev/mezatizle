@@ -151,15 +151,30 @@ async function fillLoginForm(
   await userInput.click({ timeout: 5000 });
   await userInput.fill("");
   await userInput.fill(username);
+
+  // Ensure full password lands (no truncation / race). Verify via inputValue.
   await passInput.click({ timeout: 5000 });
   await passInput.fill("");
   await passInput.fill(password);
+  let got = await passInput.inputValue().catch(() => "");
+  if (got.length !== password.length || got !== password) {
+    await passInput.click({ timeout: 5000 });
+    await passInput.fill("");
+    await passInput.pressSequentially(password, { delay: 35 });
+    got = await passInput.inputValue().catch(() => "");
+  }
+  if (got.length !== password.length) {
+    throw new Error(
+      `Parola alanı eksik doldu (beklenen ${password.length} karakter, gelen ${got.length}). Tekrar deneyin.`,
+    );
+  }
 
   const submit = page
     .locator('button[type="submit"]')
     .or(page.getByRole("button", { name: /log\s*in|giriş\s*yap/i }))
     .first();
-  await submit.click({ timeout: 10_000 });
+  await submit.waitFor({ state: "visible", timeout: 15_000 });
+  await submit.click({ timeout: 15_000 });
 }
 
 function classifyPage(url: string, bodyText: string): {
