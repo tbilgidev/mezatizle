@@ -28,6 +28,9 @@ export function SettingsPage() {
   const [ok, setOk] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwMsg, setPwMsg] = useState<string | null>(null);
+  const [pwErr, setPwErr] = useState<string | null>(null);
 
   async function refresh() {
     const [s, m, session] = await Promise.all([
@@ -259,34 +262,61 @@ export function SettingsPage() {
               Yalnızca izleme/kayıt için yedek hesap. Normal tarayıcı girişi —
               özel API veya bot aşımı yok. Başarılı olursa çerezler kaydedilir;
               parola sunucuda şifreli kalır (<strong>••••</strong>), yanıtta dönmez.
+              İşlem 1–2 dakika sürebilir — butona bir kez basın.
             </p>
+            {pwBusy && (
+              <p className="badge warn" style={{ display: "block", marginBottom: 8 }}>
+                Playwright sunucuda Instagram’a giriş yapıyor… Lütfen bekleyin (1–2 dk).
+              </p>
+            )}
+            {pwMsg && (
+              <p>
+                <span className="badge ok">{pwMsg}</span>
+              </p>
+            )}
+            {pwErr && <ErrorState message={pwErr} />}
             <form
               className="row"
               onSubmit={(e) => {
                 e.preventDefault();
+                if (pwBusy || busy) return;
+                const form = e.currentTarget;
+                const fd = new FormData(form);
+                const username = String(fd.get("username") ?? "");
+                const password = String(fd.get("password") ?? "");
                 void (async () => {
+                  setPwBusy(true);
                   setBusy(true);
                   setError(null);
                   setOk(null);
-                  const fd = new FormData(e.currentTarget);
+                  setPwMsg(null);
+                  setPwErr(null);
                   try {
                     const st = (await api.playwrightIgLogin({
-                      username: String(fd.get("username") ?? ""),
-                      password: String(fd.get("password") ?? ""),
+                      username,
+                      password,
                     })) as unknown as IgSession;
                     setIg(st);
-                    setOk(
-                      "Playwright girişi tamam — çerezler yüklü. Parola saklandı (••••).",
-                    );
-                    e.currentTarget.reset();
+                    const success =
+                      st.hasCookies || st.status === "yuklu"
+                        ? "Playwright girişi tamam — durum: Yüklü. Çerezler kaydedildi; parola saklandı (••••)."
+                        : "İstek tamamlandı; durum: " +
+                          (STATUS_TR[st.status] ?? st.status);
+                    setPwMsg(success);
+                    setOk(success);
+                    form.reset();
                   } catch (err) {
-                    setError(err instanceof Error ? err.message : String(err));
+                    const msg =
+                      err instanceof Error ? err.message : String(err);
+                    setPwErr(msg);
+                    setError(msg);
                     try {
                       setIg(await api.igSession());
                     } catch {
                       /* ignore */
                     }
                   } finally {
+                    setPwBusy(false);
                     setBusy(false);
                   }
                 })();
@@ -294,7 +324,13 @@ export function SettingsPage() {
             >
               <label>
                 Kullanıcı adı
-                <input name="username" autoComplete="username" placeholder="yedek_hesap" required />
+                <input
+                  name="username"
+                  autoComplete="username"
+                  placeholder="yedek_hesap"
+                  required
+                  disabled={pwBusy}
+                />
               </label>
               <label>
                 Parola
@@ -304,10 +340,11 @@ export function SettingsPage() {
                   autoComplete="current-password"
                   placeholder="••••••••"
                   required
+                  disabled={pwBusy}
                 />
               </label>
-              <button type="submit" disabled={busy}>
-                {busy ? "Giriş yapılıyor…" : "Playwright ile giriş yap"}
+              <button type="submit" disabled={busy || pwBusy}>
+                {pwBusy ? "Giriş yapılıyor… (bekleyin)" : "Playwright ile giriş yap"}
               </button>
             </form>
 

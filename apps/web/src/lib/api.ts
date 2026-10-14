@@ -128,15 +128,29 @@ export const api = {
     request<Record<string, unknown>>("/api/settings/ig-session", {
       method: "DELETE",
     }),
-  playwrightIgLogin: (body: {
+  playwrightIgLogin: async (body: {
     username: string;
     password: string;
     headless?: boolean;
-  }) =>
-    request<Record<string, unknown>>("/api/settings/ig-session/playwright-login", {
+  }) => {
+    const res = await fetch(url("/api/settings/ig-session/playwright-login"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    }),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      error?: string;
+      errorTr?: string;
+      screenshotPath?: string | null;
+      status?: string;
+      hasCookies?: boolean;
+      lastError?: string | null;
+    };
+    if (!res.ok) {
+      const msg = data.errorTr || data.error || res.statusText || "Giriş başarısız";
+      throw new Error(msg);
+    }
+    return data as Record<string, unknown>;
+  },
   csvUrl: () => url("/api/sales/export.csv"),
 };

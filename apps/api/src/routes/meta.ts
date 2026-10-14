@@ -124,7 +124,20 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      return c.json({ error: msg }, 400);
+      const shot =
+        err && typeof err === "object" && "screenshotPath" in err
+          ? String((err as { screenshotPath?: string }).screenshotPath ?? "")
+          : "";
+      const session = await getIgSessionStatus(env);
+      return c.json(
+        {
+          error: msg,
+          errorTr: msg,
+          screenshotPath: shot || null,
+          ...session,
+        },
+        400,
+      );
     }
   });
 
