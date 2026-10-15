@@ -12,8 +12,10 @@ import {
   parsePriceTry,
   parseSpokenBuyerName,
   parseTurkishWordAmount,
+  reconcileMezatWindows,
   resolveProfile,
   SALE_MIN_CONFIDENCE,
+  type TimelineEvent,
 } from "@mezatizle/shared";
 
 describe("shared validation", () => {
@@ -42,8 +44,8 @@ describe("Turkish auction rules", () => {
   test("sold with @buyer + currency is high confidence", () => {
     const s = parseAuctionText("Satıldı @mehmet_demo 700 TL");
     expect(s?.eventType).toBe("sold");
-    expect(s?.amountTry).toBe(700);
     expect(s?.buyerHint).toBe("mehmet_demo");
+    expect(s?.amountTry).toBe(700);
     expect(s!.confidence).toBeGreaterThanOrEqual(0.9);
     expect(isSaleWorthy(s!)).toBe(true);
   });
@@ -52,25 +54,27 @@ describe("Turkish auction rules", () => {
     const s = parseAuctionText("aldım 500 TL", { source: "comment" });
     expect(s?.eventType).toBe("bid");
     expect(s?.amountTry).toBe(500);
-    // Default (no source) also stays bid — UI OCR / unknown
-    expect(parseAuctionText("aldım 500 TL")?.eventType).toBe("bid");
+    expect(parseAuctionText("aldım TL", { source: "comment" })?.eventType).toBe(
+      "bid",
+    );
   });
 
-  test("seller transcript aldım + bin/lira is sold (buyer unknown OK)", () => {
+  test("seller transcript aldım + bin/lira is ASK not sold", () => {
     const s = parseAuctionText("Fincanı aldım on bin lira", {
       source: "transcript",
     });
-    expect(s?.eventType).toBe("sold");
+    expect(s?.eventType).toBe("price_mention");
+    expect(s?.reason).toBe("seller_aldim_ask");
     expect(s?.amountTry).toBe(10000);
-    expect(s?.buyerHint).toBeUndefined();
-    expect(isSaleWorthy(s!)).toBe(true);
+    expect(isSaleWorthy({ eventType: s!.eventType, confidence: s!.confidence })).toBe(
+      false,
+    );
 
     const s2 = parseAuctionText("Bu da aldım 8 bin lira", {
       source: "transcript",
     });
-    expect(s2?.eventType).toBe("sold");
+    expect(s2?.eventType).toBe("price_mention");
     expect(s2?.amountTry).toBe(8000);
-    expect(isSaleWorthy(s2!)).toBe(true);
   });
 
   test("Turkish number words and N bin", () => {
@@ -98,8 +102,8 @@ describe("Turkish auction rules", () => {
     expect(s?.eventType).toBe("sold");
     expect(s?.buyerHint).toBeUndefined();
     expect(s?.amountTry).toBe(700);
-    // price+currency still sale-worthy; buyer stays unknown
-    expect(isSaleWorthy(s!)).toBe(true);
+    // price without @buyer is below sale gate now (prefer unknown)
+    expect(isSaleWorthy(s!)).toBe(false);
   });
 
   test("satılmadı / iptal / düzeltme are pass not sold", () => {
@@ -181,12 +185,195 @@ describe("Turkish auction rules", () => {
     expect(solds.length).toBeGreaterThanOrEqual(2);
     expect(solds.some((s) => s.amountTry === 700)).toBe(true);
     expect(solds.some((s) => s.amountTry === 450)).toBe(true);
-    expect(solds.every((s) => !s.buyerHint)).toBe(true); // no @ invented
-    expect(solds.every((s) => isSaleWorthy(s))).toBe(true);
+    expect(solds.every((s) => !s.buyerHint)).toBe(true);
   });
 });
 
-/** Fixture gold labels — precision/recall-ish for rule layer (no ASR). */
+describe("mezat window reconcile", () => {
+  const ev = (
+    partial: Partial<TimelineEvent> &
+      Pick<TimelineEvent, "id" | "offsetMs" | "eventType" | "matched">,
+  ): TimelineEvent => ({
+    source: "transcript",
+    confidence: 0.8,
+    ...partial,
+  });
+
+  test("seller ask alone creates no sale", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "1",
+        offsetMs: 1000,
+        eventType: "price_mention",
+        matched: "Fincanı aldım on bin lira",
+        amountTry: 10000,
+        reason: "seller_aldim_ask",
+      }),
+      ev({
+        id: "2",
+        offsetMs: 20000,
+        eventType: "price_mention",
+        matched: "Bu aldım üç bin",
+        amountTry: 3000,
+        reason: "seller_aldim_ask",
+      }),
+    ]);
+    expect(sales.length).toBe(0);
+  });
+
+  test("first follower aldım comment wins at ask price", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 1000,
+        eventType: "price_mention",
+        matched: "aldım 20000 lira",
+        amountTry: 20000,
+        reason: "seller_aldim_ask",
+      }),
+      ev({
+        id: "c1",
+        offsetMs: 3000,
+        eventType: "bid",
+        matched: "aldım",
+        buyerHint: "ayse_demo",
+        reason: "aldim_claim",
+        source: "comment",
+        confidence: 0.6,
+      }),
+      ev({
+        id: "c2",
+        offsetMs: 5000,
+        eventType: "bid",
+        matched: "aldım",
+        buyerHint: "late_bidder",
+        reason: "aldim_claim",
+        source: "comment",
+        confidence: 0.6,
+      }),
+      ev({
+        id: "next",
+        offsetMs: 30000,
+        eventType: "price_mention",
+        matched: "aldım 5000 lira",
+        amountTry: 5000,
+        reason: "seller_aldim_ask",
+      }),
+    ]);
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.buyerUsername).toBe("ayse_demo");
+    expect(sales[0]!.amountTry).toBe(20000);
+    expect(sales[0]!.saleMethod).toBe("aldim_first_comment");
+  });
+
+  test("bid then seller confirm correlates OCR buyer", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "açılış 1000 TL",
+        amountTry: 1000,
+        reason: "price_mention",
+      }),
+      ev({
+        id: "b1",
+        offsetMs: 2000,
+        eventType: "bid",
+        matched: "1200",
+        amountTry: 1200,
+        buyerHint: "mehmet_demo",
+        source: "comment",
+        reason: "bid_phrase",
+      }),
+      ev({
+        id: "win",
+        offsetMs: 8000,
+        eventType: "sold",
+        matched: "satıldı 1200 TL",
+        amountTry: 1200,
+        reason: "sold+price+currency_no_buyer",
+        confidence: 0.72,
+      }),
+    ]);
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.buyerUsername).toBe("mehmet_demo");
+    expect(sales[0]!.amountTry).toBe(1200);
+    expect(sales[0]!.saleMethod).toBe("bid_win_confirm");
+  });
+
+  test("counter-offer accept uses buyer amount", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "aldım 20000 lira",
+        amountTry: 20000,
+        reason: "seller_aldim_ask",
+      }),
+      ev({
+        id: "c",
+        offsetMs: 4000,
+        eventType: "bid",
+        matched: "18 veririm",
+        amountTry: 18000,
+        buyerHint: "canan_v",
+        source: "comment",
+        reason: "counter_offer",
+      }),
+      ev({
+        id: "ok",
+        offsetMs: 7000,
+        eventType: "sold",
+        matched: "tamam olur",
+        reason: "counter_accept",
+        confidence: 0.68,
+      }),
+    ]);
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.buyerUsername).toBe("canan_v");
+    expect(sales[0]!.amountTry).toBe(18000);
+    expect(sales[0]!.saleMethod).toBe("counter_accept");
+  });
+
+  test("unsold pass yields no sale", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "aldım 5000 lira",
+        amountTry: 5000,
+        reason: "seller_aldim_ask",
+      }),
+      ev({
+        id: "pass",
+        offsetMs: 10000,
+        eventType: "pass",
+        matched: "satılmadı kalıyor",
+        reason: "unsold_or_pass",
+      }),
+    ]);
+    expect(sales.length).toBe(0);
+  });
+
+  test("sold without buyer evidence is not materialized", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "win",
+        offsetMs: 1000,
+        eventType: "sold",
+        matched: "satıldı 700 TL",
+        amountTry: 700,
+        reason: "sold+price+currency_no_buyer",
+        confidence: 0.82,
+      }),
+    ]);
+    expect(sales.length).toBe(0);
+  });
+});
+
 describe("fixture gold labels (rules precision/recall)", () => {
   const lines = [
     { text: "Sıradaki ürün: lacivert ceket, açılış 500 TL", want: "item_intro" },
@@ -198,7 +385,7 @@ describe("fixture gold labels (rules precision/recall)", () => {
     { text: "Satıldı @ayse_demo 450 TL", want: "sold" },
     { text: "aldım 400", want: "bid" },
     { text: "satılmadı kalıyor", want: "pass" },
-    { text: "satıldı", want: "sold" }, // weak — not sale-worthy
+    { text: "satıldı", want: "sold" },
   ];
 
   test("event-type accuracy on gold lines", () => {
@@ -212,12 +399,12 @@ describe("fixture gold labels (rules precision/recall)", () => {
     expect(recall).toBeGreaterThanOrEqual(0.9);
   });
 
-  test("sale-worthy only strong solds (precision gate)", () => {
+  test("sale-worthy only strong solds with @buyer (precision gate)", () => {
     const solds = lines
       .map((l) => parseAuctionText(l.text))
       .filter((s) => s?.eventType === "sold");
     const worthy = solds.filter((s) => isSaleWorthy(s!));
-    // "satıldı" alone must not pass; two @+price lines should
+    // Only the two @+price+currency lines should pass (satıldı alone and satıldı without @ fail)
     expect(worthy.length).toBe(2);
     expect(worthy.every((s) => s!.buyerHint && s!.amountTry)).toBe(true);
   });

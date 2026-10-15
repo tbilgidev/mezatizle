@@ -2,13 +2,12 @@ import { copyFile, mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Sql } from "@mezatizle/db";
 import {
-  enrichSoldFromBids,
   explainSaleTr,
   isSaleWorthy,
   parseAuctionTexts,
+  reconcileMezatWindows,
   SALE_MIN_CONFIDENCE,
-  type BidContext,
-  type ParsedAuctionSignal,
+  type TimelineEvent,
 } from "@mezatizle/shared";
 
 async function attachProductImage(
@@ -55,7 +54,6 @@ export async function segmentAuctionFromSignals(
   sql: Sql,
   recordingId: string,
 ) {
-  // Idempotent re-runs: drop prior events for this recording
   await sql`DELETE FROM auction_events WHERE recording_id = ${recordingId}`;
 
   const segments = await sql<{
@@ -78,20 +76,11 @@ export async function segmentAuctionFromSignals(
     ORDER BY COALESCE(offset_ms, 0) ASC
   `;
 
-  const bidCtx: BidContext[] = [];
   let created = 0;
 
   for (const seg of segments) {
     const signals = parseAuctionTexts(seg.text, { source: "transcript" });
     for (const signal of signals) {
-      if (signal.eventType === "bid" && signal.buyerHint) {
-        bidCtx.push({
-          offsetMs: seg.start_ms,
-          amountTry: signal.amountTry,
-          buyerHint: signal.buyerHint,
-          source: "transcript",
-        });
-      }
       await sql`
         INSERT INTO auction_events (recording_id, event_type, offset_ms, payload, confidence)
         VALUES (
@@ -117,17 +106,8 @@ export async function segmentAuctionFromSignals(
         c.author_username && /^[A-Za-z0-9._]{1,30}$/.test(c.author_username)
           ? c.author_username.toLowerCase()
           : undefined;
-      // Prefer explicit @ in body; else OCR author column for bids only
       if (author && !signal.buyerHint && signal.eventType === "bid") {
         signal = { ...signal, buyerHint: author };
-      }
-      if (signal.eventType === "bid" && signal.buyerHint) {
-        bidCtx.push({
-          offsetMs: c.offset_ms ?? 0,
-          amountTry: signal.amountTry,
-          buyerHint: signal.buyerHint,
-          source: "comment",
-        });
       }
       await sql`
         INSERT INTO auction_events (recording_id, event_type, offset_ms, payload, confidence)
@@ -148,62 +128,7 @@ export async function segmentAuctionFromSignals(
     }
   }
 
-  // Second pass: enrich sold events lacking @ from nearby bid @handles
-  const soldRows = await sql<{
-    id: string;
-    offset_ms: number | null;
-    payload: Record<string, unknown>;
-    confidence: number | null;
-  }[]>`
-    SELECT id, offset_ms, payload, confidence FROM auction_events
-    WHERE recording_id = ${recordingId} AND event_type = 'sold'
-  `;
-  let enriched = 0;
-  for (const row of soldRows) {
-    const base: ParsedAuctionSignal = {
-      eventType: "sold",
-      confidence: Number(row.confidence ?? 0),
-      matched: String(row.payload.matched ?? ""),
-      amountTry:
-        row.payload.amountTry != null
-          ? Number(row.payload.amountTry)
-          : undefined,
-      buyerHint:
-        typeof row.payload.buyerHint === "string"
-          ? row.payload.buyerHint
-          : undefined,
-      reason:
-        typeof row.payload.reason === "string" ? row.payload.reason : undefined,
-    };
-    const next = enrichSoldFromBids(base, bidCtx, row.offset_ms ?? 0);
-    if (next.buyerHint && next.buyerHint !== base.buyerHint) {
-      await sql`
-        UPDATE auction_events
-        SET confidence = ${next.confidence},
-            payload = payload || ${sql.json({
-              buyerHint: next.buyerHint,
-              confidence: next.confidence,
-              reason: next.reason,
-              enrichedFromBid: true,
-            })}::jsonb
-        WHERE id = ${row.id}
-      `;
-      enriched++;
-    }
-  }
-
-  return { eventsCreated: created, soldEnrichedFromBids: enriched };
-}
-
-function saleMethodFromReason(reason: unknown, source: unknown): string {
-  const r = typeof reason === "string" ? reason : "";
-  if (r.includes("seller_aldim")) return "seller_aldim";
-  if (r.includes("bid_lookback") || r.includes("+bid_lookback")) {
-    return "sold_phrase_bid_enriched";
-  }
-  if (source === "comment") return "comment_sold";
-  if (r.includes("sold")) return "sold_phrase";
-  return source === "transcript" ? "transcript_sold" : "unknown";
+  return { eventsCreated: created, soldEnrichedFromBids: 0 };
 }
 
 export async function reconcileSales(
@@ -223,7 +148,6 @@ export async function reconcileSales(
   );
   const gate = Number.isFinite(minConf) ? minConf : SALE_MIN_CONFIDENCE;
 
-  // Idempotent: remove prior auto sales/evidence/products for this recording
   const oldSales = await sql<{ id: string; product_id: string | null }[]>`
     SELECT id, product_id FROM sales WHERE recording_id = ${recordingId}
   `;
@@ -239,62 +163,68 @@ export async function reconcileSales(
     }
   }
 
-  const sold = await sql<{
+  const rows = await sql<{
     id: string;
     offset_ms: number | null;
+    event_type: string;
     payload: Record<string, unknown>;
     confidence: number | null;
   }[]>`
-    SELECT id, offset_ms, payload, confidence FROM auction_events
-    WHERE recording_id = ${recordingId} AND event_type = 'sold'
+    SELECT id, offset_ms, event_type, payload, confidence FROM auction_events
+    WHERE recording_id = ${recordingId}
     ORDER BY COALESCE(offset_ms, 0) ASC
   `;
 
+  const timeline: TimelineEvent[] = rows.map((r) => {
+    const p = r.payload ?? {};
+    const source =
+      p.source === "comment" ? "comment" : ("transcript" as const);
+    return {
+      id: r.id,
+      offsetMs: Number(r.offset_ms ?? 0),
+      eventType: r.event_type as TimelineEvent["eventType"],
+      source,
+      amountTry:
+        p.amountTry != null && Number.isFinite(Number(p.amountTry))
+          ? Number(p.amountTry)
+          : undefined,
+      buyerHint: typeof p.buyerHint === "string" ? p.buyerHint : undefined,
+      spokenBuyerName:
+        typeof p.spokenBuyerName === "string" ? p.spokenBuyerName : undefined,
+      reason: typeof p.reason === "string" ? p.reason : undefined,
+      matched: typeof p.matched === "string" ? p.matched : "",
+      confidence: Number(r.confidence ?? p.confidence ?? 0),
+      productHint:
+        typeof p.productHint === "string" ? p.productHint : undefined,
+    };
+  });
+
+  const candidates = reconcileMezatWindows(timeline);
+
   let salesCreated = 0;
   let skippedLowConfidence = 0;
+  let skippedNoBuyer = 0;
   let skippedDuplicate = 0;
   const seenKeys = new Set<string>();
-  for (const ev of sold) {
-    const conf = Number(ev.confidence ?? ev.payload.confidence ?? 0);
-    const pseudo = {
-      eventType: "sold" as const,
-      confidence: conf,
-    };
-    if (!isSaleWorthy(pseudo)) {
+
+  for (const cand of candidates) {
+    const pseudo = { eventType: "sold" as const, confidence: cand.confidence };
+    if (!isSaleWorthy(pseudo) || cand.confidence < gate) {
       skippedLowConfidence++;
       continue;
     }
+    if (!cand.buyerUsername) {
+      skippedNoBuyer++;
+      continue;
+    }
 
-    const rawAmount = Number(ev.payload.amountTry);
     const amountCents =
-      Number.isFinite(rawAmount) && rawAmount >= 10
-        ? Math.round(rawAmount * 100)
+      cand.amountTry != null && cand.amountTry >= 10
+        ? Math.round(cand.amountTry * 100)
         : null;
-
-    const buyerRaw =
-      typeof ev.payload.buyerHint === "string"
-        ? ev.payload.buyerHint.trim().replace(/^@/, "").toLowerCase()
-        : "";
-    const buyer =
-      buyerRaw && /^[a-z0-9._]{1,30}$/.test(buyerRaw) ? buyerRaw : null;
-
-    const spokenRaw =
-      typeof ev.payload.spokenBuyerName === "string"
-        ? ev.payload.spokenBuyerName.trim()
-        : "";
-    const spokenBuyerName =
-      spokenRaw &&
-      spokenRaw.length >= 2 &&
-      (!buyer || spokenRaw.toLowerCase() !== buyer)
-        ? spokenRaw.slice(0, 40)
-        : null;
-
-    // Dedupe: same amount within ~8s window (transcript repeats)
-    const offsetMs = ev.offset_ms != null ? Number(ev.offset_ms) : null;
-    const dedupeKey =
-      amountCents != null
-        ? `${amountCents}:${Math.floor((offsetMs ?? 0) / 8000)}`
-        : `${buyer ?? "_"}:${offsetMs ?? "_"}`;
+    const buyer = cand.buyerUsername;
+    const offsetMs = cand.offsetMs;
+    const dedupeKey = `${buyer}:${amountCents ?? "_"}:${Math.floor(offsetMs / 8000)}`;
     if (seenKeys.has(dedupeKey)) {
       skippedDuplicate++;
       continue;
@@ -302,35 +232,24 @@ export async function reconcileSales(
     seenKeys.add(dedupeKey);
 
     const gaps: string[] = [];
-    if (!buyer) gaps.push("buyer_unknown");
     if (amountCents == null) gaps.push("amount_unknown");
 
-    const matched =
-      typeof ev.payload.matched === "string" ? ev.payload.matched.trim() : "";
     const productHint =
-      typeof ev.payload.productHint === "string" &&
-      ev.payload.productHint.trim().length > 2
-        ? ev.payload.productHint.trim().slice(0, 200)
-        : matched.length > 2
-          ? matched.slice(0, 200)
-          : `Canlı lot @ ${offsetMs ?? 0}ms (inceleme)`;
+      cand.productHint && cand.productHint.trim().length > 2
+        ? cand.productHint.trim().slice(0, 200)
+        : `Canlı lot @ ${offsetMs}ms (inceleme)`;
 
-    const saleMethod = saleMethodFromReason(
-      ev.payload.reason,
-      ev.payload.source,
-    );
-
+    const saleMethod = cand.saleMethod;
     const explanation = explainSaleTr({
-      confidence: conf,
-      reason:
-        typeof ev.payload.reason === "string" ? ev.payload.reason : null,
+      confidence: cand.confidence,
+      reason: cand.reason,
       buyer,
       amountCents,
       gaps,
     });
 
     const soldAt =
-      offsetMs != null && Number.isFinite(recordedAt.getTime())
+      Number.isFinite(recordedAt.getTime())
         ? new Date(recordedAt.getTime() + offsetMs)
         : new Date();
 
@@ -339,15 +258,15 @@ export async function reconcileSales(
       VALUES (
         ${sellerId},
         ${productHint},
-        ${matched || "Otomatik aday ürün — LOCAL kurallar; yanlış olursa reddedin"},
+        ${productHint},
         ${sql.json({
-          sourceEventId: ev.id,
-          confidence: conf,
+          confidence: cand.confidence,
           amountKnown: amountCents != null,
-          buyerKnown: buyer != null,
-          spokenBuyerName,
+          buyerKnown: true,
+          spokenBuyerName: cand.spokenBuyerName ?? null,
           saleMethod,
           offsetMs,
+          askAmountTry: cand.askAmountTry ?? null,
           gaps,
         })}
       )
@@ -385,50 +304,39 @@ export async function reconcileSales(
       RETURNING id
     `;
 
-    const refTable =
-      ev.payload.source === "comment"
-        ? "observed_comments"
-        : ev.payload.source === "transcript"
-          ? "transcript_segments"
-          : "auction_events";
-    const refId =
-      typeof ev.payload.refId === "string" ? ev.payload.refId : ev.id;
-
     await sql`
       INSERT INTO sale_evidence (sale_id, evidence_type, ref_table, ref_id, note, payload)
       VALUES (
         ${sale[0]!.id},
         'auction_event',
         'auction_events',
-        ${ev.id},
-        ${"Satış olayı eşlemesi (yüksek güven kapısı)"},
+        ${cand.evidenceEventIds[0] ?? sale[0]!.id},
+        ${"Mezat penceresi eşlemesi (alıcı kanıtı zorunlu)"},
         ${sql.json({
-          confidence: conf,
+          confidence: cand.confidence,
           gate,
-          reason: ev.payload.reason ?? null,
+          reason: cand.reason,
           saleMethod,
           amountCents,
           buyer,
-          spokenBuyerName,
+          spokenBuyerName: cand.spokenBuyerName ?? null,
           gaps,
           explanationTr: explanation,
           offsetMs,
+          evidenceEventIds: cand.evidenceEventIds,
         })}
       )
     `;
-    if (refId && refTable !== "auction_events") {
+    for (const eid of cand.evidenceEventIds.slice(1)) {
       await sql`
         INSERT INTO sale_evidence (sale_id, evidence_type, ref_table, ref_id, note, payload)
         VALUES (
           ${sale[0]!.id},
-          ${refTable === "observed_comments" ? "comment" : "transcript"},
-          ${refTable},
-          ${refId},
-          ${"Kaynak satır (uydurma yok)"},
-          ${sql.json({
-            matched: ev.payload.matched ?? null,
-            offsetMs,
-          })}
+          'auction_event',
+          'auction_events',
+          ${eid},
+          ${"İlgili mezat olayı"},
+          ${sql.json({ offsetMs })}
         )
       `;
     }
@@ -442,7 +350,9 @@ export async function reconcileSales(
   return {
     salesCreated,
     skippedLowConfidence,
+    skippedNoBuyer,
     skippedDuplicate,
     saleMinConfidence: gate,
+    candidatesConsidered: candidates.length,
   };
 }

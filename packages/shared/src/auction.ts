@@ -2,12 +2,13 @@
  *
  * Priorities: (1) minimize cost  (2) miss few real sales  (3) never invent wrong buyer/price.
  *
- * Semantics:
- * - Comment "aldım" / "500" / "+50" → bid (never sold)
- * - Seller "satıldı @user 700 TL" → sold (high confidence with @ + currency)
- * - Spoken first name without @ → never becomes buyer_username
- * - Corrections / iptal / satılmadı → pass (void), not sold
- * - OCR noise (garbage glyphs, lone digits) → ignored by caller via null / low conf
+ * Turkish mezat model (yesilkoy-style “aldım” lives):
+ * - Seller «aldım X lira» / ask price → **listing / opening price**, NEVER a sale by itself
+ * - After ask: first follower comment «aldım» (OCR, with username) → buyer at listed price
+ * - Bidding: opening → OCR bids («X», «X veririm») → seller win confirm → sale
+ * - Counter: buyer «18 veririm» + seller accept → sale at 18 (not ask)
+ * - Spoken first name without @ → never buyer_username
+ * - Prefer unknown / no sale over inventing from seller chatter
  */
 
 export type AuctionEventType =
@@ -22,7 +23,7 @@ export interface ParsedAuctionSignal {
   eventType: AuctionEventType;
   amountTry?: number;
   buyerHint?: string;
-  /** Spoken first name after satıldı — never copied into buyer_username. */
+  /** Spoken first name after win phrase — never copied into buyer_username. */
   spokenBuyerName?: string;
   productHint?: string;
   confidence: number;
@@ -34,7 +35,6 @@ export interface ParsedAuctionSignal {
 export type ParseAuctionSource = "transcript" | "comment";
 
 export type ParseAuctionOpts = {
-  /** Comment "aldım" stays bid; seller transcript "aldım … bin/lira" → sold. */
   source?: ParseAuctionSource;
 };
 
@@ -44,24 +44,33 @@ export const SALE_MIN_CONFIDENCE = 0.78;
 /** Window (ms) to look for nearby OCR bids when attaching a buyer to a sold event. */
 export const SALE_BID_LOOKBACK_MS = 45_000;
 
+/** Max ms after ask for first comment «aldım» to claim the lot. */
+export const ALDIM_CLAIM_WINDOW_MS = 90_000;
+
 const CORRECTION_RE =
   /(düzeltme|duzeltme|yanl[ıi][sş]|iptal(?:\s+edildi)?|geri\s*al|özür|ozur|hata\s*oldu|yanl[ıi][sş]\s*söyled|vazgeç|vazge[cç]|işlem\s*yok|islem\s*yok)/i;
 
 const UNSOLD_RE =
-  /(sat[ıi]lmad[ıi]|kal[ıi]yor|kaldi|kald[ıi]|kimse\s+almad[ıi]|al[ıi]c[ıi]\s+yok|passt|\bpas\b|geçiyoruz|geciyoruz|geçtik|gectik|bir\s+sonraki|sıradaki\s+ürüne)/i;
+  /(sat[ıi]lmad[ıi]|kal[ıi]yor(?!\s*@)|kimse\s+almad[ıi]|al[ıi]c[ıi]\s+yok|passt|\bpas\b|geçiyoruz|geciyoruz|geçtik|gectik|bir\s+sonraki|sıradaki\s+ürüne)/i;
 
-/** Seller closing phrases — NOT "aldım". */
+/** Explicit seller win / sold — NOT seller «aldım» ask. */
 const SOLD_RE =
-  /(sat[ıi]ld[ıi]|sold(?:\s+to)?|alan(?:[ıi])?\s+bell[iı]|satt[ıi]k|kazanan\s*[:@]|gitti\s*[@]|kapatt[ıi]k|onaylad[ıi]m\s*sat|tebrikler\s*@)/i;
+  /(sat[ıi]ld[ıi]|sold(?:\s+to)?|alan(?:[ıi])?\s+bell[iı]|satt[ıi]k|kazanan\s*[:@]|gitti\s*[@]|kapatt[ıi]k|onaylad[ıi]m\s*sat|tebrikler\s*@|['']?da\s+kald[ıi]|da\s+kald[ıi]|kazand[ıi]|ald[ıi]\s+@|@\w+\s+ald[ıi])/i;
+
+/** Seller accepts a counter-offer. */
+const ACCEPT_RE =
+  /\b(tamam|olur|kabul|senin\s*olsun|anla[sş]t[ıi]k|veriyorum\s*sana|al\s+o\s+zaman|oldu\s+bu|peki\s+olur|okey|okay)\b/i;
 
 const BID_RE =
   /(ald[ıi]m|al[ıi]yorum|ben\s+ald[ıi]m|ben\s*[-:]?\s*\d+|^\s*\+?\s*\d{2,7}\s*(tl|₺|try)?\s*$|artt[ıi]r(?:d[ıi]m)?|arttir|veriyorum|veririm|\+\s*\d{2,7}|bid|benim|üstüne|ustune)/i;
+
+const COUNTER_RE = /(\d{2,7}|[a-zçğıöşü\s]+bin)\s*veririm|\bveririm\b/i;
 
 const INTRO_RE =
   /(s[ıi]radaki|yeni\s+ürün|yeni\s+urun|lot\s*\d+|ürünümüz|urunumüz|ba[sş]l[ıi]yoruz|a[cç][ıi]l[ıi][sş]\s*\d)/i;
 
 const PRICE_WORD_RE =
-  /(fiyat|a[cç][ıi]l[ıi][sş]|acilis|minimum|min\.?|a[cç]ılış|son\s+fiyat)/i;
+  /(fiyat|a[cç][ıi]l[ıi][sş]|acilis|minimum|min\.?|a[cç]ılış|son\s+fiyat|a[cç][ıi]yorum)/i;
 
 const IG_USER_RE = /@([A-Za-z0-9._]{1,30})/g;
 
@@ -73,23 +82,19 @@ export function isAuctionNoise(text: string): boolean {
   const letters = (t.match(/[A-Za-zÀ-ÿĞğÜüŞşİıÖöÇç]/g) || []).length;
   const digits = (t.match(/\d/g) || []).length;
   if (letters + digits < 2) return true;
-  // High symbol ratio (OCR garbage)
   const symbols = (t.match(/[^A-Za-zÀ-ÿĞğÜüŞşİıÖöÇç0-9\s@._+\-₺]/g) || [])
     .length;
   if (t.length >= 4 && symbols / t.length > 0.45) return true;
   return false;
 }
 
-// Avoid \\b after Turkish letters — JS \\w excludes ı/ğ/ş/…
 const CURRENCY_RE =
   /(?:tl|₺|try|türk\s*liras[ıi]|turk\s*liras[ıi]|liras[ıi]?)/i;
 
-/** True when a currency marker is present (incl. Whisper "Türk lirası"). */
 export function hasCurrencyMarker(text: string): boolean {
   return CURRENCY_RE.test(text);
 }
 
-/** Fold Turkish letters for number-word lookup (Whisper often mixes I/İ). */
 export function foldTrToken(raw: string): string {
   return raw
     .toLocaleLowerCase("tr-TR")
@@ -126,10 +131,6 @@ const TR_TENS: Record<string, number> = {
   doksan: 90,
 };
 
-/**
- * Parse a Turkish cardinal from tokens starting at `start`
- * (e.g. "uc","bin","bes","yuz" → 3500). Stops at first non-number token.
- */
 export function consumeTrNumberTokens(
   tokens: string[],
   start = 0,
@@ -181,7 +182,6 @@ export function consumeTrNumberTokens(
   return { value, next: i };
 }
 
-/** Best Turkish word / "N bin" amount in text (prefer spans near currency/bin). */
 export function parseTurkishWordAmount(text: string): number | undefined {
   const folded = foldTrToken(text);
   const tokens = folded
@@ -194,7 +194,6 @@ export function parseTurkishWordAmount(text: string): number | undefined {
   for (let i = 0; i < tokens.length; i++) {
     const got = consumeTrNumberTokens(tokens, i);
     if (!got) continue;
-    // Prefer spans that include bin / yüz or are followed by lira/tl
     const span = tokens.slice(i, got.next);
     const followed = tokens[got.next] ?? "";
     const strong =
@@ -205,11 +204,9 @@ export function parseTurkishWordAmount(text: string): number | undefined {
       followed === "tl" ||
       followed === "try";
     if (strong || got.value >= 1000) candidates.push(got.value);
-    // Skip ahead lightly so "uc bin bes yuz" is one candidate, not many
     if (strong) i = Math.max(i, got.next - 1);
   }
   if (!candidates.length) return undefined;
-  // Prefer largest plausible auction amount (bin-scale) when several match
   const binScale = candidates.filter((n) => n >= 1000);
   const pool = binScale.length ? binScale : candidates;
   return Math.max(...pool);
@@ -233,7 +230,6 @@ export function parsePriceTry(text: string): number | undefined {
     return clampPriceTry(Number(raw));
   }
 
-  // "10 bin", "25 bin", "8 bin lira" (digits + bin) before bare digits
   const digitBin = foldTrToken(t).match(
     /(\d{1,3})\s*bin(?:\s+(\d{1,3}))?(?=\s|$|lira|tl|try|turk)/,
   );
@@ -254,7 +250,6 @@ export function parsePriceTry(text: string): number | undefined {
   return clampPriceTry(Number(raw));
 }
 
-/** Buyer only from explicit @handle — never invent from spoken first names. */
 export function parseBuyerHint(text: string): string | undefined {
   IG_USER_RE.lastIndex = 0;
   const m = IG_USER_RE.exec(text);
@@ -289,26 +284,45 @@ const SPOKEN_NAME_STOP = new Set(
     "yeni",
     "urun",
     "urunumuz",
+    "aldi",
+    "kaldi",
   ].map(foldTrToken),
 );
 
 /**
- * Spoken name after satıldı/sold when no @handle — for UI only, never buyer_username.
+ * Spoken name from win phrases («Mehmet aldı», «satıldı Ayşe») — UI only.
  */
 export function parseSpokenBuyerName(text: string): string | undefined {
   if (parseBuyerHint(text)) return undefined;
-  const m = text.match(
+  const patterns = [
     /(?:sat[ıi]ld[ıi]|sold(?:\s+to)?)\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})(?=\s|$|,|\d)/i,
-  );
-  if (!m?.[1]) return undefined;
-  const name = m[1].trim();
-  if (SPOKEN_NAME_STOP.has(foldTrToken(name))) return undefined;
-  if (/^\d/.test(name)) return undefined;
-  return name;
+    /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\s+ald[ıi](?!\s*m)\b/i,
+    /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})['']?da\s+kald[ıi]/i,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (!m?.[1]) continue;
+    const name = m[1].trim();
+    if (SPOKEN_NAME_STOP.has(foldTrToken(name))) continue;
+    if (/^\d/.test(name)) continue;
+    return name;
+  }
+  return undefined;
 }
 
-/** Seller ASR closing: "aldım on bin lira" / "Bu da aldım 8 bin" — not a viewer bid. */
+/**
+ * Seller ASR «aldım on bin lira» = ASK / opening price — not a completed sale.
+ * @deprecated name kept for callers; use isSellerAldimAsk.
+ */
 export function isSellerAldimClosing(
+  text: string,
+  amountTry: number | undefined,
+): boolean {
+  return isSellerAldimAsk(text, amountTry);
+}
+
+/** Seller listing phrase with amount (bin/lira). */
+export function isSellerAldimAsk(
   text: string,
   amountTry: number | undefined,
 ): boolean {
@@ -317,7 +331,6 @@ export function isSellerAldimClosing(
   if (SOLD_RE.test(text)) return false;
   const hasBin = /\bbin\b/i.test(text);
   const hasCur = hasCurrencyMarker(text);
-  // Require bin and/or currency so bare "aldım 1500" stays unknown (prefer miss).
   return hasBin || hasCur;
 }
 
@@ -333,10 +346,10 @@ function soldConfidence(
     return { confidence: 0.85, reason: "sold+@buyer+price" };
   }
   if (hasPrice && hasCurrency) {
-    return { confidence: 0.82, reason: "sold+price+currency" };
+    return { confidence: 0.72, reason: "sold+price+currency_no_buyer" };
   }
   if (hasPrice) {
-    return { confidence: 0.72, reason: "sold+price_no_currency" };
+    return { confidence: 0.62, reason: "sold+price_no_currency" };
   }
   if (hasBuyer) {
     return { confidence: 0.7, reason: "sold+@buyer_no_price" };
@@ -344,27 +357,26 @@ function soldConfidence(
   return { confidence: 0.55, reason: "sold_phrase_only" };
 }
 
-/**
- * Split long ASR lines that contain multiple lots ("… satıldı A … satıldı B …").
- * Prefer clause boundaries; fall back to sold-phrase splits.
- */
 export function splitAuctionClauses(text: string): string[] {
   const t = text.trim();
   if (!t) return [];
   const byPunct = t
-    .split(/(?<=[.!?…])\s+|(?<=,)\s+(?=(?:sat[ıi]ld[ıi]|sold|yeni\s+ürün|s[ıi]radaki))/i)
+    .split(
+      /(?<=[.!?…])\s+|(?<=,)\s+(?=(?:sat[ıi]ld[ıi]|sold|yeni\s+ürün|s[ıi]radaki|ald[ıi]m))/i,
+    )
     .map((s) => s.trim())
     .filter(Boolean);
   if (byPunct.length > 1) return byPunct;
 
-  // Explicit multi-sold: split before each sold keyword after the first char
-  const soldSplit = t.split(/(?=\bsat[ıi]ld[ıi]\b|\bsold\b)/i).map((s) => s.trim()).filter(Boolean);
+  const soldSplit = t
+    .split(/(?=\bsat[ıi]ld[ıi]\b|\bsold\b)/i)
+    .map((s) => s.trim())
+    .filter(Boolean);
   if (soldSplit.length > 1) return soldSplit;
 
   return [t];
 }
 
-/** Parse one or many signals from a transcript/OCR line. */
 export function parseAuctionTexts(
   text: string,
   opts?: ParseAuctionOpts,
@@ -384,7 +396,6 @@ export function parseAuctionText(
   const t = text.trim();
   if (isAuctionNoise(t)) return null;
 
-  // Corrections / seller void → do not emit sold from this line
   if (CORRECTION_RE.test(t)) {
     return {
       eventType: "pass",
@@ -396,7 +407,6 @@ export function parseAuctionText(
     };
   }
 
-  // Unsold / pass before sold ("satılmadı" contains satıl…)
   if (UNSOLD_RE.test(t)) {
     return {
       eventType: "pass",
@@ -413,7 +423,7 @@ export function parseAuctionText(
   const spokenBuyerName = parseSpokenBuyerName(t);
   const source = opts?.source;
 
-  // Explicit sold phrases first
+  // Explicit win / sold (seller confirmation) — requires evidence later
   if (SOLD_RE.test(t)) {
     const { confidence, reason } = soldConfidence(
       Boolean(buyerHint),
@@ -431,40 +441,58 @@ export function parseAuctionText(
     };
   }
 
-  // Seller transcript closing: "aldım on bin lira" → sold (buyer often unknown)
-  // Comment / default "aldım 500" stays bid — never invent a sale from stray bids.
-  if (BID_RE.test(t)) {
-    if (
-      source === "transcript" &&
-      isSellerAldimClosing(t, amountTry)
-    ) {
-      const hasBin = /\bbin\b/i.test(t);
-      const { confidence, reason } = soldConfidence(
-        Boolean(buyerHint),
-        amountTry != null,
-        hasCurrency || hasBin,
-      );
-      return {
-        eventType: "sold",
-        amountTry,
-        buyerHint,
-        spokenBuyerName,
-        confidence: Math.max(confidence, hasCurrency || hasBin ? 0.82 : 0.72),
-        matched: t,
-        reason: `seller_aldim_close+${reason}`,
-      };
+  // Seller accept of counter («tamam 18 bin», «olur») — bare «tamam» alone is chatter
+  if (source === "transcript" && ACCEPT_RE.test(t)) {
+    const bareChatter = /^(tamam|olur|okey|okay|kabul|peki)[.!?…]*$/i.test(t);
+    if (bareChatter && amountTry == null && !buyerHint) {
+      return null;
     }
+    return {
+      eventType: "sold",
+      amountTry,
+      buyerHint,
+      spokenBuyerName,
+      confidence: amountTry != null ? 0.8 : 0.55,
+      matched: t,
+      reason: amountTry != null ? "counter_accept+price" : "counter_accept",
+    };
+  }
+
+  // Seller «aldım X lira» = ASK PRICE (listing), never sold
+  if (source === "transcript" && isSellerAldimAsk(t, amountTry)) {
+    return {
+      eventType: "price_mention",
+      amountTry,
+      productHint: t.slice(0, 120),
+      confidence: hasCurrency || /\bbin\b/i.test(t) ? 0.75 : 0.65,
+      matched: t,
+      reason: "seller_aldim_ask",
+    };
+  }
+
+  // Follower / OCR bids (incl. bare «aldım», «18 veririm»)
+  if (BID_RE.test(t) || COUNTER_RE.test(t)) {
+    const isCounter = COUNTER_RE.test(t);
     return {
       eventType: "bid",
       amountTry,
       buyerHint,
-      confidence: amountTry ? (hasCurrency ? 0.72 : 0.65) : 0.55,
+      confidence: amountTry
+        ? hasCurrency
+          ? 0.72
+          : 0.65
+        : /ald[ıi]m/i.test(t)
+          ? 0.6
+          : 0.55,
       matched: t,
-      reason: "bid_phrase",
+      reason: isCounter
+        ? "counter_offer"
+        : /ald[ıi]m/i.test(t)
+          ? "aldim_claim"
+          : "bid_phrase",
     };
   }
 
-  // OCR comment shape: "@user 600" / "@user 600 TL" without sold/pass words → bid
   if (
     buyerHint &&
     amountTry != null &&
@@ -492,6 +520,21 @@ export function parseAuctionText(
     };
   }
 
+  // Seller opening price without «aldım»
+  if (
+    source === "transcript" &&
+    amountTry != null &&
+    (PRICE_WORD_RE.test(t) || hasCurrency || /\bbin\b/i.test(t))
+  ) {
+    return {
+      eventType: "price_mention",
+      amountTry,
+      confidence: hasCurrency ? 0.6 : 0.5,
+      matched: t,
+      reason: PRICE_WORD_RE.test(t) ? "price_mention" : "seller_price_line",
+    };
+  }
+
   if (amountTry != null && PRICE_WORD_RE.test(t)) {
     return {
       eventType: "price_mention",
@@ -505,7 +548,6 @@ export function parseAuctionText(
   return null;
 }
 
-/** True when a sold signal is strong enough to open a sale row. */
 export function isSaleWorthy(signal: {
   eventType: string;
   confidence: number;
@@ -521,13 +563,10 @@ export interface BidContext {
   amountTry?: number;
   buyerHint?: string;
   source: "comment" | "transcript";
+  reason?: string;
+  eventId?: string;
 }
 
-/**
- * Attach buyer from a nearby OCR bid when sold line lacks @handle.
- * Never invent: only reuse an existing @ from a bid in the lookback window,
- * optionally matching amount when both known.
- */
 export function enrichSoldFromBids(
   sold: ParsedAuctionSignal,
   bids: BidContext[],
@@ -557,7 +596,6 @@ export function enrichSoldFromBids(
     buyerHint: pick.buyerHint,
     reason: `${sold.reason ?? "sold"}+bid_lookback`,
   };
-  // Bump confidence slightly when we linked a real @ from a bid
   if (sold.amountTry != null && pick.amountTry === sold.amountTry) {
     next.confidence = Math.min(0.95, sold.confidence + 0.08);
   } else {
@@ -566,7 +604,266 @@ export function enrichSoldFromBids(
   return next;
 }
 
-/** Human-readable Turkish explanation for Kanıt UI / API. */
+export type TimelineEvent = {
+  id: string;
+  offsetMs: number;
+  eventType: AuctionEventType;
+  source: "transcript" | "comment";
+  amountTry?: number;
+  buyerHint?: string;
+  spokenBuyerName?: string;
+  reason?: string;
+  matched: string;
+  confidence: number;
+  productHint?: string;
+};
+
+export type SaleMethod =
+  | "aldim_first_comment"
+  | "bid_win_confirm"
+  | "counter_accept"
+  | "sold_phrase";
+
+export type SaleCandidate = {
+  offsetMs: number;
+  amountTry?: number;
+  buyerUsername?: string;
+  spokenBuyerName?: string;
+  confidence: number;
+  reason: string;
+  saleMethod: SaleMethod;
+  evidenceEventIds: string[];
+  productHint?: string;
+  askAmountTry?: number;
+};
+
+type LotWindow = {
+  openMs: number;
+  askAmount?: number;
+  productHint?: string;
+  openEventIds: string[];
+  /** First OCR «aldım» claimer after ask. */
+  aldimClaim?: { buyer: string; offsetMs: number; eventId: string };
+  bids: BidContext[];
+  closed: boolean;
+};
+
+/**
+ * Product-window reconcile: seller ask ≠ sale; first comment aldım wins;
+ * bid+confirm; counter+accept. Prefer no sale over inventing.
+ */
+export function reconcileMezatWindows(
+  events: TimelineEvent[],
+): SaleCandidate[] {
+  const sorted = [...events].sort((a, b) => a.offsetMs - b.offsetMs);
+  const sales: SaleCandidate[] = [];
+  let win: LotWindow | null = null;
+
+  const flushAldimIfClaimed = (closeMs: number) => {
+    if (!win || win.closed) return;
+    // Only auto-complete aldım lots when we have a real OCR buyer claim
+    // and no auction bidding superseded it.
+    if (
+      win.aldimClaim &&
+      win.askAmount != null &&
+      win.bids.filter((b) => b.amountTry != null).length === 0
+    ) {
+      sales.push({
+        offsetMs: win.aldimClaim.offsetMs,
+        amountTry: win.askAmount,
+        buyerUsername: win.aldimClaim.buyer,
+        confidence: 0.88,
+        reason: "aldim_first_comment+ask_price",
+        saleMethod: "aldim_first_comment",
+        evidenceEventIds: [
+          ...win.openEventIds,
+          win.aldimClaim.eventId,
+        ],
+        productHint: win.productHint,
+        askAmountTry: win.askAmount,
+      });
+    }
+    win.closed = true;
+    void closeMs;
+    win = null;
+  };
+
+  const openLot = (ev: TimelineEvent, ask?: number) => {
+    flushAldimIfClaimed(ev.offsetMs);
+    win = {
+      openMs: ev.offsetMs,
+      askAmount: ask ?? ev.amountTry,
+      productHint: ev.productHint ?? ev.matched.slice(0, 120),
+      openEventIds: [ev.id],
+      bids: [],
+      closed: false,
+    };
+  };
+
+  for (const ev of sorted) {
+    const reason = ev.reason ?? "";
+
+    if (ev.eventType === "pass") {
+      if (win && !win.closed) {
+        win.closed = true;
+        win = null;
+      }
+      continue;
+    }
+
+    if (
+      ev.eventType === "price_mention" ||
+      ev.eventType === "item_intro"
+    ) {
+      // New ask / product opens a window
+      if (
+        reason === "seller_aldim_ask" ||
+        reason === "seller_price_line" ||
+        reason === "price_mention" ||
+        ev.eventType === "item_intro"
+      ) {
+        openLot(ev, ev.amountTry);
+      } else if (win && !win.closed && ev.amountTry != null) {
+        win.askAmount = ev.amountTry;
+        win.openEventIds.push(ev.id);
+      }
+      continue;
+    }
+
+    if (ev.eventType === "bid") {
+      if (!win || win.closed) {
+        // Orphan bid — ignore as sale (need ask or later confirm)
+        continue;
+      }
+      const isAldimClaim =
+        reason === "aldim_claim" ||
+        (/ald[ıi]m/i.test(ev.matched) && ev.amountTry == null);
+      if (
+        isAldimClaim &&
+        ev.buyerHint &&
+        !win.aldimClaim &&
+        ev.offsetMs - win.openMs <= ALDIM_CLAIM_WINDOW_MS
+      ) {
+        win.aldimClaim = {
+          buyer: ev.buyerHint,
+          offsetMs: ev.offsetMs,
+          eventId: ev.id,
+        };
+      }
+      if (ev.buyerHint || ev.amountTry != null) {
+        win.bids.push({
+          offsetMs: ev.offsetMs,
+          amountTry: ev.amountTry,
+          buyerHint: ev.buyerHint,
+          source: ev.source,
+          reason: ev.reason,
+          eventId: ev.id,
+        });
+      }
+      continue;
+    }
+
+    if (ev.eventType === "sold") {
+      // Correlate with open window
+      let buyer = ev.buyerHint;
+      let amount = ev.amountTry;
+      let method: SaleMethod = reason.includes("counter_accept")
+        ? "counter_accept"
+        : "sold_phrase";
+      const evidence = [ev.id];
+
+      if (win && !win.closed) {
+        evidence.push(...win.openEventIds);
+        if (win.askAmount != null && amount == null) amount = win.askAmount;
+
+        // Counter-accept: take latest counter bid amount + buyer
+        if (method === "counter_accept" || reason.includes("counter_accept")) {
+          const counters = win.bids.filter(
+            (b) =>
+              b.reason === "counter_offer" ||
+              (b.amountTry != null && b.buyerHint),
+          );
+          const last = counters[counters.length - 1];
+          if (last) {
+            if (last.buyerHint) buyer = buyer ?? last.buyerHint;
+            if (last.amountTry != null) amount = last.amountTry;
+            if (last.eventId) evidence.push(last.eventId);
+            method = "counter_accept";
+          }
+        }
+
+        // Win confirm after bids
+        if (!buyer && win.bids.length) {
+          const enriched = enrichSoldFromBids(
+            {
+              eventType: "sold",
+              confidence: ev.confidence,
+              matched: ev.matched,
+              amountTry: amount,
+              buyerHint: buyer,
+              reason: ev.reason,
+            },
+            win.bids,
+            ev.offsetMs,
+          );
+          buyer = enriched.buyerHint;
+          if (buyer) method = "bid_win_confirm";
+          for (const b of win.bids) {
+            if (b.eventId && b.buyerHint === buyer) evidence.push(b.eventId);
+          }
+        }
+
+        // Aldım claim + seller later confirms
+        if (!buyer && win.aldimClaim) {
+          buyer = win.aldimClaim.buyer;
+          amount = amount ?? win.askAmount;
+          evidence.push(win.aldimClaim.eventId);
+          method = "aldim_first_comment";
+        }
+
+        win.closed = true;
+        win = null;
+      }
+
+      // Gate: need buyer comment OR @ on confirmation; price preferred
+      const hasBuyer = Boolean(buyer);
+      const hasPrice = amount != null;
+      let confidence = ev.confidence;
+      if (hasBuyer && hasPrice) confidence = Math.max(confidence, 0.88);
+      else if (hasBuyer) confidence = Math.max(confidence, 0.8);
+      else if (hasPrice) {
+        // Seller said satıldı with price but no @ / OCR buyer → skip (prefer unknown)
+        confidence = Math.min(confidence, 0.7);
+      } else {
+        confidence = Math.min(confidence, 0.55);
+      }
+
+      const pseudo = { eventType: "sold" as const, confidence };
+      if (!isSaleWorthy(pseudo)) continue;
+      // Extra precision: never materialize sale without buyer evidence
+      if (!hasBuyer) continue;
+
+      sales.push({
+        offsetMs: ev.offsetMs,
+        amountTry: amount,
+        buyerUsername: buyer,
+        spokenBuyerName: ev.spokenBuyerName,
+        confidence,
+        reason: `${reason || "sold"}+${method}`,
+        saleMethod: method,
+        evidenceEventIds: [...new Set(evidence)],
+        productHint: ev.productHint ?? ev.matched.slice(0, 120),
+        askAmountTry: amount,
+      });
+    }
+  }
+
+  // End of timeline: complete open aldım claim if any
+  flushAldimIfClaimed(Number.MAX_SAFE_INTEGER);
+
+  return sales;
+}
+
 export function explainSaleTr(opts: {
   confidence: number;
   reason?: string | null;

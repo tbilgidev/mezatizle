@@ -45,22 +45,26 @@ Code: `~/projects/mezatizle` · Branch: `cursor/analysis-pipeline-tighten-de0f`
 
 ---
 
-## 2. Turkish auction rules (tightened)
+## 2. Turkish mezat model (LOCAL rules)
 
-**File:** `packages/shared/src/auction.ts`
+**File:** `packages/shared/src/auction.ts` · window reconcile: `reconcileMezatWindows`
 
-| Input | Event | Confidence idea |
-|-------|-------|-----------------|
-| `aldım` / `+50` / `@user 600` | **bid** | Never sold |
-| `Satıldı @user 700 TL` | **sold** | ~0.92 → sale candidate |
-| `Satıldı Mehmet 700 TL` (no `@`) | **sold** | Buyer **unknown** (not invented); price kept if currency |
-| `satıldı` alone | **sold** | ~0.55 → **skipped** by gate |
-| `satılmadı` / `iptal` / `düzeltme` / `kalıyor` | **pass** | Void / unsold |
-| OCR garbage `###` | null | Noise filter |
+Seller «aldım X lira» is an **opening / listing (ask) price**, **not** a completed sale.
 
-**Bid lookback:** if sold lacks `@` but a nearby OCR bid has `@user` (+ matching amount), enrich buyer from that bid only (`enrichSoldFromBids`). Spoken first names never become `buyer_username`.
+| Input | Event | Sale? |
+|-------|-------|-------|
+| Seller ASR `aldım on bin lira` | `price_mention` (`seller_aldim_ask`) | **No** — opens product window |
+| First OCR comment `aldım` (+ username) after ask | `bid` (`aldim_claim`) | **Yes** at ask price when window closes / next lot (`aldim_first_comment`) |
+| OCR `1200` / `18 veririm` | `bid` | Only after seller win/accept |
+| Seller `satıldı @user`, `X’da kaldı`, `tebrikler @` | `sold` | Yes if `@` or OCR buyer correlated |
+| Seller `tamam` / `olur` after counter | `sold` (`counter_accept`) | Yes at counter amount + OCR buyer |
+| `Satıldı Mehmet` (spoken name, no `@`) | `sold` | **No sale row** — spoken ≠ username |
+| `satılmadı` / `iptal` / `kalıyor` | `pass` | Window void |
+| Seller ask with **no** follower claim | — | **No sale** (prefer unknown) |
 
-**Precision gate:** `isSaleWorthy` / `SALE_MIN_CONFIDENCE=0.78` — prefer **missing sale** over wrong buyer/price. Default status always **`needs_review`**.
+**Product windows:** open on ask / intro; close on win confirm, unsold pass, or next ask (flushing first-aldım claim if any).
+
+**Precision:** materialize a sale only with **buyer evidence** (OCR `@` / author username). `SALE_MIN_CONFIDENCE=0.78`. Status always `needs_review`.
 
 ---
 
