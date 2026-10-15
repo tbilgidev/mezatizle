@@ -1,32 +1,26 @@
 import { FormEvent, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api } from "../lib/api";
-import { EmptyState, ErrorState, LoadingState } from "../components/States";
-
-const CAPTURE_LABEL: Record<string, string> = {
-  bekleniyor: "Bekleniyor",
-  kaydediliyor: "Kaydediliyor",
-  bitti: "Bitti",
-  bulunamadi: "Yayın bulunamadı",
-  engellendi: "Erişim engellendi",
-  iptal: "İptal",
-  hata: "Hata",
-};
+import { api } from "@/lib/api";
+import { statusTr } from "@/lib/utils";
+import { EmptyState, ErrorState, LoadingState, PageHeader } from "@/components/States";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Field, Input } from "@/components/ui/input";
+import { Table, TBody, TD, TH, THead, TR } from "@/components/ui/table";
 
 function statusBadge(r: Record<string, unknown>) {
   const capture = r.capture_status ? String(r.capture_status) : "";
-  const label = capture
-    ? (CAPTURE_LABEL[capture] ?? capture)
-    : String(r.status);
-  const cls =
+  const label = capture ? statusTr(capture) : statusTr(String(r.status));
+  const variant =
     capture === "engellendi" ||
     capture === "hata" ||
     r.status === "failed"
-      ? "badge err"
+      ? "danger"
       : capture === "bitti" || r.status === "complete"
-        ? "badge ok"
-        : "badge warn";
-  return <span className={cls}>{label}</span>;
+        ? "ok"
+        : "warn";
+  return <Badge variant={variant as "ok" | "warn" | "danger"}>{label}</Badge>;
 }
 
 export function RecordingsPage() {
@@ -116,189 +110,189 @@ export function RecordingsPage() {
   }
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <div>
-          <h1>Kayıtlar</h1>
-          <p className="lead">
-            Satıcının canlı yayınını bağlantı veya @kullanıcı ile ekleyin. Yayın
-            çözülebilirse yerelde kaydedilir; bitince analiz kuyruğuna alınır.
-          </p>
-        </div>
-      </div>
+    <div className="mx-auto max-w-[1100px] animate-rise">
+      <PageHeader
+        title="Kayıtlar"
+        lead="Satıcının canlı yayınını bağlantı veya @kullanıcı ile ekleyin. Yayın çözülebilirse yerelde kaydedilir; bitince analiz kuyruğuna alınır."
+      />
 
-      <section className="hero-upload">
-        <h2>Canlı yayın ekle</h2>
-        <p className="muted" style={{ marginTop: 0 }}>
-          Instagram Live URL’si, profil linki veya <code>@kullanici</code>. Özel
-          API yok. Giriş gerektiren yayınlar için{" "}
-          <Link to="/settings#ig-oturum">Ayarlar → Instagram oturumu</Link>{" "}
-          altına yedek hesap çerezlerini ekleyin.
+      <section className="relative mb-4 overflow-hidden rounded-[1.35rem] border border-line bg-gradient-to-br from-mint/10 via-panel to-panel-2 p-5 shadow-[0_18px_50px_rgba(0,0,0,0.25)]">
+        <h2 className="font-display mb-1 text-xl font-bold tracking-tight">
+          Canlı yayın ekle
+        </h2>
+        <p className="mb-4 text-sm text-fog">
+          Instagram Live URL’si, profil linki veya <code>@kullanici</code>. Giriş
+          gerektiren yayınlar için{" "}
+          <Link to="/settings#ig-oturum" className="text-mint hover:underline">
+            Ayarlar → Instagram oturumu
+          </Link>
+          .
         </p>
-        <form className="row" onSubmit={onLiveSubmit}>
-          <label style={{ gridColumn: "1 / -1" }}>
-            Canlı link veya @kullanıcı
-            <input
+        <form className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4" onSubmit={onLiveSubmit}>
+          <Field label="Canlı link veya @kullanıcı" className="sm:col-span-2 lg:col-span-4">
+            <Input
               name="input"
               placeholder="https://www.instagram.com/satici/live/  veya  @satici"
               required
             />
-          </label>
-          <label>
-            Görünen ad (ops.)
-            <input name="displayName" placeholder="Satıcı adı" />
-          </label>
-          <label>
-            Kayıt süresi (dk)
-            <input
+          </Field>
+          <Field label="Görünen ad (ops.)">
+            <Input name="displayName" placeholder="Satıcı adı" />
+          </Field>
+          <Field label="Kayıt süresi (dk)">
+            <Input
               name="maxDurationMinutes"
               type="number"
               min={0}
               max={1440}
               step={1}
               placeholder="boş = tüm yayın"
-              title="Boş veya 0: canlı bitene kadar. Örn. 10, 180."
             />
-          </label>
-          <label>
-            Not (ops.)
-            <input name="notes" placeholder="opsiyonel" />
-          </label>
-          <button type="submit" disabled={busy}>
-            {busy ? "Ekleniyor…" : "Canlı yayın ekle"}
-          </button>
-          <p className="muted" style={{ gridColumn: "1 / -1", margin: 0, fontSize: "0.85rem" }}>
-            Varsayılan: yayının tamamı. Süre dolunca veya yayın bitince (hangisi önce)
-            kayıt sonlanır → analiz kuyruğu. Dosya kalitesi ~720p / CRF28 / AAC 80kbps
-            (disk dostu, ASR+OCR için yeterli).
-          </p>
+          </Field>
+          <Field label="Not (ops.)">
+            <Input name="notes" placeholder="opsiyonel" />
+          </Field>
+          <div className="flex items-end">
+            <Button type="submit" disabled={busy} className="w-full">
+              {busy ? "Ekleniyor…" : "Canlı yayın ekle"}
+            </Button>
+          </div>
         </form>
+        <p className="mt-3 text-xs text-fog">
+          Varsayılan: yayının tamamı. Süre dolunca veya yayın bitince kayıt
+          sonlanır → analiz. Dosya ~720p / CRF28 / AAC 80kbps.
+        </p>
         {ok && (
-          <p style={{ marginBottom: 0 }}>
-            <span className="badge ok">{ok}</span>
+          <p className="mt-3">
+            <Badge variant="ok">{ok}</Badge>
           </p>
         )}
-        {limitation && (
-          <p className="muted" style={{ marginBottom: 0, fontSize: "0.9rem" }}>
-            {limitation}
-          </p>
-        )}
+        {limitation && <p className="mt-2 text-sm text-fog">{limitation}</p>}
       </section>
 
       <details
-        className="panel"
+        className="mb-4 rounded-2xl border border-line bg-panel/70 px-5 py-4"
         open={showUpload}
         onToggle={(e) => setShowUpload((e.target as HTMLDetailsElement).open)}
       >
-        <summary style={{ cursor: "pointer", fontWeight: 600 }}>
+        <summary className="cursor-pointer font-semibold text-paper">
           Gelişmiş · Elle MP4 yükle
         </summary>
-        <p className="muted">
-          Zaten elinizde olan satıcıya ait MP4 kaydı için. Birincil yol canlı
-          yayındır.
+        <p className="mt-2 text-sm text-fog">
+          Zaten elinizde olan satıcıya ait MP4 için. Birincil yol canlı yayındır.
         </p>
-        <form className="row" onSubmit={onUploadSubmit}>
-          <label>
-            Dosya (.mp4)
-            <input name="file" type="file" accept="video/mp4,.mp4" required />
-          </label>
-          <label>
-            Instagram kullanıcı adı
-            <input
-              name="sellerInstagramUsername"
-              placeholder="ornek_satici"
-              required
-            />
-          </label>
-          <label>
-            Kayıt tarihi
-            <input
+        <form className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4" onSubmit={onUploadSubmit}>
+          <Field label="Dosya (.mp4)">
+            <Input name="file" type="file" accept="video/mp4,.mp4" required />
+          </Field>
+          <Field label="Instagram kullanıcı adı">
+            <Input name="sellerInstagramUsername" placeholder="ornek_satici" required />
+          </Field>
+          <Field label="Kayıt tarihi">
+            <Input
               name="recordedAt"
               type="datetime-local"
               required
               defaultValue={new Date().toISOString().slice(0, 16)}
             />
-          </label>
-          <label>
-            Not
-            <input name="notes" placeholder="opsiyonel" />
-          </label>
-          <button className="secondary" type="submit" disabled={busy}>
-            {busy ? "Yükleniyor…" : "MP4 yükle"}
-          </button>
+          </Field>
+          <Field label="Not">
+            <Input name="notes" placeholder="opsiyonel" />
+          </Field>
+          <div className="flex items-end">
+            <Button type="submit" variant="secondary" disabled={busy}>
+              {busy ? "Yükleniyor…" : "MP4 yükle"}
+            </Button>
+          </div>
         </form>
       </details>
 
-      {error && <ErrorState message={error} />}
+      {error && <ErrorState message={error} className="mb-4" />}
       {loading && <LoadingState label="Kayıtlar yükleniyor…" />}
 
       {!loading && (
-        <div className="panel">
-          <h2>Kayıt listesi</h2>
-          {!rows.length ? (
-            <EmptyState
-              title="Henüz kayıt yok"
-              hint="Yukarıdan bir canlı yayın ekleyerek başlayın."
-            />
-          ) : (
-            <table>
-              <thead>
-                <tr>
-                  <th>Satıcı</th>
-                  <th>Kaynak</th>
-                  <th>Durum</th>
-                  <th>Boyut</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r) => (
-                  <tr key={String(r.id)}>
-                    <td>@{String(r.instagram_username)}</td>
-                    <td>
-                      <Link to={`/recordings/${r.id}`}>
-                        {String(r.source_type) === "live"
-                          ? "Canlı"
-                          : String(r.original_filename)}
-                      </Link>
-                      {r.source_url ? (
-                        <div className="muted" style={{ fontSize: "0.8rem" }}>
-                          {String(r.source_url)}
-                        </div>
-                      ) : null}
-                      {r.last_probe_detail || r.capture_error ? (
-                        <div className="muted" style={{ fontSize: "0.8rem" }}>
-                          {String(r.capture_error || r.last_probe_detail)}
-                        </div>
-                      ) : null}
-                    </td>
-                    <td>{statusBadge(r)}</td>
-                    <td>
-                      {r.capture_bytes != null && Number(r.capture_bytes) > 0
-                        ? `${(Number(r.capture_bytes) / (1024 * 1024)).toFixed(1)} MB`
-                        : r.file_size_bytes != null
-                          ? `${(Number(r.file_size_bytes) / (1024 * 1024)).toFixed(1)} MB`
-                          : "—"}
-                    </td>
-                    <td>
-                      {String(r.source_type) === "live" &&
-                      (r.status === "awaiting_live" ||
-                        r.status === "recording") ? (
-                        <button
-                          type="button"
-                          className="secondary"
-                          onClick={() => void onCancel(String(r.id))}
+        <Card>
+          <CardHeader>
+            <CardTitle>Kayıt listesi</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {!rows.length ? (
+              <EmptyState
+                title="Henüz kayıt yok"
+                hint="Yukarıdan bir canlı yayın ekleyerek başlayın."
+              />
+            ) : (
+              <Table>
+                <THead>
+                  <TR>
+                    <TH>Satıcı</TH>
+                    <TH>Kaynak</TH>
+                    <TH>Durum</TH>
+                    <TH>Boyut</TH>
+                    <TH></TH>
+                  </TR>
+                </THead>
+                <TBody>
+                  {rows.map((r) => (
+                    <TR key={String(r.id)}>
+                      <TD>@{String(r.instagram_username)}</TD>
+                      <TD>
+                        <Link
+                          to={`/recordings/${r.id}`}
+                          className="font-semibold text-mint hover:text-mint-bright"
                         >
-                          İptal
-                        </button>
-                      ) : null}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
+                          {String(r.source_type) === "live"
+                            ? "Canlı"
+                            : String(r.original_filename)}
+                        </Link>
+                        {r.source_url ? (
+                          <div className="mt-0.5 max-w-[28rem] truncate text-xs text-fog">
+                            {String(r.source_url)}
+                          </div>
+                        ) : null}
+                        {r.last_probe_detail || r.capture_error ? (
+                          <div className="mt-0.5 text-xs text-fog">
+                            {String(r.capture_error || r.last_probe_detail)}
+                          </div>
+                        ) : null}
+                      </TD>
+                      <TD>{statusBadge(r)}</TD>
+                      <TD>
+                        {r.capture_bytes != null && Number(r.capture_bytes) > 0
+                          ? `${(Number(r.capture_bytes) / (1024 * 1024)).toFixed(1)} MB`
+                          : r.file_size_bytes != null
+                            ? `${(Number(r.file_size_bytes) / (1024 * 1024)).toFixed(1)} MB`
+                            : "—"}
+                      </TD>
+                      <TD>
+                        <div className="flex flex-wrap gap-2">
+                          <Link
+                            to={`/reports/${r.id}`}
+                            className="text-sm font-semibold text-fog hover:text-mint"
+                          >
+                            Rapor
+                          </Link>
+                          {String(r.source_type) === "live" &&
+                          (r.status === "awaiting_live" ||
+                            r.status === "recording") ? (
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="secondary"
+                              onClick={() => void onCancel(String(r.id))}
+                            >
+                              İptal
+                            </Button>
+                          ) : null}
+                        </div>
+                      </TD>
+                    </TR>
+                  ))}
+                </TBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card>
       )}
     </div>
   );

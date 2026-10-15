@@ -29,6 +29,48 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.text() as Promise<T>;
 }
 
+export type ReportListItem = {
+  recordingId: string;
+  sellerUsername: string;
+  displayName: string | null;
+  originalFilename: string;
+  status: string;
+  recordedAt: string | null;
+  uploadedAt: string | null;
+  durationSeconds: number | null;
+  saleCount: number;
+  needsReviewCount: number;
+  confirmedCount: number;
+  rejectedCount: number;
+  sumAmountTry: number | null;
+  currency: string;
+  sourceType: string | null;
+  avgEventConfidence: number | null;
+  headline: string;
+};
+
+export type ReportDetail = ReportListItem & {
+  sales: Array<{
+    id: string;
+    buyerUsername: string | null;
+    amountCents: number | null;
+    amountTry: number | null;
+    status: string;
+    productTitle: string | null;
+    soldAt: string | null;
+  }>;
+  eventCounts: Record<string, number>;
+  transcriptSegmentCount: number;
+  commentCount: number;
+  jobs: Array<{
+    jobType: string;
+    status: string;
+    progressPercent: number;
+    stage: string | null;
+    finishedAt: string | null;
+  }>;
+};
+
 export const api = {
   base: API_BASE || "(same-origin)",
   dashboard: () => request<Record<string, unknown>>("/api/dashboard"),
@@ -50,6 +92,19 @@ export const api = {
       `/api/recordings/${id}/events`,
     ),
   sales: () => request<{ sales: Array<Record<string, unknown>> }>("/api/sales"),
+  reports: () =>
+    request<{
+      reports: ReportListItem[];
+      totals: {
+        recordings: number;
+        sales: number;
+        needsReview: number;
+        sumAmountTry: number;
+        currency: string;
+      };
+    }>("/api/reports"),
+  report: (recordingId: string) =>
+    request<{ report: ReportDetail }>(`/api/reports/${recordingId}`),
   evidence: (id: string) =>
     request<{
       sale: Record<string, unknown>;
@@ -153,4 +208,6 @@ export const api = {
     return data as Record<string, unknown>;
   },
   csvUrl: () => url("/api/sales/export.csv"),
+  reportCsvUrl: (recordingId: string) =>
+    url(`/api/reports/${recordingId}/export.csv`),
 };

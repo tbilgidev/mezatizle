@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { api } from "../lib/api";
-import { EmptyState, ErrorState, LoadingState } from "../components/States";
+import { api } from "@/lib/api";
+import { formatTry, statusTr } from "@/lib/utils";
+import { EmptyState, ErrorState, LoadingState, PageHeader } from "@/components/States";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Field, Select } from "@/components/ui/input";
 
 export function EvidencePage() {
   const { id } = useParams();
@@ -53,19 +58,16 @@ export function EvidencePage() {
     }
   }
 
-  return (
-    <div className="page">
-      <div className="page-head">
-        <div>
-          <h1>Kanıt inceleme</h1>
-          <p className="lead">
-            Her satış adayının dayandığı olay ve referansları kontrol edin;
-            onaylayın veya reddedin.
-          </p>
-        </div>
-      </div>
+  const saleStatus = sale ? String(sale.status) : "";
 
-      {error && <ErrorState message={error} />}
+  return (
+    <div className="mx-auto max-w-[1100px] animate-rise">
+      <PageHeader
+        title="Kanıt inceleme"
+        lead="Her satış adayının dayandığı olay ve referansları kontrol edin; onaylayın veya reddedin."
+      />
+
+      {error && <ErrorState message={error} className="mb-4" />}
       {loading && <LoadingState />}
 
       {!loading && !sales.length && (
@@ -77,86 +79,103 @@ export function EvidencePage() {
 
       {!loading && !!sales.length && (
         <>
-          <div className="panel row">
-            <label>
-              Satış seç
-              <select
-                value={selected ?? ""}
-                onChange={(e) => setSelected(e.target.value)}
-              >
-                <option value="" disabled>
-                  Seçin
-                </option>
-                {sales.map((s) => (
-                  <option key={String(s.id)} value={String(s.id)}>
-                    {String(s.product_title ?? s.id)} ({String(s.status)})
+          <Card className="mb-4">
+            <CardContent className="flex flex-wrap items-end gap-3 pt-5">
+              <Field label="Satış seç" className="min-w-[220px] flex-1">
+                <Select
+                  value={selected ?? ""}
+                  onChange={(e) => setSelected(e.target.value)}
+                >
+                  <option value="" disabled>
+                    Seçin
                   </option>
-                ))}
-              </select>
-            </label>
-            {sale && (
-              <>
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => review("confirmed")}
-                >
-                  Onayla
-                </button>
-                <button
-                  type="button"
-                  className="danger"
-                  disabled={busy}
-                  onClick={() => review("rejected")}
-                >
-                  Reddet
-                </button>
-                <Link className="btn secondary" to="/sales">
-                  Satış listesi
-                </Link>
-              </>
-            )}
-          </div>
+                  {sales.map((s) => (
+                    <option key={String(s.id)} value={String(s.id)}>
+                      {String(s.product_title ?? s.id)} ({statusTr(String(s.status))})
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              {sale && (
+                <>
+                  <Button type="button" disabled={busy} onClick={() => review("confirmed")}>
+                    Onayla
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="danger"
+                    disabled={busy}
+                    onClick={() => review("rejected")}
+                  >
+                    Reddet
+                  </Button>
+                  {sale.recording_id ? (
+                    <Link
+                      to={`/reports/${String(sale.recording_id)}`}
+                      className="inline-flex h-10 items-center rounded-xl border border-line px-4 text-sm font-semibold text-fog hover:text-paper"
+                    >
+                      Rapora dön
+                    </Link>
+                  ) : (
+                    <Link
+                      to="/reports"
+                      className="inline-flex h-10 items-center rounded-xl border border-line px-4 text-sm font-semibold text-fog hover:text-paper"
+                    >
+                      Raporlar
+                    </Link>
+                  )}
+                </>
+              )}
+            </CardContent>
+          </Card>
 
           {busy && !sale && <LoadingState label="Kanıtlar getiriliyor…" />}
 
           {sale && (
-            <div className="panel">
-              <h2>Satış özeti</h2>
-              <p>
-                Durum:{" "}
-                <span
-                  className={
-                    sale.status === "needs_review"
-                      ? "badge warn"
-                      : sale.status === "confirmed"
-                        ? "badge ok"
-                        : "badge err"
-                  }
-                >
-                  {String(sale.status)}
-                </span>{" "}
-                · Tutar:{" "}
-                {sale.amount_cents != null
-                  ? `${Number(sale.amount_cents) / 100} TRY`
-                  : "—"}{" "}
-                · Alıcı: {sale.buyer_username ? `@${sale.buyer_username}` : "—"}
-              </p>
-              <h2>Kanıtlar</h2>
-              {!evidence.length ? (
-                <EmptyState title="Kanıt kaydı yok" />
-              ) : (
-                <ul>
-                  {evidence.map((e) => (
-                    <li key={String(e.id)}>
-                      <strong>{String(e.evidence_type)}</strong> —{" "}
-                      {String(e.note)} ({String(e.ref_table)}/
-                      {String(e.ref_id)})
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
+            <Card>
+              <CardHeader>
+                <CardTitle>Satış özeti</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="mb-4 text-sm">
+                  Durum:{" "}
+                  <Badge
+                    variant={
+                      saleStatus === "needs_review"
+                        ? "warn"
+                        : saleStatus === "confirmed"
+                          ? "ok"
+                          : "danger"
+                    }
+                  >
+                    {statusTr(saleStatus)}
+                  </Badge>{" "}
+                  · Tutar:{" "}
+                  {sale.amount_cents != null
+                    ? formatTry(Number(sale.amount_cents) / 100)
+                    : "—"}{" "}
+                  · Alıcı:{" "}
+                  {sale.buyer_username ? `@${sale.buyer_username}` : "—"}
+                </p>
+                <h3 className="font-display mb-2 text-base font-bold">Kanıtlar</h3>
+                {!evidence.length ? (
+                  <EmptyState title="Kanıt kaydı yok" />
+                ) : (
+                  <ul className="space-y-2">
+                    {evidence.map((e) => (
+                      <li
+                        key={String(e.id)}
+                        className="rounded-xl border border-line bg-ink/30 px-3 py-2 text-sm"
+                      >
+                        <strong className="text-mint">{String(e.evidence_type)}</strong>{" "}
+                        — {String(e.note)} ({String(e.ref_table)}/
+                        {String(e.ref_id)})
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </CardContent>
+            </Card>
           )}
         </>
       )}
