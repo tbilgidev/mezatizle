@@ -49,10 +49,12 @@ export function RecordingsPage() {
 
   async function onLiveSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    const form = e.currentTarget;
     setBusy(true);
     setError(null);
     setOk(null);
-    const fd = new FormData(e.currentTarget);
+    setLimitation(null);
+    const fd = new FormData(form);
     try {
       const durRaw = String(fd.get("maxDurationMinutes") ?? "").trim();
       const maxDurationMinutes = durRaw === "" ? null : Number(durRaw);
@@ -73,10 +75,14 @@ export function RecordingsPage() {
           : " · yayının tamamı";
       setOk(`Canlı oturum açıldı · ${res.recordingId.slice(0, 8)}…${durNote}`);
       setLimitation(res.policy?.limitationTr ?? null);
-      e.currentTarget.reset();
+      form.reset();
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Canlı yayın eklenemedi. Bağlantıyı veya oturumu kontrol edin.",
+      );
     } finally {
       setBusy(false);
     }
@@ -84,17 +90,22 @@ export function RecordingsPage() {
 
   async function onUploadSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    const form = e.currentTarget;
     setBusy(true);
     setError(null);
     setOk(null);
-    const fd = new FormData(e.currentTarget);
+    const fd = new FormData(form);
     try {
       const res = await api.upload(fd);
       setOk(`MP4 yüklendi · ${res.recordingId.slice(0, 8)}…`);
-      e.currentTarget.reset();
+      form.reset();
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(
+        err instanceof Error
+          ? err.message
+          : "MP4 yükleme başarısız. Dosyayı ve satıcı adını kontrol edin.",
+      );
     } finally {
       setBusy(false);
     }
