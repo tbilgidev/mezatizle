@@ -26,7 +26,10 @@ import {
 import { probeAvSync } from "../lib/ffmpeg.ts";
 import {
   extractBroadcastIdFromUrl,
+  getLiveViewerPresenceHealth,
   resolveLiveStreamWithPlaywright,
+  startLiveViewerPresence,
+  stopLiveViewerPresence,
   usernameFromWatchUrl,
 } from "./ig_live_playwright.ts";
 import { access } from "node:fs/promises";
@@ -456,6 +459,7 @@ export async function resumeBlockedLiveCapture(sql: Sql, recordingId: string) {
 }
 
 export async function cancelLiveCapture(sql: Sql, recordingId: string) {
+  await stopLiveViewerPresence(recordingId);
   const proc = activeProcs.get(recordingId);
   if (proc && !proc.killed) {
     try {
@@ -641,6 +645,19 @@ async function startRecordingProcess(
     WHERE id = ${recordingId}
   `;
 
+  // Keep spare-account browser session "watching" so IG can list them as a viewer.
+  // Does not feed ffmpeg — DASH capture continues separately.
+  void startLiveViewerPresence(env, {
+    recordingId,
+    watchUrl,
+    username: usernameFromWatchUrl(watchUrl) ?? undefined,
+    broadcastId: extractBroadcastIdFromUrl(watchUrl),
+  }).then((r) => {
+    if (!r.ok) {
+      console.warn(`[live-viewer] ${recordingId}: ${r.detail}`);
+    }
+  });
+
   let stderr = "";
   child.stderr.on("data", (d) => {
     stderr += String(d);
@@ -673,6 +690,7 @@ async function startRecordingProcess(
   child.on("close", (code) => {
     clearInterval(sizeTimer);
     activeProcs.delete(recordingId);
+    void stopLiveViewerPresence(recordingId);
     void finalizeRecording(sql, env, recordingId, destAbs, partAbs, code, stderr);
   });
 }
@@ -907,6 +925,7 @@ export function getLiveSupervisorHealth() {
     lastError: supervisorLastError,
     activeRecordings: activeProcs.size,
     probeIntervalMs: probeIntervalMs(),
+    viewerPresence: getLiveViewerPresenceHealth(),
   };
 }
 
@@ -916,16 +935,55 @@ export async function liveCaptureLoop(sql: Sql, env: AppEnv) {
   supervisorStartedAt = new Date().toISOString();
   console.log("[live-capture] supervisor started");
 
-  // Resume waiting sessions after restart
+  // Resume: only reclaim rows whose ffmpeg pid is dead. Keep orphaned
+  // recorders (API restart mid-capture) marked recording so we can attach viewer.
+  const maybeRecording = await sql<{
+    recording_id: string;
+    watch_url: string;
+    process_pid: number | null;
+  }[]>`
+    SELECT recording_id, watch_url, process_pid
+    FROM live_captures
+    WHERE status IN ('recording', 'finalizing')
+  `;
+  for (const row of maybeRecording) {
+    const pid = row.process_pid != null ? Number(row.process_pid) : null;
+    let alive = false;
+    if (pid && pid > 1) {
+      try {
+        process.kill(pid, 0);
+        alive = true;
+      } catch {
+        alive = false;
+      }
+    }
+    if (alive) {
+      // ffmpeg still running (API restarted without killing child) — attach viewer only
+      void startLiveViewerPresence(env, {
+        recordingId: row.recording_id,
+        watchUrl: row.watch_url,
+        username: usernameFromWatchUrl(row.watch_url) ?? undefined,
+        broadcastId: extractBroadcastIdFromUrl(row.watch_url),
+      }).then((r) => {
+        if (!r.ok) console.warn(`[live-viewer] resume ${row.recording_id}: ${r.detail}`);
+      });
+      continue;
+    }
+    await sql`
+      UPDATE live_captures
+      SET status = 'waiting', process_pid = NULL, updated_at = now()
+      WHERE recording_id = ${row.recording_id}
+    `;
+    await sql`
+      UPDATE recordings
+      SET status = 'awaiting_live', capture_status = 'bekleniyor', updated_at = now()
+      WHERE id = ${row.recording_id} AND status = 'recording' AND source_type = 'live'
+    `;
+  }
   await sql`
     UPDATE live_captures
     SET status = 'waiting', process_pid = NULL, updated_at = now()
-    WHERE status IN ('recording', 'finalizing', 'pending')
-  `;
-  await sql`
-    UPDATE recordings
-    SET status = 'awaiting_live', capture_status = 'bekleniyor', updated_at = now()
-    WHERE status = 'recording' AND source_type = 'live'
+    WHERE status = 'pending'
   `;
 
   for (;;) {

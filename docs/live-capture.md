@@ -8,6 +8,11 @@
 
 See agent store `docs/live-capture.md` for full probe log summary.
 
+
+## Viewer list vs stream grab
+
+Previously Playwright only scraped a DASH URL then exited; **ffmpeg alone does not register as an Instagram Live viewer**. Cookies belong to spare account **ferahsevecen** (verified via IG web form). During recording we now keep a Playwright session and POST live heartbeats so Instagram can count that account as a viewer (best-effort; `/live/` page may 429 while heartbeats still work). Mid-flight attach: `bun scripts/attach-live-viewer.ts <recordingId>`.
+
 ## Funnel
 
 https://tolga-mini.tailf479ba.ts.net/mezatizle/

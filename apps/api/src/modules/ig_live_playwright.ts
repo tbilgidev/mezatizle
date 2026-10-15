@@ -451,3 +451,367 @@ export async function playwrightChromiumReady(): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * Who is logged in via operator cookies? (no secrets returned).
+ */
+export async function whoamiIgCookies(
+  env: AppEnv,
+): Promise<{ ok: true; username: string } | { ok: false; detail: string }> {
+  const cookiesFile = await resolveCookiesPath(env);
+  if (!cookiesFile) return { ok: false, detail: "Çerez dosyası yok" };
+  let cookieText: string;
+  try {
+    cookieText = await readFile(cookiesFile, "utf8");
+  } catch {
+    return { ok: false, detail: "Çerez okunamadı" };
+  }
+  const cookies = parseNetscapeCookies(cookieText);
+  if (!cookies.some((c) => c.name === "sessionid")) {
+    return { ok: false, detail: "sessionid yok" };
+  }
+  let chromium: typeof import("playwright").chromium;
+  try {
+    ({ chromium } = await import("playwright"));
+  } catch {
+    return { ok: false, detail: "Playwright yok" };
+  }
+  let browser: import("playwright").Browser | null = null;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      locale: "tr-TR",
+    });
+    await context.addCookies(
+      cookies.map((c) => ({ ...c, sameSite: "Lax" as const })),
+    );
+    const page = await context.newPage();
+    await page.goto("https://www.instagram.com/", {
+      waitUntil: "domcontentloaded",
+      timeout: 45_000,
+    });
+    await page.waitForTimeout(1500);
+    const username = await page.evaluate(async () => {
+      const csrf =
+        document.cookie
+          .split(";")
+          .map((s) => s.trim())
+          .find((s) => s.startsWith("csrftoken="))
+          ?.split("=")[1] || "";
+      const r = await fetch(
+        "https://www.instagram.com/api/v1/accounts/edit/web_form_data/",
+        {
+          credentials: "include",
+          headers: {
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRFToken": csrf,
+            Accept: "*/*",
+          },
+        },
+      );
+      const j = (await r.json()) as { form_data?: { username?: string } };
+      return j?.form_data?.username ?? null;
+    });
+    if (!username) return { ok: false, detail: "Kullanıcı adı alınamadı" };
+    return { ok: true, username };
+  } catch (err) {
+    return {
+      ok: false,
+      detail: err instanceof Error ? err.message.slice(0, 160) : String(err),
+    };
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+export type LiveViewerPresence = {
+  recordingId: string;
+  broadcastId: string;
+  username: string;
+  cookieUsername: string | null;
+  startedAt: string;
+  stop: () => Promise<void>;
+};
+
+const viewerSessions = new Map<string, LiveViewerPresence>();
+
+export function getLiveViewerPresenceHealth() {
+  return {
+    active: [...viewerSessions.values()].map((s) => ({
+      recordingId: s.recordingId,
+      broadcastId: s.broadcastId,
+      seller: s.username,
+      cookieUsername: s.cookieUsername,
+      startedAt: s.startedAt,
+    })),
+  };
+}
+
+/**
+ * Keep a normal Playwright browser session "watching" the live for the
+ * duration of recording so Instagram can count the spare account as a viewer.
+ *
+ * Why this is needed: resolveLiveStreamWithPlaywright only scrapes a DASH URL
+ * then closes the browser; ffmpeg reads the CDN alone and never joins the live UI.
+ * Instagram viewer lists come from live heartbeat / open live page sessions.
+ *
+ * Method: cookies → open IG → try /live/ page → periodic POST
+ * /api/v1/live/{id}/heartbeat_and_get_viewer_count/ (works even when /live/ is 429).
+ * No anti-bot kits.
+ */
+export async function startLiveViewerPresence(
+  env: AppEnv,
+  opts: {
+    recordingId: string;
+    watchUrl: string;
+    username?: string;
+    broadcastId?: string | null;
+  },
+): Promise<
+  | { ok: true; presence: LiveViewerPresence }
+  | { ok: false; detail: string }
+> {
+  await stopLiveViewerPresence(opts.recordingId);
+
+  const cookiesFile = await resolveCookiesPath(env);
+  if (!cookiesFile) {
+    return { ok: false, detail: "Çerez yok — izleyici oturumu açılamadı" };
+  }
+  let cookieText: string;
+  try {
+    cookieText = await readFile(cookiesFile, "utf8");
+  } catch {
+    return { ok: false, detail: "Çerez okunamadı" };
+  }
+  const cookies = parseNetscapeCookies(cookieText);
+  if (!cookies.some((c) => c.name === "sessionid")) {
+    return { ok: false, detail: "sessionid yok" };
+  }
+
+  const username =
+    opts.username || usernameFromWatchUrl(opts.watchUrl) || "";
+  let broadcastId =
+    opts.broadcastId || extractBroadcastIdFromUrl(opts.watchUrl);
+  if (!username || !broadcastId) {
+    // Resolve once to learn broadcast id
+    const resolved = await resolveLiveStreamWithPlaywright(env, {
+      watchUrl: opts.watchUrl,
+      username: username || undefined,
+      broadcastId,
+    });
+    if (!resolved.ok) {
+      return {
+        ok: false,
+        detail: `İzleyici oturumu için yayın çözülemedi: ${resolved.detail}`,
+      };
+    }
+    broadcastId = resolved.broadcastId;
+  }
+  if (!username || !broadcastId) {
+    return { ok: false, detail: "username/broadcastId eksik" };
+  }
+
+  let chromium: typeof import("playwright").chromium;
+  try {
+    ({ chromium } = await import("playwright"));
+  } catch {
+    return { ok: false, detail: "Playwright yüklü değil" };
+  }
+
+  const browser = await chromium.launch({ headless: true });
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    locale: "tr-TR",
+    viewport: { width: 1280, height: 720 },
+  });
+  await context.addCookies(
+    cookies.map((c) => ({ ...c, sameSite: "Lax" as const })),
+  );
+  const page = await context.newPage();
+
+  let cookieUsername: string | null = null;
+  let stopped = false;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let lastHeartbeatOk = false;
+  let lastHeartbeatDetail = "starting";
+
+  const heartbeatOnce = async () => {
+    if (stopped) return;
+    try {
+      const r = await page.evaluate(
+        async ({ broadcastId, username }) => {
+          const csrf =
+            document.cookie
+              .split(";")
+              .map((s) => s.trim())
+              .find((s) => s.startsWith("csrftoken="))
+              ?.split("=")[1] || "";
+          const res = await fetch(
+            `https://www.instagram.com/api/v1/live/${broadcastId}/heartbeat_and_get_viewer_count/`,
+            {
+              method: "POST",
+              credentials: "include",
+              headers: {
+                "X-IG-App-ID": "936619743392459",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-CSRFToken": csrf,
+                "Content-Type": "application/x-www-form-urlencoded",
+                Referer: `https://www.instagram.com/${username}/live/`,
+                Accept: "*/*",
+              },
+              body: "",
+            },
+          );
+          const text = await res.text();
+          let viewer_count: number | null = null;
+          let broadcast_status: string | null = null;
+          try {
+            const j = JSON.parse(text) as {
+              viewer_count?: number;
+              broadcast_status?: string;
+            };
+            viewer_count =
+              typeof j.viewer_count === "number" ? j.viewer_count : null;
+            broadcast_status = j.broadcast_status ?? null;
+          } catch {
+            /* ignore */
+          }
+          return {
+            status: res.status,
+            viewer_count,
+            broadcast_status,
+          };
+        },
+        { broadcastId: broadcastId!, username },
+      );
+      lastHeartbeatOk = r.status === 200;
+      lastHeartbeatDetail = lastHeartbeatOk
+        ? `heartbeat_ok viewers=${r.viewer_count ?? "?"} status=${r.broadcast_status ?? "?"}`
+        : `heartbeat_http_${r.status}`;
+    } catch (err) {
+      lastHeartbeatOk = false;
+      lastHeartbeatDetail =
+        err instanceof Error ? err.message.slice(0, 120) : String(err);
+    }
+  };
+
+  try {
+    await page.goto("https://www.instagram.com/", {
+      waitUntil: "domcontentloaded",
+      timeout: 45_000,
+    });
+    await page.waitForTimeout(1200);
+    cookieUsername = await page
+      .evaluate(async () => {
+        const csrf =
+          document.cookie
+            .split(";")
+            .map((s) => s.trim())
+            .find((s) => s.startsWith("csrftoken="))
+            ?.split("=")[1] || "";
+        const r = await fetch(
+          "https://www.instagram.com/api/v1/accounts/edit/web_form_data/",
+          {
+            credentials: "include",
+            headers: {
+              "X-IG-App-ID": "936619743392459",
+              "X-Requested-With": "XMLHttpRequest",
+              "X-CSRFToken": csrf,
+              Accept: "*/*",
+            },
+          },
+        );
+        const j = (await r.json()) as { form_data?: { username?: string } };
+        return j?.form_data?.username ?? null;
+      })
+      .catch(() => null);
+
+    // Best-effort open live UI (often 429 from datacenter IPs — heartbeat still works)
+    const liveUrl = `https://www.instagram.com/${username}/live/?broadcast_id=${broadcastId}`;
+    try {
+      const nav = await page.goto(liveUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
+      if (nav && nav.status() === 429) {
+        // Stay on home — heartbeats still register the session
+        await page.goto("https://www.instagram.com/", {
+          waitUntil: "domcontentloaded",
+          timeout: 30_000,
+        });
+      } else {
+        await page.waitForTimeout(2000);
+      }
+    } catch {
+      await page
+        .goto("https://www.instagram.com/", {
+          waitUntil: "domcontentloaded",
+          timeout: 30_000,
+        })
+        .catch(() => undefined);
+    }
+
+    await heartbeatOnce();
+    heartbeatTimer = setInterval(() => {
+      void heartbeatOnce();
+    }, 12_000);
+  } catch (err) {
+    try {
+      await browser.close();
+    } catch {
+      /* ignore */
+    }
+    return {
+      ok: false,
+      detail: `İzleyici oturumu açılamadı: ${
+        err instanceof Error ? err.message.slice(0, 160) : String(err)
+      }`,
+    };
+  }
+
+  const presence: LiveViewerPresence = {
+    recordingId: opts.recordingId,
+    broadcastId,
+    username,
+    cookieUsername,
+    startedAt: new Date().toISOString(),
+    stop: async () => {
+      if (stopped) return;
+      stopped = true;
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+      viewerSessions.delete(opts.recordingId);
+      try {
+        await browser.close();
+      } catch {
+        /* ignore */
+      }
+      console.log(
+        `[live-viewer] stopped ${opts.recordingId} last=${lastHeartbeatDetail}`,
+      );
+    },
+  };
+
+  viewerSessions.set(opts.recordingId, presence);
+  console.log(
+    `[live-viewer] started ${opts.recordingId} as=${cookieUsername ?? "?"} watching=@${username} bid=${broadcastId} ${lastHeartbeatDetail}`,
+  );
+  return { ok: true, presence };
+}
+
+export async function stopLiveViewerPresence(
+  recordingId: string,
+): Promise<void> {
+  const s = viewerSessions.get(recordingId);
+  if (s) await s.stop();
+}
