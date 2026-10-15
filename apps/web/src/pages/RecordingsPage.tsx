@@ -23,6 +23,22 @@ function statusBadge(r: Record<string, unknown>) {
   return <Badge variant={variant as "ok" | "warn" | "danger"}>{label}</Badge>;
 }
 
+/** Prefer API lastError (TR) under waiting / not-found / blocked captures. */
+function captureLastError(r: Record<string, unknown>): string | null {
+  const capture = r.capture_status ? String(r.capture_status) : "";
+  const showUnder = new Set(["bekleniyor", "bulunamadi", "engellendi", "hata"]);
+  if (capture && !showUnder.has(capture)) return null;
+  const msg =
+    r.lastError ??
+    r.last_error ??
+    r.capture_error ??
+    r.last_probe_detail ??
+    r.error_message;
+  if (msg == null) return null;
+  const s = String(msg).trim();
+  return s.length ? s : null;
+}
+
 export function RecordingsPage() {
   const [rows, setRows] = useState<Array<Record<string, unknown>>>([]);
   const [error, setError] = useState<string | null>(null);
@@ -261,11 +277,18 @@ export function RecordingsPage() {
                             {String(r.source_url)}
                           </div>
                         ) : null}
-                        {r.last_probe_detail || r.capture_error ? (
-                          <div className="mt-0.5 text-xs text-fog">
-                            {String(r.capture_error || r.last_probe_detail)}
-                          </div>
-                        ) : null}
+                        {(() => {
+                          const err = captureLastError(r);
+                          if (!err) return null;
+                          return (
+                            <div
+                              className="mt-0.5 max-w-[28rem] text-xs text-amber"
+                              title={err}
+                            >
+                              {err}
+                            </div>
+                          );
+                        })()}
                       </TD>
                       <TD>{statusBadge(r)}</TD>
                       <TD>
