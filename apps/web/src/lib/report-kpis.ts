@@ -44,11 +44,12 @@ function maybeCentsToTry(v: number | null): number | null {
  */
 export function extractReportKpis(row: Record<string, unknown>): ReportKpis {
   const productsOffered = firstNum(row, [
+    "productsOfferedCount",
+    "products_offered_count",
     "productsOffered",
     "products_offered",
     "offeredProductCount",
     "offered_product_count",
-    "productsOfferedCount",
     "offeredCount",
     "offered_count",
     "askProductCount",
@@ -56,6 +57,8 @@ export function extractReportKpis(row: Record<string, unknown>): ReportKpis {
   ]);
 
   let totalAskTry = firstNum(row, [
+    "productsOfferedSumTry",
+    "products_offered_sum_try",
     "totalAskTry",
     "total_ask_try",
     "offeredAmountTry",
@@ -79,6 +82,8 @@ export function extractReportKpis(row: Record<string, unknown>): ReportKpis {
 
   const productsSold =
     firstNum(row, [
+      "productsSoldCount",
+      "products_sold_count",
       "productsSold",
       "products_sold",
       "soldProductCount",
@@ -89,6 +94,8 @@ export function extractReportKpis(row: Record<string, unknown>): ReportKpis {
 
   let totalSoldTry =
     firstNum(row, [
+      "productsSoldSumTry",
+      "products_sold_sum_try",
       "totalSoldTry",
       "total_sold_try",
       "soldAmountTry",

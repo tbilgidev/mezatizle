@@ -158,7 +158,10 @@ export function ReportsPage() {
                         </div>
 
                         {progress ? (
-                          <p className="mt-2 text-xs font-medium text-amber">
+                          <p
+                            className={`mt-2 text-xs font-medium ${progress.className}`}
+                            data-analysis-state={progress.state}
+                          >
                             {progress.label}
                           </p>
                         ) : null}

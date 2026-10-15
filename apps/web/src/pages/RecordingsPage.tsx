@@ -61,9 +61,10 @@ function reportLinkTone(r: Record<string, unknown>): {
   const status = String(r.status ?? "");
 
   if (analysisState === "done") {
+    const progress = analysisProgressInfo(r);
     return {
       tone: "green",
-      title: "Analiz tamam — rapor hazır",
+      title: progress?.label ?? "Analiz tamam — rapor hazır",
       className: "text-emerald hover:text-emerald/80",
     };
   }
@@ -76,9 +77,10 @@ function reportLinkTone(r: Record<string, unknown>): {
     };
   }
   if (analysisState === "failed") {
+    const progress = analysisProgressInfo(r);
     return {
       tone: "red",
-      title: "Analiz başarısız — rapor sınırlı olabilir",
+      title: progress?.label ?? "Analiz başarısız — rapor sınırlı olabilir",
       className: "text-rose hover:text-rose/80",
     };
   }
@@ -451,11 +453,12 @@ export function RecordingsPage() {
                               if (!progress) return null;
                               return (
                                 <span
-                                  className="text-xs font-medium text-amber"
+                                  className={`text-xs font-medium ${progress.className}`}
                                   title={progress.label}
                                   data-analysis-progress={
                                     progress.percent ?? undefined
                                   }
+                                  data-analysis-state={progress.state}
                                 >
                                   {progress.label}
                                 </span>

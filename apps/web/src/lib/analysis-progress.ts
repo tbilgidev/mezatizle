@@ -1,15 +1,20 @@
 /**
  * Display helpers for analysis pipeline progress on Kayıtlar / Raporlar.
- * Prefer API `analysisProgress` (0–100) + `analysisStage` when present;
- * fall back to coarse % / TR stage from `status` until the worker ships fields.
+ * Prefer API `analysisProgress` (0–100) + `analysisStage` when present.
+ * Always show a progress line for running | failed | done (never hide % on fail).
  */
 
+export type AnalysisTone = "yellow" | "red" | "green" | "muted";
+
 export type AnalysisProgressInfo = {
-  /** True when analysis is in progress and we should show a progress line. */
+  /** Show progress chip next to Rapor. */
   active: boolean;
   percent: number | null;
   stage: string | null;
-  /** e.g. `Analiz %42 · Ses çözülüyor` */
+  state: "running" | "failed" | "done" | "none" | "unknown";
+  tone: AnalysisTone;
+  className: string;
+  /** e.g. `Analiz %40 · Analiz başarısız` */
   label: string;
 };
 
@@ -35,9 +40,11 @@ const STAGE_TR: Record<string, string> = {
   analyze: "Mezât analizi",
   finalize: "Sonuçlandırılıyor",
   finalizing: "Sonuçlandırılıyor",
-  done: "Tamamlandı",
-  tamamlandı: "Tamamlandı",
-  tamamlandi: "Tamamlandı",
+  failed: "Analiz başarısız",
+  error: "Analiz başarısız",
+  done: "Tamam",
+  tamamlandı: "Tamam",
+  tamamlandi: "Tamam",
 };
 
 /** Coarse progress when API has not yet published analysisProgress. */
@@ -48,8 +55,8 @@ const STATUS_FALLBACK: Record<string, { percent: number; stage: string }> = {
   extracted: { percent: 40, stage: "Ses hazır" },
   transcribing: { percent: 55, stage: "Ses çözülüyor" },
   analyzing: { percent: 80, stage: "Mezât analizi" },
-  // status=complete can still be analysisState=running (post-pipeline wrap-up)
   complete: { percent: 92, stage: "Sonuçlandırılıyor" },
+  failed: { percent: 40, stage: "Analiz başarısız" },
 };
 
 function clampPercent(n: number): number {
@@ -71,7 +78,6 @@ function translateStage(raw: string | null | undefined): string | null {
   if (!s) return null;
   const key = s.toLowerCase().replace(/\s+/g, "_");
   if (STAGE_TR[key]) return STAGE_TR[key];
-  // Already Turkish / free-form from API — keep as-is
   if (/[ğüşıöçĞÜŞİÖÇ]/.test(s) || /\s/.test(s)) return s;
   return STAGE_TR[key] ?? s;
 }
@@ -89,48 +95,81 @@ function statusOf(r: Record<string, unknown>): string {
   return String(r.status ?? "").toLowerCase();
 }
 
+function resolveState(
+  r: Record<string, unknown>,
+): AnalysisProgressInfo["state"] {
+  const state = analysisStateOf(r);
+  if (state === "running" || state === "failed" || state === "done" || state === "none") {
+    return state;
+  }
+  const status = statusOf(r);
+  if (status === "failed") return "failed";
+  if (STATUS_FALLBACK[status] && status !== "complete") return "running";
+  if (status === "complete") return "done";
+  return state ? "unknown" : "none";
+}
+
 /** Whether this row should be treated as an in-flight analysis. */
 export function isAnalysisRunning(r: Record<string, unknown>): boolean {
-  const state = analysisStateOf(r);
-  if (state === "running") return true;
-  if (state === "done" || state === "failed" || state === "none") return false;
-  // Fallback when analysisState missing
-  return Boolean(STATUS_FALLBACK[statusOf(r)] && statusOf(r) !== "complete");
+  return resolveState(r) === "running";
+}
+
+export function isAnalysisFailed(r: Record<string, unknown>): boolean {
+  return resolveState(r) === "failed";
 }
 
 /**
  * Build progress line for a recording / report row.
- * Prefer API fields; fall back from status while the worker rolls out.
+ * Shows for running (yellow), failed (red), done (green).
  */
 export function analysisProgressInfo(
   r: Record<string, unknown>,
 ): AnalysisProgressInfo | null {
-  const state = analysisStateOf(r);
+  const state = resolveState(r);
   const status = statusOf(r);
-  const running =
-    state === "running" ||
-    (state === "" && Boolean(STATUS_FALLBACK[status] && status !== "complete"));
 
-  if (!running) return null;
+  if (state === "none" || state === "unknown") {
+    // No analysis yet — hide progress chip (Rapor link stays red via reportLinkTone).
+    return null;
+  }
 
   const apiPercent = readPercent(r);
   const apiStage = readStage(r);
-  const fallback = STATUS_FALLBACK[status] ?? {
-    percent: 50,
-    stage: "Analiz sürüyor",
-  };
+  const fallback = STATUS_FALLBACK[status];
 
-  const percent = apiPercent ?? fallback.percent;
-  const stage = apiStage ?? fallback.stage;
+  let percent: number;
+  let stage: string;
+  let tone: AnalysisTone;
+  let className: string;
+
+  if (state === "failed") {
+    percent = apiPercent ?? fallback?.percent ?? 40;
+    stage = apiStage ?? "Analiz başarısız";
+    tone = "red";
+    className = "text-rose";
+  } else if (state === "done") {
+    percent = apiPercent ?? 100;
+    stage = apiStage ?? "Tamam";
+    tone = "green";
+    className = "text-emerald";
+  } else {
+    // running
+    percent = apiPercent ?? fallback?.percent ?? 50;
+    stage = apiStage ?? fallback?.stage ?? "Analiz sürüyor";
+    tone = "yellow";
+    className = "text-amber";
+  }
+
   const label =
-    stage.length > 0
-      ? `Analiz %${percent} · ${stage}`
-      : `Analiz %${percent}`;
+    stage.length > 0 ? `Analiz %${percent} · ${stage}` : `Analiz %${percent}`;
 
   return {
     active: true,
     percent,
     stage,
+    state,
+    tone,
+    className,
     label,
   };
 }

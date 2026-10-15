@@ -9,6 +9,10 @@ import {
   ImageOff,
 } from "lucide-react";
 import { api, type ReportDetail, type ReportSale } from "@/lib/api";
+import {
+  analysisProgressInfo,
+  isAnalysisFailed,
+} from "@/lib/analysis-progress";
 import { resolveOffsetMs } from "@/lib/seek";
 import {
   extractReportKpis,
@@ -66,14 +70,25 @@ function formatOffset(ms: number | null | undefined): string {
   return `${String(m).padStart(2, "0")}:${String(rem).padStart(2, "0")}`;
 }
 
-function emptySalesHint(report: ReportDetail): string {
-  const bids = Number(report.eventCounts.bid ?? 0);
+function emptySalesHint(
+  report: ReportDetail,
+  analysisFailed: boolean,
+): string {
+  if (analysisFailed) {
+    return "Analiz başarısız olduğu için satış adayları üretilemedi. Altyapı düzelince kaydı yeniden analiz edin.";
+  }
+  const counts =
+    report.eventCounts && typeof report.eventCounts === "object"
+      ? report.eventCounts
+      : {};
+  const bids = Number(counts.bid ?? 0);
   const ocr =
-    Number(report.eventCounts.ocr ?? 0) +
-    Number(report.eventCounts.price ?? 0) +
-    Number(report.eventCounts.overlay ?? 0);
-  const running = report.jobs.some(
-    (j) => j.status === "running" || j.status === "queued",
+    Number(counts.ocr ?? 0) +
+    Number(counts.price ?? 0) +
+    Number(counts.overlay ?? 0);
+  const jobs = Array.isArray(report.jobs) ? report.jobs : [];
+  const running = jobs.some(
+    (j) => j?.status === "running" || j?.status === "queued",
   );
   if (running) {
     return "Analiz sürüyor — satış adayları hazır olunca burada listelenir.";
@@ -84,7 +99,7 @@ function emptySalesHint(report: ReportDetail): string {
     if (ocr > 0) bits.push(`${ocr} OCR/fiyat sinyali`);
     return `${bits.join(", ")} bulundu ama henüz satış satırına dönüşmedi. Transkript + OCR eşleşmesi tamamlanınca ürün / alıcı / tutar burada görünür.`;
   }
-  if (report.transcriptSegmentCount > 0) {
+  if ((report.transcriptSegmentCount ?? 0) > 0) {
     return "Transkript var; bu yayında onaylanabilir satış cümlesi / fiyat eşleşmesi çıkmadı.";
   }
   return "Bu kayıtta henüz satış adayı yok. Analiz bitince ürün, alıcı ve tutar burada listelenir.";
@@ -116,6 +131,10 @@ function SaleThumb({ sale }: { sale: ReportSale }) {
 export function ReportDetailPage() {
   const { recordingId = "" } = useParams();
   const [report, setReport] = useState<ReportDetail | null>(null);
+  const [recordingMeta, setRecordingMeta] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -128,8 +147,26 @@ export function ReportDetailPage() {
   const [reviewedIds, setReviewedIds] = useState<Set<string>>(() => new Set());
 
   async function load() {
-    const rep = await api.report(recordingId);
-    setReport(rep.report);
+    const [rep, rec] = await Promise.all([
+      api.report(recordingId),
+      api.recording(recordingId).catch(() => null),
+    ]);
+    const safe = rep?.report;
+    if (!safe) throw new Error("Rapor yanıtı boş.");
+    setReport({
+      ...safe,
+      sales: Array.isArray(safe.sales) ? safe.sales : [],
+      jobs: Array.isArray(safe.jobs) ? safe.jobs : [],
+      eventCounts:
+        safe.eventCounts && typeof safe.eventCounts === "object"
+          ? safe.eventCounts
+          : {},
+    });
+    setRecordingMeta(
+      rec?.recording && typeof rec.recording === "object"
+        ? (rec.recording as Record<string, unknown>)
+        : null,
+    );
   }
 
   useEffect(() => {
@@ -153,9 +190,33 @@ export function ReportDetailPage() {
     };
   }, [recordingId]);
 
-  const sales = useMemo(() => report?.sales ?? [], [report]);
+  const sales = useMemo(
+    () => (Array.isArray(report?.sales) ? report!.sales : []),
+    [report],
+  );
+
+  const analysisRow = useMemo(() => {
+    const base = {
+      ...(report as unknown as Record<string, unknown>),
+      ...(recordingMeta ?? {}),
+    };
+    return base;
+  }, [report, recordingMeta]);
+
+  const analysisFailed = isAnalysisFailed(analysisRow);
+  const analysisProgress = analysisProgressInfo(analysisRow);
 
   async function review(saleId: string, status: string) {
+    if (!saleId) {
+      setError("Satış kimliği yok — işlem yapılamadı.");
+      return;
+    }
+    if (analysisFailed) {
+      setError(
+        "Analiz başarısız. Onay/red için önce analizi yeniden çalıştırın.",
+      );
+      return;
+    }
     setBusyId(saleId);
     setError(null);
     try {
@@ -169,31 +230,43 @@ export function ReportDetailPage() {
   }
 
   async function openEvidencePlayer(sale: ReportSale) {
+    if (!sale?.id) {
+      setError("Satış kaydı bulunamadı.");
+      return;
+    }
     setBusyId(sale.id);
     setError(null);
     try {
-      let ms = sale.offsetMs;
-      if (ms == null) {
+      let ms = sale.offsetMs != null ? Number(sale.offsetMs) : null;
+      if (ms == null || !Number.isFinite(ms)) {
         const d = await api.evidence(sale.id);
         ms = resolveOffsetMs({
           offsetMs: d.offsetMs,
-          evidence: d.evidence,
+          evidence: Array.isArray(d.evidence) ? d.evidence : [],
           productTitle:
             sale.productTitle ??
-            (d.sale.product_title != null
+            (d.sale && d.sale.product_title != null
               ? String(d.sale.product_title)
               : null),
-          auctionEvent: d.auctionEvent,
+          auctionEvent: d.auctionEvent ?? null,
         });
       }
-      if (ms == null) {
-        setError("Bu satış için video zaman damgası bulunamadı.");
+      if (ms == null || !Number.isFinite(ms)) {
+        setError(
+          analysisFailed
+            ? "Analiz başarısız — bu satış için video zamanı yok. Analizi yeniden deneyin."
+            : "Bu satış için video zaman damgası bulunamadı.",
+        );
         return;
       }
       setPlayer({ saleId: sale.id, offsetMs: ms });
       setReviewedIds((prev) => new Set(prev).add(sale.id));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(
+        e instanceof Error
+          ? e.message
+          : "Kanıt videosu açılamadı. Analiz tamamlanmamış olabilir.",
+      );
     } finally {
       setBusyId(null);
     }
@@ -269,6 +342,19 @@ export function ReportDetailPage() {
 
       {error && <ErrorState message={error} className="mb-4" />}
 
+      {analysisFailed ? (
+        <div
+          className="mb-4 rounded-2xl border border-rose/40 bg-rose/10 px-4 py-3 text-sm text-rose"
+          role="alert"
+          data-analysis-failed="1"
+        >
+          <strong className="font-semibold">Analiz başarısız.</strong>{" "}
+          {analysisProgress?.label ?? "Analiz tamamlanamadı."} Satış listesi
+          boş veya eksik olabilir. Altyapı (Python/ASR) düzelince bu kaydı
+          yeniden analiz edin.
+        </div>
+      ) : null}
+
       <div
         className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4"
         data-report-kpis={kpiChips.length ? "1" : undefined}
@@ -310,7 +396,7 @@ export function ReportDetailPage() {
           {!sales.length ? (
             <EmptyState
               title="Satış adayı yok"
-              hint={emptySalesHint(report)}
+              hint={emptySalesHint(report, analysisFailed)}
             />
           ) : (
             <div className="overflow-x-auto">
@@ -489,31 +575,31 @@ export function ReportDetailPage() {
               <span>İnceleme: {report.needsReviewCount}</span>
               <span>Ort. güven: {confidenceLabel(report.avgEventConfidence)}</span>
             </div>
-            {!!Object.keys(report.eventCounts).length && (
+            {!!Object.keys(report.eventCounts ?? {}).length && (
               <p className="mb-4 text-xs text-fog">
                 Sinyaller:{" "}
-                {Object.entries(report.eventCounts)
+                {Object.entries(report.eventCounts ?? {})
                   .map(([k, v]) => `${k}:${v}`)
                   .join(" · ")}
               </p>
             )}
-            {!report.jobs.length ? (
+            {!(report.jobs ?? []).length ? (
               <EmptyState title="İş yok" />
             ) : (
               <div className="space-y-3">
-                {report.jobs.map((j, i) => (
-                  <div key={`${j.jobType}-${i}`}>
+                {(report.jobs ?? []).map((j, i) => (
+                  <div key={`${j?.jobType ?? "job"}-${i}`}>
                     <div className="mb-1 flex items-center justify-between gap-2">
-                      <strong className="text-sm">{j.jobType}</strong>
-                      <Badge variant="muted">{statusTr(j.status)}</Badge>
+                      <strong className="text-sm">{j?.jobType ?? "—"}</strong>
+                      <Badge variant="muted">{statusTr(j?.status)}</Badge>
                     </div>
                     <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
                       <i
                         className="block h-full rounded-full bg-gradient-to-r from-mint to-signal transition-all"
-                        style={{ width: `${j.progressPercent || 0}%` }}
+                        style={{ width: `${j?.progressPercent || 0}%` }}
                       />
                     </div>
-                    {j.stage ? (
+                    {j?.stage ? (
                       <p className="mt-1 text-xs text-fog">{j.stage}</p>
                     ) : null}
                   </div>

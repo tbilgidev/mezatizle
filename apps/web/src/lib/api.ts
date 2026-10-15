@@ -353,10 +353,19 @@ export const api = {
         ? (d.report as Record<string, unknown>)
         : d;
     const sales = extractSalesArray(d).map((s) => normalizeReportSale(s));
+    const jobs = Array.isArray(reportObj.jobs)
+      ? (reportObj.jobs as ReportDetail["jobs"])
+      : [];
+    const eventCounts =
+      reportObj.eventCounts && typeof reportObj.eventCounts === "object"
+        ? (reportObj.eventCounts as Record<string, number>)
+        : {};
     return {
       report: {
         ...(reportObj as unknown as ReportDetail),
         sales,
+        jobs,
+        eventCounts,
       } satisfies ReportDetail,
     };
   },
