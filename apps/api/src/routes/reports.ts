@@ -77,6 +77,14 @@ function buildHeadline(r: ReportListItem): string {
   return `${seller} — ${sales}${total}${dur}`;
 }
 
+function toIso(v: unknown): string | null {
+  if (v == null) return null;
+  if (v instanceof Date) return v.toISOString();
+  const s = String(v);
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? s : d.toISOString();
+}
+
 function rowToListItem(r: Record<string, unknown>): ReportListItem {
   const saleCount = Number(r.sale_count ?? 0);
   const sumCents = r.sum_amount_cents != null ? Number(r.sum_amount_cents) : null;
@@ -94,8 +102,8 @@ function rowToListItem(r: Record<string, unknown>): ReportListItem {
         : null,
     originalFilename: String(r.original_filename ?? ""),
     status: String(r.status ?? ""),
-    recordedAt: r.recorded_at ? String(r.recorded_at) : null,
-    uploadedAt: r.uploaded_at ? String(r.uploaded_at) : null,
+    recordedAt: toIso(r.recorded_at),
+    uploadedAt: toIso(r.uploaded_at),
     durationSeconds:
       r.duration_seconds != null && Number.isFinite(Number(r.duration_seconds))
         ? Number(r.duration_seconds)
