@@ -70,13 +70,17 @@ Seller «aldım X lira» is an **opening / listing (ask) price**, **not** a comp
 
 ## 3. Comments + OCR (trust note — verified 2026-10-15)
 
-**Critical:** Instagram Live **DASH** masters captured by ffmpeg are **camera video only**. The IG comment overlay is **not** burned into the stream. Spot-check of yesilkoy frames (bottom-left crop) showed **no readable comment text**; Tesseract returned glyph noise. Ended broadcast `get_comment` API returns `media has been deleted`.
+**Critical:** Instagram Live **DASH** masters captured by ffmpeg are **camera video only**. The IG comment overlay is **not** burned into the stream. Spot-check of yesilkoy frames (bottom-left crop) showed **no readable comment text**; Tesseract returned glyph noise.
 
 | Source | When | Buyer usernames? |
 |--------|------|------------------|
 | `live_api` (Playwright poll during record) | **While live** | Yes — authoritative |
 | OCR Tesseract on frames | After extract | Only if overlay somehow present (rare on DASH) |
 | Operator `POST /api/comments` | Manual export | Yes |
+
+**Live poll (shipped):** every 5s `get_comment` while viewer presence runs → `observed_comments`. Pin `broadcast_id` on `watch_url`.
+
+**Yesilkoy backfill (2026-10-15 evening):** `get_comment` / `get_final_comment` for ended bid `18093629261179067` → HTML 404, **0 comments recovered**. `99b0…` had no stored broadcast_id. Sale counts remain **0**. Only **future** lives get follower buyers automatically.
 
 **OCR when used** (`workers/extractor/tools.py`):
 

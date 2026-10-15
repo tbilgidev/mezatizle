@@ -37,11 +37,11 @@ import { access } from "node:fs/promises";
 import { resolve } from "node:path";
 
 /** Persist live API comments (DASH video has no comment overlay for OCR). */
-async function persistLiveComments(
+export async function persistLiveComments(
   sql: Sql,
   recordingId: string,
   hits: LiveCommentHit[],
-) {
+): Promise<number> {
   const now = Date.now();
   const [rec] = await sql<{ capture_started_at: Date | string | null }[]>`
     SELECT capture_started_at FROM recordings WHERE id = ${recordingId}
@@ -49,6 +49,7 @@ async function persistLiveComments(
   const startMs = rec?.capture_started_at
     ? new Date(rec.capture_started_at).getTime()
     : null;
+  let inserted = 0;
   for (const h of hits) {
     const body = h.text.trim();
     if (body.length < 1) continue;
@@ -62,15 +63,29 @@ async function persistLiveComments(
     } else if (startMs != null) {
       offsetMs = Math.max(0, now - startMs);
     }
+    const observedAt =
+      h.createdAtMs != null ? new Date(h.createdAtMs) : new Date(now);
+    // Dedupe by IG comment pk when present
+    if (h.pk) {
+      const [dup] = await sql<{ id: string }[]>`
+        SELECT id FROM observed_comments
+        WHERE recording_id = ${recordingId}
+          AND source = 'live_api'
+          AND raw_json->>'pk' = ${h.pk}
+        LIMIT 1
+      `;
+      if (dup) continue;
+    }
     await sql`
       INSERT INTO observed_comments
-        (recording_id, body, author_username, source, offset_ms, raw_json)
+        (recording_id, body, author_username, source, offset_ms, observed_at, raw_json)
       VALUES (
         ${recordingId},
         ${body},
         ${author},
         ${"live_api"},
         ${offsetMs},
+        ${observedAt},
         ${sql.json({
           pk: h.pk,
           createdAtMs: h.createdAtMs,
@@ -78,12 +93,14 @@ async function persistLiveComments(
         })}
       )
     `;
+    inserted += 1;
   }
-  if (hits.length) {
+  if (inserted) {
     console.log(
-      `[live-comments] ${recordingId} +${hits.length} (authors=${hits.filter((x) => x.username).length})`,
+      `[live-comments] ${recordingId} +${inserted}/${hits.length} (authors=${hits.filter((x) => x.username).length})`,
     );
   }
+  return inserted;
 }
 
 export const LIVE_CAPTURE_POLICY = {
@@ -180,12 +197,28 @@ async function runCapture(
 }
 
 type ProbeResult =
-  | { ok: true; detail: string; streamUrl?: string }
+  | { ok: true; detail: string; streamUrl?: string; broadcastId?: string }
   | {
       ok: false;
       kind: "blocked" | "not_found" | "rate_limited" | "error";
       detail: string;
     };
+
+/** Ensure watch URL carries broadcast_id so comment polling can resume after restart. */
+export function watchUrlWithBroadcastId(
+  watchUrl: string,
+  broadcastId: string | null | undefined,
+): string {
+  if (!broadcastId || !/^\d{5,}$/.test(broadcastId)) return watchUrl;
+  try {
+    const u = new URL(watchUrl);
+    if (u.searchParams.get("broadcast_id") === broadcastId) return watchUrl;
+    u.searchParams.set("broadcast_id", broadcastId);
+    return u.toString();
+  } catch {
+    return watchUrl;
+  }
+}
 
 function classifyYtDlpProbeFailure(
   code: number,
@@ -328,6 +361,7 @@ export async function probePublicLive(
       ok: true,
       detail: pw.detail,
       streamUrl: pw.streamUrl,
+      broadcastId: pw.broadcastId,
     };
   }
 
@@ -706,9 +740,19 @@ async function startRecordingProcess(
     ? `recording_started max=${maxDurationMinutes}dk quality<=${CAPTURE_QUALITY.maxHeight}p`
     : `recording_started full_live quality<=${CAPTURE_QUALITY.maxHeight}p`;
 
+  // Prefer broadcast_id from resolve so comment poll works even if input was @username only
+  const bidFromUrl = extractBroadcastIdFromUrl(watchUrl);
+  const bidFromDetail = (() => {
+    const m = resolved.detail.match(/bid=(\d{5,})/);
+    return m?.[1] ?? null;
+  })();
+  const broadcastId = bidFromUrl || bidFromDetail;
+  const watchUrlPinned = watchUrlWithBroadcastId(watchUrl, broadcastId);
+
   await sql`
     UPDATE live_captures
     SET status = 'recording', process_pid = ${child.pid ?? null},
+        watch_url = ${watchUrlPinned},
         updated_at = now(), last_probe_detail = ${detail}
     WHERE recording_id = ${recordingId}
   `;
@@ -718,17 +762,18 @@ async function startRecordingProcess(
         capture_status = 'kaydediliyor',
         capture_started_at = COALESCE(capture_started_at, now()),
         capture_error = NULL,
+        source_url = ${watchUrlPinned},
         updated_at = now()
     WHERE id = ${recordingId}
   `;
 
   // Keep spare-account browser session "watching" so IG can list them as a viewer.
-  // Does not feed ffmpeg — DASH capture continues separately.
+  // Also polls get_comment → observed_comments (DASH has no comment UI for OCR).
   void startLiveViewerPresence(env, {
     recordingId,
-    watchUrl,
-    username: usernameFromWatchUrl(watchUrl) ?? undefined,
-    broadcastId: extractBroadcastIdFromUrl(watchUrl),
+    watchUrl: watchUrlPinned,
+    username: usernameFromWatchUrl(watchUrlPinned) ?? undefined,
+    broadcastId,
     onComments: (hits) => persistLiveComments(sql, recordingId, hits),
   }).then((r) => {
     if (!r.ok) {
@@ -1095,11 +1140,16 @@ async function tickCapture(sql: Sql, env: AppEnv, row: {
   if (probe.ok) {
     await setIgSessionLastError(env, null);
   }
+  const pinnedWatch =
+    probe.ok && probe.broadcastId
+      ? watchUrlWithBroadcastId(row.watch_url, probe.broadcastId)
+      : row.watch_url;
   await sql`
     UPDATE live_captures
     SET attempt_count = attempt_count + 1,
         last_probe_at = now(),
         last_probe_detail = ${probe.ok ? probe.detail : probe.detail},
+        watch_url = ${pinnedWatch},
         updated_at = now()
     WHERE recording_id = ${recordingId}
   `;
@@ -1138,7 +1188,7 @@ async function tickCapture(sql: Sql, env: AppEnv, row: {
     sql,
     env,
     recordingId,
-    row.watch_url,
+    pinnedWatch,
     destAbs,
     Number(row.max_bytes),
     row.max_duration_minutes != null && Number(row.max_duration_minutes) > 0

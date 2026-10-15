@@ -13,6 +13,17 @@ See agent store `docs/live-capture.md` for full probe log summary.
 
 Previously Playwright only scraped a DASH URL then exited; **ffmpeg alone does not register as an Instagram Live viewer**. Cookies belong to spare account **ferahsevecen** (verified via IG web form). During recording we now keep a Playwright session and POST live heartbeats so Instagram can count that account as a viewer (best-effort; `/live/` page may 429 while heartbeats still work). Mid-flight attach: `bun scripts/attach-live-viewer.ts <recordingId>`.
 
+## Live comments → `observed_comments` (required for sales)
+
+DASH masters have **no** comment overlay. Buyer «aldım» / pey must be captured **while the broadcast is live**:
+
+1. `startLiveViewerPresence` polls `GET /api/v1/live/{broadcast_id}/get_comment/?last_comment_ts=…` every **5s** (same-origin, cookies, `X-IG-App-ID` — no private kits).
+2. Hits persist via `persistLiveComments` → `observed_comments` (`source=live_api`) with `author_username`, `offset_ms` aligned to `capture_started_at`.
+3. `watch_url` is pinned with `broadcast_id` when the live resolves (even if the operator entered `@username` only), so resume-after-restart can keep polling.
+4. Dedupes by comment `pk`. Logs empty/HTTP failures periodically.
+
+**Backfill after the live ends:** usually **impossible**. Probed yesilkoy `broadcast_id=18093629261179067` (2026-10-15): `get_comment` / `get_final_comment` return HTML 404 shell — comments not replayable. Second keeper had **no broadcast_id** on the capture row. Re-reconcile left **0 sales**. Future recordings get buyers; historical DASH-only keepers stay ask-only KPIs unless the operator pastes an export into `POST /api/comments`.
+
 ## Funnel
 
 https://tolga-mini.tailf479ba.ts.net/mezatizle/

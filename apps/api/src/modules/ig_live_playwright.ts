@@ -656,9 +656,13 @@ export async function startLiveViewerPresence(
   let lastHeartbeatDetail = "starting";
   let lastCommentTs = 0;
   const seenCommentPks = new Set<string>();
+  let commentPollCount = 0;
+  let commentHitTotal = 0;
+  let lastCommentPollDetail = "not_started";
 
   const pollCommentsOnce = async () => {
     if (stopped || !opts.onComments) return;
+    commentPollCount += 1;
     try {
       const r = await page.evaluate(
         async ({ broadcastId, lastCommentTs }) => {
@@ -689,21 +693,39 @@ export async function startLiveViewerPresence(
             created_time?: number;
           }> = [];
           let nextTs = lastCommentTs;
+          let message = "";
           try {
             const j = JSON.parse(text) as {
               comments?: typeof comments;
               last_comment_ts?: number;
+              message?: string;
             };
             comments = Array.isArray(j.comments) ? j.comments : [];
             if (typeof j.last_comment_ts === "number") nextTs = j.last_comment_ts;
+            message = String(j.message || "");
           } catch {
-            /* ignore */
+            message = "non_json";
           }
-          return { status: res.status, comments, nextTs, raw: text.slice(0, 120) };
+          return {
+            status: res.status,
+            comments,
+            nextTs,
+            message,
+            raw: text.slice(0, 120),
+          };
         },
         { broadcastId: broadcastId!, lastCommentTs },
       );
-      if (r.status !== 200) return;
+      if (r.status !== 200) {
+        lastCommentPollDetail = `http_${r.status}${r.message ? ` ${r.message.slice(0, 60)}` : ""}`;
+        // Log first failure + every ~60s (12 polls @ 5s)
+        if (commentPollCount === 1 || commentPollCount % 12 === 0) {
+          console.warn(
+            `[live-comments] ${opts.recordingId} poll#${commentPollCount} ${lastCommentPollDetail}`,
+          );
+        }
+        return;
+      }
       lastCommentTs = r.nextTs || lastCommentTs;
       const hits: LiveCommentHit[] = [];
       for (const c of r.comments) {
@@ -728,11 +750,21 @@ export async function startLiveViewerPresence(
           pk,
         });
       }
-      if (hits.length) await opts.onComments(hits);
+      lastCommentPollDetail = `ok batch=${hits.length} total=${commentHitTotal + hits.length} ts=${lastCommentTs}`;
+      if (hits.length) {
+        commentHitTotal += hits.length;
+        await opts.onComments(hits);
+      } else if (commentPollCount === 1 || commentPollCount % 24 === 0) {
+        console.log(
+          `[live-comments] ${opts.recordingId} poll#${commentPollCount} empty (waiting for followers)`,
+        );
+      }
     } catch (err) {
+      lastCommentPollDetail =
+        err instanceof Error ? err.message.slice(0, 120) : String(err);
       console.warn(
         `[live-comments] ${opts.recordingId}:`,
-        err instanceof Error ? err.message.slice(0, 120) : err,
+        lastCommentPollDetail,
       );
     }
   };
@@ -914,4 +946,243 @@ export async function stopLiveViewerPresence(
 ): Promise<void> {
   const s = viewerSessions.get(recordingId);
   if (s) await s.stop();
+}
+
+export type FetchLiveCommentsResult = {
+  ok: boolean;
+  httpStatus: number;
+  hits: LiveCommentHit[];
+  lastCommentTs: number;
+  detail: string;
+  /** Raw snippet for debugging (never secrets). */
+  rawSnippet?: string;
+};
+
+/**
+ * One-shot comment fetch via logged-in Playwright cookies (same endpoint the
+ * live viewer polls). Works while broadcast is active; ended lives usually
+ * return HTTP 400/404 ("media has been deleted") — callers must treat that
+ * as "backfill unavailable", not invent comments.
+ */
+export async function fetchLiveCommentsForBroadcast(
+  env: AppEnv,
+  opts: {
+    broadcastId: string;
+    lastCommentTs?: number;
+    /** Optional: open seller live URL first (same-origin referer). */
+    username?: string | null;
+  },
+): Promise<FetchLiveCommentsResult> {
+  const cookiesFile = await resolveCookiesPath(env);
+  if (!cookiesFile) {
+    return {
+      ok: false,
+      httpStatus: 0,
+      hits: [],
+      lastCommentTs: opts.lastCommentTs ?? 0,
+      detail: "Çerez yok",
+    };
+  }
+  let cookieText: string;
+  try {
+    cookieText = await readFile(cookiesFile, "utf8");
+  } catch {
+    return {
+      ok: false,
+      httpStatus: 0,
+      hits: [],
+      lastCommentTs: opts.lastCommentTs ?? 0,
+      detail: "Çerez okunamadı",
+    };
+  }
+  const cookies = parseNetscapeCookies(cookieText);
+  if (!cookies.some((c) => c.name === "sessionid")) {
+    return {
+      ok: false,
+      httpStatus: 0,
+      hits: [],
+      lastCommentTs: opts.lastCommentTs ?? 0,
+      detail: "sessionid yok",
+    };
+  }
+
+  let chromium: typeof import("playwright").chromium;
+  try {
+    ({ chromium } = await import("playwright"));
+  } catch {
+    return {
+      ok: false,
+      httpStatus: 0,
+      hits: [],
+      lastCommentTs: opts.lastCommentTs ?? 0,
+      detail: "Playwright yüklü değil",
+    };
+  }
+
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      locale: "tr-TR",
+      viewport: { width: 1280, height: 720 },
+    });
+    await context.addCookies(
+      cookies.map((c) => ({ ...c, sameSite: "Lax" as const })),
+    );
+    const page = await context.newPage();
+    // Warm session on home (same as viewer presence) — profile-first can look logged-out.
+    await page.goto("https://www.instagram.com/", {
+      waitUntil: "domcontentloaded",
+      timeout: 45_000,
+    });
+    await page.waitForTimeout(1200);
+    const sessionUser = await page
+      .evaluate(async () => {
+        const csrf =
+          document.cookie
+            .split(";")
+            .map((s) => s.trim())
+            .find((s) => s.startsWith("csrftoken="))
+            ?.split("=")[1] || "";
+        const r = await fetch(
+          "https://www.instagram.com/api/v1/accounts/edit/web_form_data/",
+          {
+            credentials: "include",
+            headers: {
+              "X-IG-App-ID": "936619743392459",
+              "X-Requested-With": "XMLHttpRequest",
+              "X-CSRFToken": csrf,
+              Accept: "*/*",
+            },
+          },
+        );
+        if (!r.ok) return null;
+        const j = (await r.json()) as { form_data?: { username?: string } };
+        return j?.form_data?.username ?? null;
+      })
+      .catch(() => null);
+    if (!sessionUser) {
+      return {
+        ok: false,
+        httpStatus: 401,
+        hits: [],
+        lastCommentTs: opts.lastCommentTs ?? 0,
+        detail: "session_invalid_or_expired — refresh Ayarlar → Instagram oturumu",
+      };
+    }
+
+    // Try the same web endpoints the live UI uses (no private reverse-eng kits).
+    const paths = [
+      `https://www.instagram.com/api/v1/live/${opts.broadcastId}/get_comment/?last_comment_ts=${opts.lastCommentTs ?? 0}`,
+      // Some builds expose a "final" comment dump after end — often 404; harmless probe.
+      `https://www.instagram.com/api/v1/live/${opts.broadcastId}/get_final_comment/`,
+    ];
+
+    let best: FetchLiveCommentsResult = {
+      ok: false,
+      httpStatus: 0,
+      hits: [],
+      lastCommentTs: opts.lastCommentTs ?? 0,
+      detail: "no_response",
+    };
+
+    for (const url of paths) {
+      const r = await page.evaluate(async (fetchUrl) => {
+        const csrf =
+          document.cookie
+            .split(";")
+            .map((s) => s.trim())
+            .find((s) => s.startsWith("csrftoken="))
+            ?.split("=")[1] || "";
+        const res = await fetch(fetchUrl, {
+          credentials: "include",
+          headers: {
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRFToken": csrf,
+            Accept: "*/*",
+          },
+        });
+        const text = await res.text();
+        return { status: res.status, text: text.slice(0, 4000) };
+      }, url);
+
+      let comments: Array<{
+        pk?: string | number;
+        user?: { username?: string };
+        text?: string;
+        created_at?: number;
+        created_time?: number;
+      }> = [];
+      let nextTs = opts.lastCommentTs ?? 0;
+      let message = "";
+      try {
+        const j = JSON.parse(r.text) as {
+          comments?: typeof comments;
+          last_comment_ts?: number;
+          message?: string;
+          status?: string;
+        };
+        comments = Array.isArray(j.comments) ? j.comments : [];
+        if (typeof j.last_comment_ts === "number") nextTs = j.last_comment_ts;
+        message = String(j.message || j.status || "");
+      } catch {
+        message = "non_json";
+      }
+
+      const hits: LiveCommentHit[] = [];
+      for (const c of comments) {
+        const text = String(c.text ?? "").trim();
+        if (!text) continue;
+        hits.push({
+          username:
+            typeof c.user?.username === "string"
+              ? c.user.username.toLowerCase()
+              : null,
+          text,
+          createdAtMs:
+            typeof c.created_at === "number"
+              ? c.created_at * 1000
+              : typeof c.created_time === "number"
+                ? c.created_time * 1000
+                : null,
+          pk: c.pk != null ? String(c.pk) : null,
+        });
+      }
+
+      const looksHtml = /^\s*</.test(r.text) || /not-logged-in/i.test(r.text);
+      best = {
+        ok: r.status === 200 && !looksHtml,
+        httpStatus: r.status,
+        hits,
+        lastCommentTs: nextTs,
+        detail:
+          r.status === 200 && !looksHtml
+            ? `ok comments=${hits.length}`
+            : looksHtml
+              ? `http_${r.status} broadcast_unavailable_or_ended (HTML shell; comments not replayable)`
+              : `http_${r.status}${message ? ` ${message.slice(0, 80)}` : ""}`,
+        rawSnippet: r.text.slice(0, 200),
+      };
+      if (hits.length > 0) break;
+      // Continue to next path only when empty / error
+    }
+
+    return best;
+  } catch (err) {
+    return {
+      ok: false,
+      httpStatus: 0,
+      hits: [],
+      lastCommentTs: opts.lastCommentTs ?? 0,
+      detail: err instanceof Error ? err.message.slice(0, 160) : String(err),
+    };
+  } finally {
+    try {
+      await browser.close();
+    } catch {
+      /* ignore */
+    }
+  }
 }
