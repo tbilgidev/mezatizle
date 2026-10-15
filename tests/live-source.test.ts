@@ -13,6 +13,17 @@ describe("parseLiveSourceInput", () => {
     const p = parseLiveSourceInput("https://www.instagram.com/shop_x/live/");
     expect(p.kind).toBe("live_url");
     expect(p.username).toBe("shop_x");
+    expect(p.watchUrl).toBe("https://www.instagram.com/shop_x/live/");
+  });
+
+  test("preserves broadcast_id on live URL", () => {
+    const p = parseLiveSourceInput(
+      "https://www.instagram.com/yesilkoyantika_/live/?broadcast_id=18093629261179067",
+    );
+    expect(p.kind).toBe("live_url");
+    expect(p.username).toBe("yesilkoyantika_");
+    expect(p.broadcastId).toBe("18093629261179067");
+    expect(p.watchUrl).toContain("broadcast_id=18093629261179067");
   });
 
   test("parses profile URL", () => {

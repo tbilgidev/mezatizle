@@ -1,5 +1,13 @@
 # mezatizle — Live capture
 
+## 2026-10-15 — Live detect fix
+
+**Root cause:** yt-dlp has no Instagram Live extractor (`[generic]` → HTTP 429). Browser-watchable lives still need spare-account cookies. Misleading copy said “herkese açık bulunamadı”.
+
+**Fix:** Prefer `.venv/bin/yt-dlp`; Playwright+cookies resolve `broadcast_id` + DASH via same-origin live info; surface real errors (429/login/not live); preserve `broadcast_id` in URLs; cancel `smoke_seller` junk; start `kaydediliyor` when DASH found.
+
+See agent store `docs/live-capture.md` for full probe log summary.
+
 ## Funnel
 
 https://tolga-mini.tailf479ba.ts.net/mezatizle/

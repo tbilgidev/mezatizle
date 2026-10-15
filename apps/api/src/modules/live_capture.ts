@@ -14,6 +14,7 @@ import type { AppEnv } from "../lib/env.ts";
 import { safeJoinStorage, toStorageKey } from "../lib/storage.ts";
 import { enqueueAnalysisPipeline, upsertSeller } from "./ingestion.ts";
 import {
+  resolveCookiesPath,
   setIgSessionLastError,
   ytDlpAuthArgs,
 } from "./ig_session.ts";
@@ -23,13 +24,20 @@ import {
   type CaptureInput,
 } from "./capture_quality.ts";
 import { probeAvSync } from "../lib/ffmpeg.ts";
+import {
+  extractBroadcastIdFromUrl,
+  resolveLiveStreamWithPlaywright,
+  usernameFromWatchUrl,
+} from "./ig_live_playwright.ts";
+import { access } from "node:fs/promises";
+import { resolve } from "node:path";
 
 export const LIVE_CAPTURE_POLICY = {
   status: "operator_session_optional" as const,
-  playwright: "login_export_cookies",
+  playwright: "login_export_cookies_and_live_resolve",
   tools: ["yt-dlp", "ffmpeg", "playwright"],
   message:
-    "Canlı kayıt yt-dlp+ffmpeg ile yapılır. Giriş için Ayarlar → Instagram oturumu: cookies.txt veya Playwright ile yedek hesap girişi. Özel API / bot aşımı yok.",
+    "Canlı kayıt: yt-dlp denemesi + Playwright+çerez ile yayın/DASH çözümleme, ffmpeg encode. Giriş: Ayarlar → Instagram oturumu (yedek hesap). Özel API / bot aşımı yok.",
   restrictions: [
     "Özel / belgesiz Instagram API yok",
     "Anti-bot aşımı / CAPTCHA bypass yok",
@@ -37,15 +45,35 @@ export const LIVE_CAPTURE_POLICY = {
     "Kayıt için yasal/izin yükümlülüğü operatörde",
   ],
   limitationTr:
-    "Oturum yoksa Instagram çoğu canlıyı engeller. Ayarlar → Instagram oturumu bölümüne yedek hesabınızın cookies.txt dosyasını yükleyin; yt-dlp --cookies ile dener.",
+    "Instagram canlıları çoğu zaman oturum ister (tarayıcıda izlenebilir olsa bile). cookies.txt / Playwright oturumu zorunlu sayılır. yt-dlp’nin Instagram Live çıkarıcısı yok; Playwright DASH çözümler.",
   settingsPathTr: "Ayarlar → Instagram oturumu (yedek hesap)",
 };
 
 const activeProcs = new Map<string, ChildProcessWithoutNullStreams>();
 let loopStarted = false;
 
-function ytDlpBin() {
-  return process.env.YT_DLP_PATH || "yt-dlp";
+/** Prefer project venv yt-dlp (current) over stale distro package. */
+function ytDlpBin(): string {
+  if (process.env.YT_DLP_PATH?.trim()) return process.env.YT_DLP_PATH.trim();
+  const venv = resolve(process.cwd(), ".venv/bin/yt-dlp");
+  return venv;
+}
+
+async function ytDlpBinResolved(): Promise<string> {
+  const preferred = ytDlpBin();
+  try {
+    await access(preferred);
+    return preferred;
+  } catch {
+    /* fall through */
+  }
+  const venv = resolve(process.cwd(), ".venv/bin/yt-dlp");
+  try {
+    await access(venv);
+    return venv;
+  } catch {
+    return "yt-dlp";
+  }
 }
 
 function maxLiveBytes(env: AppEnv) {
@@ -98,15 +126,124 @@ async function runCapture(
 }
 
 type ProbeResult =
-  | { ok: true; detail: string }
-  | { ok: false; kind: "blocked" | "not_found" | "error"; detail: string };
+  | { ok: true; detail: string; streamUrl?: string }
+  | {
+      ok: false;
+      kind: "blocked" | "not_found" | "rate_limited" | "error";
+      detail: string;
+    };
 
+function classifyYtDlpProbeFailure(
+  code: number,
+  stdout: string,
+  stderr: string,
+  hasCookies: boolean,
+): ProbeResult | null {
+  const blob = `${stdout}\n${stderr}`;
+  const low = blob.toLowerCase();
+
+  if (code === 0 && stdout.trim().startsWith("{")) {
+    try {
+      const j = JSON.parse(stdout) as {
+        is_live?: boolean;
+        formats?: unknown[];
+      };
+      if (j.is_live || (j.formats && j.formats.length > 0)) {
+        return { ok: true, detail: "ytdlp_stream_metadata_ok" };
+      }
+    } catch {
+      /* fall through */
+    }
+  }
+
+  if (
+    low.includes("http error 429") ||
+    low.includes("too many requests") ||
+    low.includes("rate-limit")
+  ) {
+    return {
+      ok: false,
+      kind: "rate_limited",
+      detail:
+        "yt-dlp: Instagram HTTP 429 (rate-limit). Playwright+çerez ile denenecek / sonra tekrar.",
+    };
+  }
+
+  if (
+    low.includes("login required") ||
+    low.includes("please log in") ||
+    low.includes("sign in") ||
+    low.includes("http error 401") ||
+    low.includes("http error 403") ||
+    low.includes("checkpoint") ||
+    low.includes("session expired") ||
+    low.includes("not authorized") ||
+    (low.includes("cookie") &&
+      (low.includes("expired") || low.includes("invalid")))
+  ) {
+    return {
+      ok: false,
+      kind: "blocked",
+      detail: hasCookies
+        ? "yt-dlp: oturum/çerez reddedildi (401/403). cookies.txt yenileyin."
+        : "yt-dlp: giriş gerekli — Ayarlar → Instagram oturumu (cookies.txt).",
+    };
+  }
+
+  if (
+    low.includes("is not currently live") ||
+    low.includes("not live") ||
+    low.includes("no longer available")
+  ) {
+    return {
+      ok: false,
+      kind: "not_found",
+      detail: "yt-dlp: kullanıcı şu an canlıda değil.",
+    };
+  }
+
+  if (
+    low.includes("[generic]") ||
+    low.includes("unsupported url") ||
+    low.includes("unable to extract") ||
+    low.includes("no suitable extractor")
+  ) {
+    return {
+      ok: false,
+      kind: "error",
+      detail:
+        "yt-dlp: Instagram Live çıkarıcısı yok (generic IE). Playwright+çerez ile çözülmeye çalışılacak.",
+    };
+  }
+
+  if (code !== 0) {
+    const snip = stderr.replace(/\s+/g, " ").trim().slice(0, 180);
+    return {
+      ok: false,
+      kind: "error",
+      detail: snip
+        ? `yt-dlp hata: ${snip}`
+        : "yt-dlp canlı meta verisi alınamadı.",
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Probe whether a live is capturable.
+ * 1) yt-dlp -J with cookies (often fails: no IG Live IE / 429)
+ * 2) Playwright + spare-account cookies → live info → DASH URL
+ */
 export async function probePublicLive(
   env: AppEnv,
   watchUrl: string,
 ): Promise<ProbeResult> {
-  const bin = ytDlpBin();
+  const cookiesPath = await resolveCookiesPath(env);
+  const hasCookies = Boolean(cookiesPath);
   const auth = await ytDlpAuthArgs(env);
+  const bin = await ytDlpBinResolved();
+
   const r = await runCapture(
     [
       bin,
@@ -118,64 +255,53 @@ export async function probePublicLive(
       "-J",
       watchUrl,
     ],
-    60_000,
+    45_000,
   );
-  const blob = `${r.stdout}\n${r.stderr}`;
-  const low = blob.toLowerCase();
 
-  if (
-    low.includes("login required") ||
-    low.includes("sign in") ||
-    low.includes("rate-limit") ||
-    low.includes("checkpoint") ||
-    low.includes("consent") ||
-    low.includes("http error 401") ||
-    low.includes("http error 403") ||
-    low.includes("session expired") ||
-    (low.includes("cookie") &&
-      (low.includes("expired") || low.includes("invalid"))) ||
-    low.includes("please log in") ||
-    low.includes("not authorized") ||
-    (low.includes("cookies") && r.code !== 0)
-  ) {
-    const detail = auth.length
-      ? "Instagram erişim engellendi — yedek oturum/çerezler geçersiz veya süresi dolmuş olabilir (Ayarlar → Instagram oturumu → cookies.txt yenileyin)."
-      : "Instagram giriş veya erişim engeli — Ayarlar → Instagram oturumu altına yedek hesap çerezlerini ekleyin.";
-    await setIgSessionLastError(env, detail);
+  const ytdlp = classifyYtDlpProbeFailure(r.code, r.stdout, r.stderr, hasCookies);
+  if (ytdlp?.ok) return ytdlp;
+
+  // Playwright path — required for real IG Live (login-gated even when browser-watchable)
+  const pw = await resolveLiveStreamWithPlaywright(env, {
+    watchUrl,
+    username: usernameFromWatchUrl(watchUrl) ?? undefined,
+    broadcastId: extractBroadcastIdFromUrl(watchUrl),
+  });
+
+  if (pw.ok) {
+    await setIgSessionLastError(env, null);
     return {
-      ok: false,
-      kind: "blocked",
-      detail,
+      ok: true,
+      detail: pw.detail,
+      streamUrl: pw.streamUrl,
     };
   }
 
-  if (
-    low.includes("is not currently live") ||
-    low.includes("not live") ||
-    low.includes("unsupported url") ||
-    low.includes("unable to extract") ||
-    low.includes("no video formats") ||
-    r.code !== 0
-  ) {
-    // Try formats listing as secondary signal
-    if (r.code === 0 && r.stdout.trim().startsWith("{")) {
-      try {
-        const j = JSON.parse(r.stdout) as { is_live?: boolean; formats?: unknown[] };
-        if (j.is_live || (j.formats && j.formats.length > 0)) {
-          return { ok: true, detail: "stream_metadata_ok" };
-        }
-      } catch {
-        /* fall through */
-      }
+  if (pw.kind === "blocked") {
+    await setIgSessionLastError(env, pw.detail);
+    return { ok: false, kind: "blocked", detail: pw.detail };
+  }
+
+  // Prefer Playwright's concrete reason; fall back to yt-dlp taxonomy
+  if (pw.kind === "rate_limited") {
+    return { ok: false, kind: "rate_limited", detail: pw.detail };
+  }
+  if (pw.kind === "not_found") {
+    return { ok: false, kind: "not_found", detail: pw.detail };
+  }
+
+  if (ytdlp && !ytdlp.ok) {
+    // Surface the more specific of the two
+    if (ytdlp.kind === "rate_limited" || ytdlp.kind === "blocked") {
+      return ytdlp;
     }
-    return {
-      ok: false,
-      kind: "not_found",
-      detail: "Aktif herkese açık canlı yayın bulunamadı.",
-    };
   }
 
-  return { ok: true, detail: "probe_ok" };
+  return {
+    ok: false,
+    kind: pw.kind,
+    detail: pw.detail,
+  };
 }
 
 export async function createLiveCapture(
@@ -261,6 +387,7 @@ export async function createLiveCapture(
       destAbs,
       maxBytes,
       maxDurationMinutes,
+      first.streamUrl,
     );
   } else if (first.kind === "blocked") {
     captureStatus = "engellendi";
@@ -277,6 +404,7 @@ export async function createLiveCapture(
       WHERE id = ${id}
     `;
   } else {
+    // not_found / rate_limited / error → keep waiting, but show real reason
     await sql`
       UPDATE live_captures
       SET attempt_count = 1, last_probe_at = now(),
@@ -364,18 +492,37 @@ async function fileSize(path: string): Promise<number> {
 }
 
 /**
- * Resolve live media URL(s). Prefer one progressive muxed URL.
- * If yt-dlp returns video+audio separately, keep both for one ffmpeg mux
- * (shared encode clock — never record A and V on different processes).
+ * Resolve live media URL(s). Prefer Playwright DASH (IG Live).
+ * yt-dlp -g as secondary (rarely works — no IG Live extractor).
  */
 async function resolveStreamInput(
   env: AppEnv,
   watchUrl: string,
+  preferredStreamUrl?: string | null,
 ): Promise<
-  | { input: CaptureInput }
-  | { error: string; kind: "blocked" | "not_found" }
+  | { input: CaptureInput; detail: string }
+  | { error: string; kind: "blocked" | "not_found" | "rate_limited" | "error" }
 > {
-  const bin = ytDlpBin();
+  if (preferredStreamUrl && /^https?:\/\//i.test(preferredStreamUrl)) {
+    return {
+      input: { kind: "muxed", url: preferredStreamUrl },
+      detail: "stream_from_probe",
+    };
+  }
+
+  const pw = await resolveLiveStreamWithPlaywright(env, {
+    watchUrl,
+    username: usernameFromWatchUrl(watchUrl) ?? undefined,
+    broadcastId: extractBroadcastIdFromUrl(watchUrl),
+  });
+  if (pw.ok) {
+    return {
+      input: { kind: "muxed", url: pw.streamUrl },
+      detail: pw.detail,
+    };
+  }
+
+  const bin = await ytDlpBinResolved();
   const auth = await ytDlpAuthArgs(env);
   const r = await runCapture(
     [
@@ -389,7 +536,7 @@ async function resolveStreamInput(
       "-g",
       watchUrl,
     ],
-    60_000,
+    45_000,
   );
   const lines = r.stdout
     .split(/\r?\n/)
@@ -398,27 +545,19 @@ async function resolveStreamInput(
   if (lines.length >= 2) {
     return {
       input: { kind: "separate", videoUrl: lines[0]!, audioUrl: lines[1]! },
+      detail: "ytdlp_dual_url",
     };
   }
   if (lines[0]) {
-    return { input: { kind: "muxed", url: lines[0]! } };
-  }
-  const low = `${r.stdout}\n${r.stderr}`.toLowerCase();
-  if (
-    low.includes("login required") ||
-    low.includes("http error 401") ||
-    low.includes("http error 403") ||
-    low.includes("sign in")
-  ) {
     return {
-      kind: "blocked",
-      error:
-        "Akış URL’si alınamadı — Ayarlar → Instagram oturumu (çerez / Playwright giriş) kontrol edin.",
+      input: { kind: "muxed", url: lines[0]! },
+      detail: "ytdlp_single_url",
     };
   }
+
   return {
-    kind: "not_found",
-    error: "Aktif yayın akış URL’si çözülemedi.",
+    kind: pw.kind,
+    error: pw.detail,
   };
 }
 
@@ -430,6 +569,7 @@ async function startRecordingProcess(
   destAbs: string,
   maxBytes: number,
   maxDurationMinutes: number | null,
+  preferredStreamUrl?: string | null,
 ) {
   const partAbs = `${destAbs}.part.mp4`;
   try {
@@ -438,7 +578,7 @@ async function startRecordingProcess(
     /* ok */
   }
 
-  const resolved = await resolveStreamInput(env, watchUrl);
+  const resolved = await resolveStreamInput(env, watchUrl, preferredStreamUrl);
   if ("error" in resolved) {
     const blocked = resolved.kind === "blocked";
     await sql`
@@ -748,6 +888,7 @@ async function tickCapture(sql: Sql, env: AppEnv, row: {
     row.max_duration_minutes != null && Number(row.max_duration_minutes) > 0
       ? Number(row.max_duration_minutes)
       : null,
+    probe.streamUrl,
   );
 }
 

@@ -13,6 +13,8 @@ export EMBEDDED_WORKER="${EMBEDDED_WORKER:-1}"
 export LIVE_CAPTURE_SUPERVISOR="${LIVE_CAPTURE_SUPERVISOR:-1}"
 export DATABASE_URL="${DATABASE_URL:-postgres://mezatizle:mezatizle@127.0.0.1:5433/mezatizle}"
 export PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python3}"
+# Distro yt-dlp is often years behind and has no usable IG Live path — prefer venv.
+export YT_DLP_PATH="${YT_DLP_PATH:-$ROOT/.venv/bin/yt-dlp}"
 # small: better short TR sale phrases on fixture (~3× CPU vs base). Override with WHISPER_MODEL=base to save CPU.
 export WHISPER_MODEL="${WHISPER_MODEL:-small}"
 export OCR_ENGINE="${OCR_ENGINE:-tesseract}"

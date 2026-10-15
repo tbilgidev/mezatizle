@@ -13,9 +13,11 @@ function requireUsername(raw: string): string {
 export interface ParsedLiveSource {
   kind: LiveSourceKind;
   username: string;
-  /** Public page to watch / pass to yt-dlp (never a private API). */
+  /** Page / identity to watch (may include broadcast_id query). */
   watchUrl: string;
   inputRaw: string;
+  /** When present on input URL — preferred for Playwright live info. */
+  broadcastId?: string;
 }
 
 const LIVE_URL_RE =
@@ -24,9 +26,24 @@ const PROFILE_URL_RE =
   /^https?:\/\/(www\.)?instagram\.com\/([A-Za-z0-9._]{1,30})\/?(\?.*)?$/i;
 const REEL_OR_P_RE =
   /^https?:\/\/(www\.)?instagram\.com\/(reel|p|tv)\//i;
+/** Live sometimes shared as /reel/… with broadcast/live query — rare. */
+const LIVE_REEL_HINT_RE = /[?&](broadcast_id|media_id)=/i;
+
+function broadcastIdFromUrl(url: URL): string | undefined {
+  const q =
+    url.searchParams.get("broadcast_id") ||
+    url.searchParams.get("broadcastId");
+  if (q && /^\d{5,}$/.test(q)) return q;
+  return undefined;
+}
+
+function watchUrlFor(username: string, broadcastId?: string): string {
+  const base = `https://www.instagram.com/${username}/live/`;
+  return broadcastId ? `${base}?broadcast_id=${broadcastId}` : base;
+}
 
 /**
- * Parse operator input: @user, profile URL, or …/live URL.
+ * Parse operator input: @user, profile URL, …/live URL, or live+broadcast_id.
  * Rejects private-API style hosts and non-Instagram URLs.
  */
 export function parseLiveSourceInput(raw: string): ParsedLiveSource {
@@ -43,21 +60,33 @@ export function parseLiveSourceInput(raw: string): ParsedLiveSource {
     }
     const host = url.hostname.replace(/^www\./, "").toLowerCase();
     if (host !== "instagram.com") {
-      throw new Error("Yalnızca herkese açık Instagram bağlantıları kabul edilir");
+      throw new Error("Yalnızca Instagram bağlantıları kabul edilir");
     }
+
+    const broadcastId = broadcastIdFromUrl(url);
+
+    // Reel/post: reject unless clearly a live share with broadcast_id
     if (REEL_OR_P_RE.test(url.href) && !/\/live/i.test(url.pathname)) {
+      if (broadcastId || LIVE_REEL_HINT_RE.test(url.href)) {
+        // Cannot reliably map reel→username here; ask for @user or /live/
+        throw new Error(
+          "Reel/gönderi linki canlı kimliğini taşımıyor olabilir. @kullanıcı veya …/user/live/?broadcast_id=… girin.",
+        );
+      }
       throw new Error(
         "Bu bir gönderi/reel bağlantısı. Canlı yayın URL’si (…/live) veya profil/@kullanıcı girin.",
       );
     }
+
     const live = url.href.match(LIVE_URL_RE);
     if (live) {
       const username = requireUsername(live[2]!);
       return {
         kind: "live_url",
         username,
-        watchUrl: `https://www.instagram.com/${username}/live/`,
+        watchUrl: watchUrlFor(username, broadcastId),
         inputRaw,
+        broadcastId,
       };
     }
     const profile = url.href.match(PROFILE_URL_RE);
@@ -66,8 +95,9 @@ export function parseLiveSourceInput(raw: string): ParsedLiveSource {
       return {
         kind: "profile_url",
         username,
-        watchUrl: `https://www.instagram.com/${username}/live/`,
+        watchUrl: watchUrlFor(username, broadcastId),
         inputRaw,
+        broadcastId,
       };
     }
     throw new Error("Anlaşılamayan Instagram URL’si");
@@ -77,7 +107,7 @@ export function parseLiveSourceInput(raw: string): ParsedLiveSource {
   return {
     kind: "username",
     username,
-    watchUrl: `https://www.instagram.com/${username}/live/`,
+    watchUrl: watchUrlFor(username),
     inputRaw,
   };
 }
