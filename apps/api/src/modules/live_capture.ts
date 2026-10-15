@@ -565,6 +565,16 @@ async function resolveStreamInput(
   };
 }
 
+function pidAlive(pid: number | null | undefined): boolean {
+  if (pid == null || !Number.isFinite(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function startRecordingProcess(
   sql: Sql,
   env: AppEnv,
@@ -575,6 +585,22 @@ async function startRecordingProcess(
   maxDurationMinutes: number | null,
   preferredStreamUrl?: string | null,
 ) {
+  // Guard: createLiveCapture first-probe + supervisor tick can race
+  if (activeProcs.has(recordingId)) {
+    console.warn(`[live-capture] skip duplicate start ${recordingId}`);
+    return;
+  }
+  const existingPid = await sql<{ process_pid: number | null; status: string }[]>`
+    SELECT process_pid, status FROM live_captures WHERE recording_id = ${recordingId}
+  `;
+  if (
+    existingPid[0]?.status === "recording" &&
+    pidAlive(existingPid[0].process_pid != null ? Number(existingPid[0].process_pid) : null)
+  ) {
+    console.warn(`[live-capture] skip duplicate start (pid alive) ${recordingId}`);
+    return;
+  }
+
   const partAbs = `${destAbs}.part.mp4`;
   try {
     await unlink(partAbs);
