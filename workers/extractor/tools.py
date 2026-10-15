@@ -27,6 +27,40 @@ def _norm_text(s: str) -> str:
     return t
 
 
+def _near_dup(a: str, b: str) -> bool:
+    """Fuzzy dedupe: exact, containment, or high char-overlap (prefer miss over spam)."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if a in b or b in a:
+        return abs(len(a) - len(b)) <= max(4, int(0.35 * max(len(a), len(b))))
+    # cheap token Jaccard
+    ta, tb = set(a.split()), set(b.split())
+    if not ta or not tb:
+        return False
+    inter = len(ta & tb)
+    union = len(ta | tb)
+    return union > 0 and inter / union >= 0.85
+
+
+def _crop_signature(fp: Path, crop_frac: tuple[float, float, float, float]) -> bytes:
+    """Tiny grayscale thumbnail of comment crop — detect region change cheaply."""
+    from PIL import Image
+
+    img = Image.open(fp).convert("L")
+    cropped = _crop_image(img, crop_frac)
+    thumb = cropped.resize((48, 32), Image.Resampling.BILINEAR)
+    return thumb.tobytes()
+
+
+def _sig_changed(a: bytes, b: bytes, threshold: float = 0.08) -> bool:
+    if not a or not b or len(a) != len(b):
+        return True
+    diff = sum(1 for x, y in zip(a, b) if abs(x - y) > 18)
+    return (diff / len(a)) >= threshold
+
+
 def _frame_offset_ms(name: str, fps: float) -> int:
     """frame_00001.jpg → offset from 1-based index and OCR fps."""
     m = re.search(r"(\d+)", Path(name).stem)
@@ -232,21 +266,55 @@ def _ocr_tesseract(files: list[Path], crop_frac) -> list[tuple[str, str, float]]
     return out
 
 
+def _select_ocr_frames(
+    all_files: list[Path], crop_frac: tuple[float, float, float, float]
+) -> list[Path]:
+    """Keep frame budget; OCR denser only when comment-region crop changes.
+
+    Walk every Nth frame for signatures; when the crop changes vs last kept
+    frame, include it. Always keep first/last. Cap at OCR_MAX_FRAMES.
+    """
+    if not all_files:
+        return []
+    stride = max(1, int(os.environ.get("OCR_FRAME_STRIDE", "2")))
+    max_frames = int(os.environ.get("OCR_MAX_FRAMES", "240"))
+    # Scan denser than OCR budget so we can pick change frames
+    scan = all_files[:: max(1, stride // 2 or 1)] if stride > 1 else all_files
+    if len(scan) > max_frames * 3:
+        step = max(1, len(scan) // (max_frames * 3))
+        scan = scan[::step]
+
+    selected: list[Path] = []
+    last_sig: bytes | None = None
+    for fp in scan:
+        try:
+            sig = _crop_signature(fp, crop_frac)
+        except Exception:  # noqa: BLE001
+            sig = b""
+        if last_sig is None or _sig_changed(last_sig, sig):
+            selected.append(fp)
+            last_sig = sig if sig else last_sig
+        if len(selected) >= max_frames:
+            break
+    # Ensure coverage: if change-detect under-selected, fill with stride sample
+    if len(selected) < min(max_frames, max(8, len(all_files) // max(stride, 1))):
+        for fp in all_files[::stride]:
+            if fp not in selected:
+                selected.append(fp)
+            if len(selected) >= max_frames:
+                break
+        selected.sort(key=lambda p: p.name)
+    return selected[:max_frames]
+
+
 def try_ocr(recording_id: str, storage_root: str) -> dict:
     frames = Path(storage_root) / "frames" / recording_id
-    files = sorted(frames.glob("*.jpg")) if frames.is_dir() else []
-    if not files:
+    all_files = sorted(frames.glob("*.jpg")) if frames.is_dir() else []
+    if not all_files:
         return _fail(f"no frames in {frames}")
 
-    # Stride + cap: 10 min @ 1fps → stride 3 ≈ 200 frames (enough for comment dedupe)
-    stride = max(1, int(os.environ.get("OCR_FRAME_STRIDE", "2")))
-    files = files[::stride]
-    max_frames = int(os.environ.get("OCR_MAX_FRAMES", "240"))
-    if len(files) > max_frames:
-        step = max(1, len(files) // max_frames)
-        files = files[::step][:max_frames]
-
     crop_frac = _parse_crop(DEFAULT_CROP)
+    files = _select_ocr_frames(all_files, crop_frac)
     fps = float(os.environ.get("OCR_FPS", "1"))
     engine = (os.environ.get("OCR_ENGINE") or "auto").lower()
 
@@ -274,16 +342,14 @@ def try_ocr(recording_id: str, storage_root: str) -> dict:
     if not hits and errors:
         return _fail("; ".join(errors))
 
-    # Dedupe near-identical lines (keep first occurrence + earliest offset)
-    seen: set[str] = set()
+    # Fuzzy dedupe near-identical lines (keep earliest offset)
     unique: list[tuple[str, str, float, int]] = []
     for fname, text, conf in hits:
         key = _norm_text(text)
         if len(key) < 2:
             continue
-        if key in seen:
+        if any(_near_dup(key, _norm_text(u[1])) for u in unique):
             continue
-        seen.add(key)
         unique.append((fname, text, conf, _frame_offset_ms(fname, fps)))
 
     dsn = os.environ.get("DATABASE_URL")
@@ -325,10 +391,12 @@ def try_ocr(recording_id: str, storage_root: str) -> dict:
         "ok": True,
         "backend": backend,
         "frames": len(files),
+        "framesAvailable": len(all_files),
         "rawHits": len(hits),
         "texts": inserted or len(unique),
         "deduped": len(unique),
         "crop": DEFAULT_CROP,
+        "selection": "change_aware",
         "errors": errors or None,
     }
 

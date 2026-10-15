@@ -1,0 +1,57 @@
+{
+  "ok": true,
+  "audio": "/home/tolga/projects/mezatizle/fixtures/sample-live.wav",
+  "results": [
+    {
+      "model": "base",
+      "wallSec": 14.37,
+      "segments": 2,
+      "phraseHits": {
+        "satıldı": true,
+        "satildi": false,
+        "açılış": true,
+        "acilis": false,
+        "sıradaki": false,
+        "siradaki": false,
+        "tl": false,
+        "700": false,
+        "450": false,
+        "500": true
+      },
+      "phraseScore": 3,
+      "phraseMax": 10,
+      "sample": [
+        "Sıvadaki yürün, lacivert çeket, açılış 500 tüklüresi, Ayşe diyor ki altı yüzüncü Mehmet Yedi 100 tüklüresi verdi.",
+        "Satıldı Mehmet Yedi 100 tüklüresi, yeni yürün, kırmızı çanta, açılış 300 tüklüresi, satıldı Ayşe 400 50 tüklüresi."
+      ],
+      "language": "tr"
+    },
+    {
+      "model": "small",
+      "wallSec": 44.67,
+      "segments": 2,
+      "phraseHits": {
+        "satıldı": true,
+        "satildi": false,
+        "açılış": true,
+        "acilis": false,
+        "sıradaki": true,
+        "siradaki": false,
+        "tl": false,
+        "700": true,
+        "450": true,
+        "500": true
+      },
+      "phraseScore": 6,
+      "phraseMax": 10,
+      "sample": [
+        "Sıradaki ürün, laciverk ceket, açılış 500 Türk lirası, Ayşe diyor ki 6. Mehmet 700 Türk lirası verdi.",
+        "Satıldı Mehmet 700 Türk lirası, yeni ürün, kırmızı çanta, açılış 300 Türk lirası, satıldı Ayşe 450 Türk lirası."
+      ],
+      "language": "tr"
+    }
+  ],
+  "recommendation": "small",
+  "rationale": "small gains +3 phrase hits at ~3.1× CPU — worth it on this fixture.",
+  "note": "Does not mutate env; set WHISPER_MODEL only after operator review."
+}

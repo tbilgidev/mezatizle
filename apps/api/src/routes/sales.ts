@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { Sql } from "@mezatizle/db";
+import { explainSaleTr } from "@mezatizle/shared";
 
 export function salesRoutes(sql: Sql) {
   const app = new Hono();
@@ -37,26 +38,124 @@ export function salesRoutes(sql: Sql) {
   });
 
   app.get("/", async (c) => {
-    const rows = await sql`
-      SELECT sa.*, p.title AS product_title, s.instagram_username, r.original_filename
-      FROM sales sa
-      LEFT JOIN products p ON p.id = sa.product_id
-      JOIN sellers s ON s.id = sa.seller_id
-      LEFT JOIN recordings r ON r.id = sa.recording_id
-      ORDER BY sa.created_at DESC
-      LIMIT 500
-    `;
+    const recordingId = c.req.query("recordingId");
+    const rows = recordingId
+      ? await sql`
+          SELECT sa.*, p.title AS product_title, s.instagram_username, r.original_filename
+          FROM sales sa
+          LEFT JOIN products p ON p.id = sa.product_id
+          JOIN sellers s ON s.id = sa.seller_id
+          LEFT JOIN recordings r ON r.id = sa.recording_id
+          WHERE sa.recording_id = ${recordingId}
+          ORDER BY sa.created_at DESC
+          LIMIT 500
+        `
+      : await sql`
+          SELECT sa.*, p.title AS product_title, s.instagram_username, r.original_filename
+          FROM sales sa
+          LEFT JOIN products p ON p.id = sa.product_id
+          JOIN sellers s ON s.id = sa.seller_id
+          LEFT JOIN recordings r ON r.id = sa.recording_id
+          ORDER BY sa.created_at DESC
+          LIMIT 500
+        `;
     return c.json({ sales: rows });
   });
 
   app.get("/:id/evidence", async (c) => {
     const id = c.req.param("id");
-    const evidence = await sql`
+    const sale = await sql<Record<string, unknown>[]>`
+      SELECT sa.*, p.title AS product_title, p.attributes AS product_attributes,
+             s.instagram_username, r.original_filename, r.duration_seconds
+      FROM sales sa
+      LEFT JOIN products p ON p.id = sa.product_id
+      JOIN sellers s ON s.id = sa.seller_id
+      LEFT JOIN recordings r ON r.id = sa.recording_id
+      WHERE sa.id = ${id}
+    `;
+    if (!sale[0]) return c.json({ error: "Bulunamadı" }, 404);
+
+    const evidence = await sql<Record<string, unknown>[]>`
       SELECT * FROM sale_evidence WHERE sale_id = ${id} ORDER BY created_at ASC
     `;
-    const sale = await sql`SELECT * FROM sales WHERE id = ${id}`;
-    if (!sale[0]) return c.json({ error: "Bulunamadı" }, 404);
-    return c.json({ sale: sale[0], evidence });
+
+    // Resolve timeline from linked auction event (+ nearby transcript/OCR)
+    let offsetMs: number | null = null;
+    let auctionEvent: Record<string, unknown> | null = null;
+    const primary = evidence.find((e) => e.evidence_type === "auction_event");
+    if (primary?.ref_id) {
+      const ev = await sql<Record<string, unknown>[]>`
+        SELECT * FROM auction_events WHERE id = ${String(primary.ref_id)}
+      `;
+      auctionEvent = ev[0] ?? null;
+      if (auctionEvent?.offset_ms != null) {
+        offsetMs = Number(auctionEvent.offset_ms);
+      }
+    }
+
+    const recordingId = String(sale[0].recording_id ?? "");
+    const windowMs = Number(process.env.EVIDENCE_WINDOW_MS ?? "20000");
+    let transcriptAround: Array<Record<string, unknown>> = [];
+    let commentsAround: Array<Record<string, unknown>> = [];
+    if (recordingId && offsetMs != null) {
+      transcriptAround = await sql`
+        SELECT id, start_ms, end_ms, text, confidence, source
+        FROM transcript_segments
+        WHERE recording_id = ${recordingId}
+          AND start_ms BETWEEN ${offsetMs - windowMs} AND ${offsetMs + windowMs}
+        ORDER BY start_ms ASC
+        LIMIT 40
+      `;
+      commentsAround = await sql`
+        SELECT id, offset_ms, author_username, body, source
+        FROM observed_comments
+        WHERE recording_id = ${recordingId}
+          AND COALESCE(offset_ms, 0) BETWEEN ${offsetMs - windowMs} AND ${offsetMs + windowMs}
+        ORDER BY COALESCE(offset_ms, 0) ASC
+        LIMIT 40
+      `;
+    }
+
+    const conf = Number(
+      (primary?.payload as { confidence?: number } | undefined)?.confidence ??
+        auctionEvent?.confidence ??
+        0,
+    );
+    const reason =
+      (primary?.payload as { reason?: string } | undefined)?.reason ??
+      (auctionEvent?.payload as { reason?: string } | undefined)?.reason ??
+      null;
+    const gaps =
+      (primary?.payload as { gaps?: string[] } | undefined)?.gaps ??
+      ((sale[0].product_attributes as { gaps?: string[] } | undefined)?.gaps ??
+        []);
+    const explanationTr =
+      (primary?.payload as { explanationTr?: string } | undefined)
+        ?.explanationTr ??
+      explainSaleTr({
+        confidence: conf,
+        reason,
+        buyer:
+          sale[0].buyer_username != null
+            ? String(sale[0].buyer_username)
+            : null,
+        amountCents:
+          sale[0].amount_cents != null ? Number(sale[0].amount_cents) : null,
+        gaps,
+      });
+
+    return c.json({
+      sale: sale[0],
+      evidence,
+      auctionEvent,
+      offsetMs,
+      transcriptAround,
+      commentsAround,
+      explanationTr,
+      confidence: conf,
+      gaps,
+      windowMs,
+    });
   });
 
   app.patch("/:id/review", async (c) => {

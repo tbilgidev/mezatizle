@@ -32,3 +32,4 @@ storage/secrets/*
 !storage/secrets/.gitkeep
 BENCHMARK.results.json
 logs/
+fixtures/*.wav

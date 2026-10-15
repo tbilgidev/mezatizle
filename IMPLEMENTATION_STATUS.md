@@ -9,7 +9,7 @@ Last updated: real LOCAL ASR/OCR path verified on tolga-mini (no FORCE_MOCK in l
 - [x] Migrations `001`–`004` applied
 - [x] Live capture (yt-dlp + ffmpeg) with optional duration, compact ≤720p encode
 - [x] Ayarlar → Instagram oturumu (cookies / Playwright login → Netscape cookies for yt-dlp)
-- [x] **faster-whisper** Turkish ASR (`base`, CPU int8) — default LOCAL provider
+- [x] **faster-whisper** Turkish ASR (`small`, CPU int8) — default LOCAL provider
 - [x] **Tesseract** comment OCR (system `tesseract` + `eng`; crop/stride/dedupe) — default LOCAL OCR  
       (PaddleOCR attempted; incompatible with this host’s Python 3.12 / numpy stack — code path kept, `OCR_ENGINE=paddle` when workable)
 - [x] Auction segmentation + sale reconcile on real transcript/OCR (rules-first, no LLM)
@@ -25,7 +25,7 @@ Last updated: real LOCAL ASR/OCR path verified on tolga-mini (no FORCE_MOCK in l
 | Knob | Value |
 |------|--------|
 | `PROCESSING_PROFILE` | `LOCAL` |
-| `WHISPER_MODEL` | `base` |
+| `WHISPER_MODEL` | `small` (fixture-eval default; `base` = CPU saver) |
 | `OCR_ENGINE` | `tesseract` |
 | Frame extract | 1 fps |
 | OCR stride / cap | 3 / 200 frames |
