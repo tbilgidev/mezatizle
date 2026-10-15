@@ -3,7 +3,7 @@
  * Stable JSON — LOCAL only, no paid fields.
  *
  * GET /api/reports
- * GET /api/reports/:recordingId
+ * GET /api/reports/:recordingId  → sales list with thumbnails (not job logs)
  * GET /api/reports/:recordingId/export.csv
  */
 import { Hono } from "hono";
@@ -29,19 +29,36 @@ export type ReportListItem = {
   headline: string;
 };
 
+export type ReportSaleRow = {
+  id: string;
+  productId: string | null;
+  productTitle: string | null;
+  productDescription: string | null;
+  /** Absolute API path for UI: /api/products/:id/image */
+  thumbnailUrl: string | null;
+  buyerUsername: string | null;
+  /** Spoken name when different from @handle; never invented as username. */
+  spokenBuyerName: string | null;
+  amountCents: number | null;
+  amountTry: number | null;
+  currency: string;
+  saleMethod: string | null;
+  /** Alias of saleMethod for mezatizle-ui ReportDetailPage. */
+  detectionMethod: string | null;
+  soldAt: string | null;
+  offsetMs: number | null;
+  confidence: number | null;
+  status: string;
+  evidenceIds: string[];
+  explanationTr: string | null;
+};
+
 export type ReportDetail = ReportListItem & {
-  sales: Array<{
-    id: string;
-    buyerUsername: string | null;
-    amountCents: number | null;
-    amountTry: number | null;
-    status: string;
-    productTitle: string | null;
-    soldAt: string | null;
-  }>;
+  sales: ReportSaleRow[];
   eventCounts: Record<string, number>;
   transcriptSegmentCount: number;
   commentCount: number;
+  /** Job summary kept for debug; UI should prefer `sales`. */
   jobs: Array<{
     jobType: string;
     status: string;
@@ -126,6 +143,28 @@ function rowToListItem(r: Record<string, unknown>): ReportListItem {
 function csvEscape(v: string) {
   if (/[",\n]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
   return v;
+}
+
+function attrString(
+  attrs: Record<string, unknown> | null | undefined,
+  key: string,
+): string | null {
+  if (!attrs || typeof attrs !== "object") return null;
+  const v = attrs[key];
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s.length ? s : null;
+}
+
+function attrNumber(
+  attrs: Record<string, unknown> | null | undefined,
+  key: string,
+): number | null {
+  if (!attrs || typeof attrs !== "object") return null;
+  const v = attrs[key];
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 export function reportsRoutes(sql: Sql) {
@@ -245,13 +284,119 @@ export function reportsRoutes(sql: Sql) {
     const base = rowToListItem(rows[0]);
 
     const sales = await sql<Record<string, unknown>[]>`
-      SELECT sa.id, sa.buyer_username, sa.amount_cents, sa.status, sa.sold_at,
-             p.title AS product_title
+      SELECT
+        sa.id,
+        sa.product_id,
+        sa.buyer_username,
+        sa.amount_cents,
+        sa.currency,
+        sa.status,
+        sa.sold_at,
+        p.title AS product_title,
+        p.description AS product_description,
+        p.attributes AS product_attributes
       FROM sales sa
       LEFT JOIN products p ON p.id = sa.product_id
       WHERE sa.recording_id = ${recordingId}
       ORDER BY sa.sold_at ASC NULLS LAST, sa.created_at ASC
     `;
+
+    const saleIds = sales.map((s) => String(s.id));
+    const evidenceBySale = new Map<
+      string,
+      Array<{ id: string; payload: Record<string, unknown> }>
+    >();
+    if (saleIds.length) {
+      const evRows = await sql<
+        {
+          id: string;
+          sale_id: string;
+          payload: Record<string, unknown>;
+          evidence_type: string;
+        }[]
+      >`
+        SELECT id, sale_id, payload, evidence_type
+        FROM sale_evidence
+        WHERE sale_id = ANY(${saleIds}::uuid[])
+        ORDER BY created_at ASC
+      `;
+      for (const e of evRows) {
+        const list = evidenceBySale.get(String(e.sale_id)) ?? [];
+        list.push({
+          id: String(e.id),
+          payload: (e.payload ?? {}) as Record<string, unknown>,
+        });
+        evidenceBySale.set(String(e.sale_id), list);
+      }
+    }
+
+    const saleRows: ReportSaleRow[] = sales.map((s) => {
+      const productId = s.product_id != null ? String(s.product_id) : null;
+      const attrs =
+        s.product_attributes && typeof s.product_attributes === "object"
+          ? (s.product_attributes as Record<string, unknown>)
+          : null;
+      const imagePath = attrString(attrs, "imagePath");
+      const evList = evidenceBySale.get(String(s.id)) ?? [];
+      const primaryEv = evList[0];
+      const evPayload = primaryEv?.payload ?? {};
+
+      const confidence =
+        attrNumber(attrs, "confidence") ??
+        (evPayload.confidence != null
+          ? Number(evPayload.confidence)
+          : null);
+      const offsetMs =
+        attrNumber(attrs, "offsetMs") ??
+        (evPayload.offsetMs != null ? Number(evPayload.offsetMs) : null);
+      const saleMethod =
+        attrString(attrs, "saleMethod") ??
+        (typeof evPayload.saleMethod === "string"
+          ? evPayload.saleMethod
+          : null);
+      const spokenBuyerName =
+        attrString(attrs, "spokenBuyerName") ??
+        (typeof evPayload.spokenBuyerName === "string"
+          ? evPayload.spokenBuyerName
+          : null);
+      const explanationTr =
+        typeof evPayload.explanationTr === "string"
+          ? evPayload.explanationTr
+          : null;
+
+      return {
+        id: String(s.id),
+        productId,
+        productTitle:
+          s.product_title != null ? String(s.product_title) : null,
+        productDescription:
+          s.product_description != null
+            ? String(s.product_description)
+            : null,
+        thumbnailUrl:
+          productId && imagePath
+            ? `/api/products/${productId}/image`
+            : null,
+        buyerUsername:
+          s.buyer_username != null ? String(s.buyer_username) : null,
+        spokenBuyerName,
+        amountCents: s.amount_cents != null ? Number(s.amount_cents) : null,
+        amountTry:
+          s.amount_cents != null ? Number(s.amount_cents) / 100 : null,
+        currency: String(s.currency ?? "TRY"),
+        saleMethod,
+        detectionMethod: saleMethod,
+        soldAt: toIso(s.sold_at),
+        offsetMs,
+        confidence:
+          confidence != null && Number.isFinite(confidence)
+            ? confidence
+            : null,
+        status: String(s.status),
+        evidenceIds: evList.map((e) => e.id),
+        explanationTr,
+      };
+    });
 
     const eventRows = await sql<{ event_type: string; n: string }[]>`
       SELECT event_type, COUNT(*)::text AS n
@@ -280,16 +425,7 @@ export function reportsRoutes(sql: Sql) {
 
     const detail: ReportDetail = {
       ...base,
-      sales: sales.map((s) => ({
-        id: String(s.id),
-        buyerUsername: s.buyer_username != null ? String(s.buyer_username) : null,
-        amountCents: s.amount_cents != null ? Number(s.amount_cents) : null,
-        amountTry:
-          s.amount_cents != null ? Number(s.amount_cents) / 100 : null,
-        status: String(s.status),
-        productTitle: s.product_title != null ? String(s.product_title) : null,
-        soldAt: toIso(s.sold_at),
-      })),
+      sales: saleRows,
       eventCounts,
       transcriptSegmentCount: Number(tr?.n ?? 0),
       commentCount: Number(cm?.n ?? 0),

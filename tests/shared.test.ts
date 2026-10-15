@@ -10,6 +10,8 @@ import {
   parseAuctionTexts,
   parseBuyerHint,
   parsePriceTry,
+  parseSpokenBuyerName,
+  parseTurkishWordAmount,
   resolveProfile,
   SALE_MIN_CONFIDENCE,
 } from "@mezatizle/shared";
@@ -46,10 +48,44 @@ describe("Turkish auction rules", () => {
     expect(isSaleWorthy(s!)).toBe(true);
   });
 
-  test("aldım is bid never sold", () => {
-    const s = parseAuctionText("aldım 500 TL");
+  test("comment aldım is bid never sold", () => {
+    const s = parseAuctionText("aldım 500 TL", { source: "comment" });
     expect(s?.eventType).toBe("bid");
     expect(s?.amountTry).toBe(500);
+    // Default (no source) also stays bid — UI OCR / unknown
+    expect(parseAuctionText("aldım 500 TL")?.eventType).toBe("bid");
+  });
+
+  test("seller transcript aldım + bin/lira is sold (buyer unknown OK)", () => {
+    const s = parseAuctionText("Fincanı aldım on bin lira", {
+      source: "transcript",
+    });
+    expect(s?.eventType).toBe("sold");
+    expect(s?.amountTry).toBe(10000);
+    expect(s?.buyerHint).toBeUndefined();
+    expect(isSaleWorthy(s!)).toBe(true);
+
+    const s2 = parseAuctionText("Bu da aldım 8 bin lira", {
+      source: "transcript",
+    });
+    expect(s2?.eventType).toBe("sold");
+    expect(s2?.amountTry).toBe(8000);
+    expect(isSaleWorthy(s2!)).toBe(true);
+  });
+
+  test("Turkish number words and N bin", () => {
+    expect(parsePriceTry("on bin lira")).toBe(10000);
+    expect(parsePriceTry("altı bin")).toBe(6000);
+    expect(parsePriceTry("üç bin beş yüz")).toBe(3500);
+    expect(parsePriceTry("25 bin")).toBe(25000);
+    expect(parseTurkishWordAmount("Iki bin beş yüz lira")).toBe(2500);
+  });
+
+  test("spoken buyer name is not buyer_username", () => {
+    const s = parseAuctionText("Satıldı Mehmet 700 TL");
+    expect(s?.buyerHint).toBeUndefined();
+    expect(parseSpokenBuyerName("Satıldı Mehmet 700 TL")).toBe("Mehmet");
+    expect(s?.spokenBuyerName).toBe("Mehmet");
   });
 
   test("plain +50 / arttır are bids", () => {

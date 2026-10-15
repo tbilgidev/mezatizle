@@ -87,7 +87,10 @@ export {
   parseAuctionTexts,
   splitAuctionClauses,
   parsePriceTry,
+  parseTurkishWordAmount,
   parseBuyerHint,
+  parseSpokenBuyerName,
+  isSellerAldimClosing,
   isSaleWorthy,
   isAuctionNoise,
   enrichSoldFromBids,
@@ -97,6 +100,8 @@ export {
   type AuctionEventType,
   type ParsedAuctionSignal,
   type BidContext,
+  type ParseAuctionOpts,
+  type ParseAuctionSource,
 } from "./auction.ts";
 export {
   parseLiveSourceInput,

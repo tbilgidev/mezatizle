@@ -32,12 +32,20 @@ fi
 
 bun run migrate
 
-# Stop previous by pid file (avoid pkill -f matching this script)
+# Stop previous API/web (pid file + free API port)
 for f in logs/api.pid logs/web.pid; do
   if [[ -f "$f" ]]; then
-    kill "$(cat "$f")" 2>/dev/null || true
+    oldpid="$(cat "$f" 2>/dev/null || true)"
+    if [[ -n "${oldpid:-}" ]]; then
+      kill "$oldpid" 2>/dev/null || true
+      sleep 1
+      kill -9 "$oldpid" 2>/dev/null || true
+    fi
   fi
 done
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k "${API_PORT:-43127}/tcp" 2>/dev/null || true
+fi
 sleep 1
 
 # Explicitly clear mocks in the child env

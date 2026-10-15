@@ -55,6 +55,9 @@ export async function segmentAuctionFromSignals(
   sql: Sql,
   recordingId: string,
 ) {
+  // Idempotent re-runs: drop prior events for this recording
+  await sql`DELETE FROM auction_events WHERE recording_id = ${recordingId}`;
+
   const segments = await sql<{
     id: string;
     start_ms: number;
@@ -79,7 +82,7 @@ export async function segmentAuctionFromSignals(
   let created = 0;
 
   for (const seg of segments) {
-    const signals = parseAuctionTexts(seg.text);
+    const signals = parseAuctionTexts(seg.text, { source: "transcript" });
     for (const signal of signals) {
       if (signal.eventType === "bid" && signal.buyerHint) {
         bidCtx.push({
@@ -108,7 +111,7 @@ export async function segmentAuctionFromSignals(
   }
 
   for (const c of comments) {
-    const signals = parseAuctionTexts(c.body);
+    const signals = parseAuctionTexts(c.body, { source: "comment" });
     for (let signal of signals) {
       const author =
         c.author_username && /^[A-Za-z0-9._]{1,30}$/.test(c.author_username)
@@ -192,21 +195,49 @@ export async function segmentAuctionFromSignals(
   return { eventsCreated: created, soldEnrichedFromBids: enriched };
 }
 
+function saleMethodFromReason(reason: unknown, source: unknown): string {
+  const r = typeof reason === "string" ? reason : "";
+  if (r.includes("seller_aldim")) return "seller_aldim";
+  if (r.includes("bid_lookback") || r.includes("+bid_lookback")) {
+    return "sold_phrase_bid_enriched";
+  }
+  if (source === "comment") return "comment_sold";
+  if (r.includes("sold")) return "sold_phrase";
+  return source === "transcript" ? "transcript_sold" : "unknown";
+}
+
 export async function reconcileSales(
   sql: Sql,
   recordingId: string,
   storageRoot = process.env.STORAGE_ROOT ?? "./storage",
 ) {
-  const rec = await sql<{ seller_id: string }[]>`
-    SELECT seller_id FROM recordings WHERE id = ${recordingId}
+  const rec = await sql<{ seller_id: string; recorded_at: Date | string }[]>`
+    SELECT seller_id, recorded_at FROM recordings WHERE id = ${recordingId}
   `;
   if (!rec[0]) throw new Error("recording not found");
   const sellerId = rec[0].seller_id;
+  const recordedAt = new Date(rec[0].recorded_at);
 
   const minConf = Number(
     process.env.SALE_MIN_CONFIDENCE ?? SALE_MIN_CONFIDENCE,
   );
   const gate = Number.isFinite(minConf) ? minConf : SALE_MIN_CONFIDENCE;
+
+  // Idempotent: remove prior auto sales/evidence/products for this recording
+  const oldSales = await sql<{ id: string; product_id: string | null }[]>`
+    SELECT id, product_id FROM sales WHERE recording_id = ${recordingId}
+  `;
+  if (oldSales.length) {
+    const saleIds = oldSales.map((s) => s.id);
+    await sql`DELETE FROM sale_evidence WHERE sale_id = ANY(${saleIds}::uuid[])`;
+    await sql`DELETE FROM sales WHERE recording_id = ${recordingId}`;
+    const productIds = oldSales
+      .map((s) => s.product_id)
+      .filter((id): id is string => Boolean(id));
+    if (productIds.length) {
+      await sql`DELETE FROM products WHERE id = ANY(${productIds}::uuid[])`;
+    }
+  }
 
   const sold = await sql<{
     id: string;
@@ -247,23 +278,47 @@ export async function reconcileSales(
     const buyer =
       buyerRaw && /^[a-z0-9._]{1,30}$/.test(buyerRaw) ? buyerRaw : null;
 
-    // Dedupe transcript+OCR double-count of the same lot
-    const dedupeKey = `${buyer ?? "_"}:${amountCents ?? "_"}`;
-    if (amountCents != null && seenKeys.has(dedupeKey)) {
+    const spokenRaw =
+      typeof ev.payload.spokenBuyerName === "string"
+        ? ev.payload.spokenBuyerName.trim()
+        : "";
+    const spokenBuyerName =
+      spokenRaw &&
+      spokenRaw.length >= 2 &&
+      (!buyer || spokenRaw.toLowerCase() !== buyer)
+        ? spokenRaw.slice(0, 40)
+        : null;
+
+    // Dedupe: same amount within ~8s window (transcript repeats)
+    const offsetMs = ev.offset_ms != null ? Number(ev.offset_ms) : null;
+    const dedupeKey =
+      amountCents != null
+        ? `${amountCents}:${Math.floor((offsetMs ?? 0) / 8000)}`
+        : `${buyer ?? "_"}:${offsetMs ?? "_"}`;
+    if (seenKeys.has(dedupeKey)) {
       skippedDuplicate++;
       continue;
     }
-    if (amountCents != null) seenKeys.add(dedupeKey);
+    seenKeys.add(dedupeKey);
 
     const gaps: string[] = [];
     if (!buyer) gaps.push("buyer_unknown");
     if (amountCents == null) gaps.push("amount_unknown");
 
+    const matched =
+      typeof ev.payload.matched === "string" ? ev.payload.matched.trim() : "";
     const productHint =
       typeof ev.payload.productHint === "string" &&
       ev.payload.productHint.trim().length > 2
         ? ev.payload.productHint.trim().slice(0, 200)
-        : `Canlı lot @ ${ev.offset_ms ?? 0}ms (inceleme)`;
+        : matched.length > 2
+          ? matched.slice(0, 200)
+          : `Canlı lot @ ${offsetMs ?? 0}ms (inceleme)`;
+
+    const saleMethod = saleMethodFromReason(
+      ev.payload.reason,
+      ev.payload.source,
+    );
 
     const explanation = explainSaleTr({
       confidence: conf,
@@ -274,17 +329,25 @@ export async function reconcileSales(
       gaps,
     });
 
+    const soldAt =
+      offsetMs != null && Number.isFinite(recordedAt.getTime())
+        ? new Date(recordedAt.getTime() + offsetMs)
+        : new Date();
+
     const product = await sql<{ id: string }[]>`
       INSERT INTO products (seller_id, title, description, attributes)
       VALUES (
         ${sellerId},
         ${productHint},
-        ${"Otomatik aday ürün — LOCAL kurallar; yanlış olursa reddedin"},
+        ${matched || "Otomatik aday ürün — LOCAL kurallar; yanlış olursa reddedin"},
         ${sql.json({
           sourceEventId: ev.id,
           confidence: conf,
           amountKnown: amountCents != null,
           buyerKnown: buyer != null,
+          spokenBuyerName,
+          saleMethod,
+          offsetMs,
           gaps,
         })}
       )
@@ -294,7 +357,7 @@ export async function reconcileSales(
       storageRoot,
       recordingId,
       product[0]!.id,
-      ev.offset_ms,
+      offsetMs,
     );
     if (imagePath) {
       await sql`
@@ -316,7 +379,7 @@ export async function reconcileSales(
         ${buyer},
         ${amountCents},
         'TRY',
-        now(),
+        ${soldAt.toISOString()},
         'needs_review'
       )
       RETURNING id
@@ -343,11 +406,13 @@ export async function reconcileSales(
           confidence: conf,
           gate,
           reason: ev.payload.reason ?? null,
+          saleMethod,
           amountCents,
           buyer,
+          spokenBuyerName,
           gaps,
           explanationTr: explanation,
-          offsetMs: ev.offset_ms,
+          offsetMs,
         })}
       )
     `;
@@ -362,7 +427,7 @@ export async function reconcileSales(
           ${"Kaynak satır (uydurma yok)"},
           ${sql.json({
             matched: ev.payload.matched ?? null,
-            offsetMs: ev.offset_ms,
+            offsetMs,
           })}
         )
       `;
