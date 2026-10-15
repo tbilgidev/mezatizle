@@ -37,7 +37,12 @@ export type ReportDetail = ReportListItem & {
     amountTry: number | null;
     status: string;
     productTitle: string | null;
+    productDescription: string | null;
     soldAt: string | null;
+    thumbnailUrl: string | null;
+    detectionMethod: string | null;
+    confidence: number | null;
+    offsetMs: number | null;
   }>;
   eventCounts: Record<string, number>;
   transcriptSegmentCount: number;
@@ -244,9 +249,50 @@ export function reportsRoutes(sql: Sql) {
 
     const base = rowToListItem(rows[0]);
 
+    // Extra fields (thumbnail / method / confidence / offset) come from product
+    // attributes + first sale_evidence payload when present. Analysis worker may
+    // also enrich the live API response with camelCase aliases the web normalizes.
     const sales = await sql<Record<string, unknown>[]>`
       SELECT sa.id, sa.buyer_username, sa.amount_cents, sa.status, sa.sold_at,
-             p.title AS product_title
+             p.title AS product_title,
+             p.description AS product_description,
+             COALESCE(
+               p.attributes->>'thumbnailUrl',
+               p.attributes->>'thumbnail_url',
+               p.attributes->>'imageUrl',
+               p.attributes->>'image_url',
+               p.attributes->>'imagePath'
+             ) AS thumbnail_url,
+             (
+               SELECT COALESCE(
+                 se.payload->>'detectionMethod',
+                 se.payload->>'method',
+                 se.payload->>'source',
+                 se.evidence_type
+               )
+               FROM sale_evidence se
+               WHERE se.sale_id = sa.id
+               ORDER BY se.created_at ASC
+               LIMIT 1
+             ) AS detection_method,
+             (
+               SELECT NULLIF(se.payload->>'confidence', '')::double precision
+               FROM sale_evidence se
+               WHERE se.sale_id = sa.id
+                 AND se.payload ? 'confidence'
+               ORDER BY se.created_at ASC
+               LIMIT 1
+             ) AS sale_confidence,
+             (
+               SELECT COALESCE(
+                 NULLIF(se.payload->>'offsetMs', '')::bigint,
+                 NULLIF(se.payload->>'offset_ms', '')::bigint
+               )
+               FROM sale_evidence se
+               WHERE se.sale_id = sa.id
+               ORDER BY se.created_at ASC
+               LIMIT 1
+             ) AS offset_ms
       FROM sales sa
       LEFT JOIN products p ON p.id = sa.product_id
       WHERE sa.recording_id = ${recordingId}
@@ -280,16 +326,34 @@ export function reportsRoutes(sql: Sql) {
 
     const detail: ReportDetail = {
       ...base,
-      sales: sales.map((s) => ({
-        id: String(s.id),
-        buyerUsername: s.buyer_username != null ? String(s.buyer_username) : null,
-        amountCents: s.amount_cents != null ? Number(s.amount_cents) : null,
-        amountTry:
-          s.amount_cents != null ? Number(s.amount_cents) / 100 : null,
-        status: String(s.status),
-        productTitle: s.product_title != null ? String(s.product_title) : null,
-        soldAt: toIso(s.sold_at),
-      })),
+      sales: sales.map((s) => {
+        const conf =
+          s.sale_confidence != null && Number.isFinite(Number(s.sale_confidence))
+            ? Number(s.sale_confidence)
+            : null;
+        return {
+          id: String(s.id),
+          buyerUsername:
+            s.buyer_username != null ? String(s.buyer_username) : null,
+          amountCents: s.amount_cents != null ? Number(s.amount_cents) : null,
+          amountTry:
+            s.amount_cents != null ? Number(s.amount_cents) / 100 : null,
+          status: String(s.status),
+          productTitle:
+            s.product_title != null ? String(s.product_title) : null,
+          productDescription:
+            s.product_description != null
+              ? String(s.product_description)
+              : null,
+          soldAt: toIso(s.sold_at),
+          thumbnailUrl:
+            s.thumbnail_url != null ? String(s.thumbnail_url) : null,
+          detectionMethod:
+            s.detection_method != null ? String(s.detection_method) : null,
+          confidence: conf,
+          offsetMs: s.offset_ms != null ? Number(s.offset_ms) : null,
+        };
+      }),
       eventCounts,
       transcriptSegmentCount: Number(tr?.n ?? 0),
       commentCount: Number(cm?.n ?? 0),

@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, Download, Film } from "lucide-react";
-import { api, type ReportDetail } from "@/lib/api";
+import {
+  ArrowLeft,
+  ChevronDown,
+  ChevronUp,
+  Download,
+  Film,
+  ImageOff,
+} from "lucide-react";
+import { api, type ReportDetail, type ReportSale } from "@/lib/api";
 import { resolveOffsetMs } from "@/lib/seek";
 import {
   confidenceLabel,
@@ -15,42 +22,114 @@ import { EmptyState, ErrorState, LoadingState, PageHeader } from "@/components/S
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Table, TBody, TD, TH, THead, TR } from "@/components/ui/table";
 
 function saleBadge(status: string): "ok" | "warn" | "danger" | "muted" {
   if (status === "confirmed") return "ok";
   if (status === "rejected") return "danger";
-  if (status === "needs_review") return "warn";
+  if (status === "needs_review" || status === "candidate") return "warn";
   return "muted";
+}
+
+const METHOD_TR: Record<string, string> = {
+  transcript: "Ses",
+  asr: "Ses",
+  ocr: "OCR",
+  overlay: "OCR",
+  comment: "Yorum",
+  comments: "Yorum",
+  video: "Video",
+  frame: "Kare",
+  reconcile: "Eşleştirme",
+  bid: "Teklif",
+  auction_event: "Olay",
+  manual: "Elle",
+};
+
+function methodTr(raw: string | null | undefined): string {
+  if (!raw) return "—";
+  const key = raw.toLowerCase().replace(/\s+/g, "_");
+  return METHOD_TR[key] ?? raw;
+}
+
+function formatOffset(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${String(m).padStart(2, "0")}:${String(rem).padStart(2, "0")}`;
+}
+
+function emptySalesHint(report: ReportDetail): string {
+  const bids = Number(report.eventCounts.bid ?? 0);
+  const ocr =
+    Number(report.eventCounts.ocr ?? 0) +
+    Number(report.eventCounts.price ?? 0) +
+    Number(report.eventCounts.overlay ?? 0);
+  const running = report.jobs.some(
+    (j) => j.status === "running" || j.status === "queued",
+  );
+  if (running) {
+    return "Analiz sürüyor — satış adayları hazır olunca burada listelenir.";
+  }
+  if (bids > 0 || ocr > 0) {
+    const bits: string[] = [];
+    if (bids > 0) bits.push(`${bids} teklif sinyali`);
+    if (ocr > 0) bits.push(`${ocr} OCR/fiyat sinyali`);
+    return `${bits.join(", ")} bulundu ama henüz satış satırına dönüşmedi. Transkript + OCR eşleşmesi tamamlanınca ürün / alıcı / tutar burada görünür.`;
+  }
+  if (report.transcriptSegmentCount > 0) {
+    return "Transkript var; bu yayında onaylanabilir satış cümlesi / fiyat eşleşmesi çıkmadı.";
+  }
+  return "Bu kayıtta henüz satış adayı yok. Analiz bitince ürün, alıcı ve tutar burada listelenir.";
+}
+
+function SaleThumb({ sale }: { sale: ReportSale }) {
+  const [broken, setBroken] = useState(false);
+  if (!sale.thumbnailUrl || broken) {
+    return (
+      <div
+        className="flex h-16 w-16 shrink-0 items-center justify-center rounded-xl border border-line bg-ink/50 text-fog"
+        aria-hidden
+      >
+        <ImageOff className="h-5 w-5" />
+      </div>
+    );
+  }
+  return (
+    <img
+      src={sale.thumbnailUrl}
+      alt=""
+      className="h-16 w-16 shrink-0 rounded-xl border border-line object-cover"
+      loading="lazy"
+      onError={() => setBroken(true)}
+    />
+  );
 }
 
 export function ReportDetailPage() {
   const { recordingId = "" } = useParams();
   const [report, setReport] = useState<ReportDetail | null>(null);
-  const [segments, setSegments] = useState<Array<Record<string, unknown>>>([]);
-  const [events, setEvents] = useState<Array<Record<string, unknown>>>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [techOpen, setTechOpen] = useState(false);
   const [player, setPlayer] = useState<{
     saleId: string;
     offsetMs: number;
   } | null>(null);
+  /** Sales whose video was reviewed this session — unlocks Onayla/Reddet. */
+  const [reviewedIds, setReviewedIds] = useState<Set<string>>(() => new Set());
 
   async function load() {
-    const [rep, tr, ev] = await Promise.all([
-      api.report(recordingId),
-      api.transcript(recordingId),
-      api.events(recordingId),
-    ]);
+    const rep = await api.report(recordingId);
     setReport(rep.report);
-    setSegments(tr.segments);
-    setEvents(ev.events);
   }
 
   useEffect(() => {
     let alive = true;
     setLoading(true);
+    setReviewedIds(new Set());
+    setPlayer(null);
     load()
       .catch((e: Error) => {
         if (alive) setError(e.message);
@@ -60,28 +139,14 @@ export function ReportDetailPage() {
       });
     const t = setInterval(() => {
       void load().catch(() => undefined);
-    }, 4000);
+    }, 5000);
     return () => {
       alive = false;
       clearInterval(t);
     };
   }, [recordingId]);
 
-  const transcriptHighlights = useMemo(() => {
-    const keywords = /satıldı|satildi|gitti|aldi|aldı|kazandi|kazandı|tl\b|\d+\s*tl/i;
-    return segments
-      .filter((s) => keywords.test(String(s.text ?? "")))
-      .slice(0, 24);
-  }, [segments]);
-
-  const ocrHighlights = useMemo(() => {
-    return events
-      .filter((e) => {
-        const t = String(e.event_type ?? "").toLowerCase();
-        return t.includes("ocr") || t.includes("overlay") || t.includes("price");
-      })
-      .slice(0, 24);
-  }, [events]);
+  const sales = useMemo(() => report?.sales ?? [], [report]);
 
   async function review(saleId: string, status: string) {
     setBusyId(saleId);
@@ -96,24 +161,30 @@ export function ReportDetailPage() {
     }
   }
 
-  async function openEvidencePlayer(saleId: string, productTitle: string | null) {
-    setBusyId(saleId);
+  async function openEvidencePlayer(sale: ReportSale) {
+    setBusyId(sale.id);
     setError(null);
     try {
-      const d = await api.evidence(saleId);
-      const ms = resolveOffsetMs({
-        offsetMs: d.offsetMs,
-        evidence: d.evidence,
-        productTitle:
-          productTitle ??
-          (d.sale.product_title != null ? String(d.sale.product_title) : null),
-        auctionEvent: d.auctionEvent,
-      });
+      let ms = sale.offsetMs;
+      if (ms == null) {
+        const d = await api.evidence(sale.id);
+        ms = resolveOffsetMs({
+          offsetMs: d.offsetMs,
+          evidence: d.evidence,
+          productTitle:
+            sale.productTitle ??
+            (d.sale.product_title != null
+              ? String(d.sale.product_title)
+              : null),
+          auctionEvent: d.auctionEvent,
+        });
+      }
       if (ms == null) {
         setError("Bu satış için video zaman damgası bulunamadı.");
         return;
       }
-      setPlayer({ saleId, offsetMs: ms });
+      setPlayer({ saleId: sale.id, offsetMs: ms });
+      setReviewedIds((prev) => new Set(prev).add(sale.id));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -124,7 +195,7 @@ export function ReportDetailPage() {
   if (loading && !report) {
     return (
       <div className="mx-auto max-w-[1100px]">
-        <LoadingState label="Rapor yükleniyor…" />
+        <LoadingState label="Satış analizi yükleniyor…" />
       </div>
     );
   }
@@ -152,8 +223,11 @@ export function ReportDetailPage() {
       </p>
 
       <PageHeader
-        title={report.headline || `@${report.sellerUsername}`}
-        lead={`${formatDateTr(report.recordedAt ?? report.uploadedAt)} · ${formatDuration(report.durationSeconds)} · ${report.originalFilename}`}
+        title={
+          report.headline ||
+          `@${report.sellerUsername} — satış analizi`
+        }
+        lead={`${formatDateTr(report.recordedAt ?? report.uploadedAt)} · ${formatDuration(report.durationSeconds)} · @${report.sellerUsername}`}
         actions={
           <a
             href={api.reportCsvUrl(report.recordingId)}
@@ -167,22 +241,23 @@ export function ReportDetailPage() {
 
       {error && <ErrorState message={error} className="mb-4" />}
 
-      <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-5">
+      <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
         {[
-          { l: "Durum", v: statusTr(report.status) },
+          { l: "Satıcı", v: `@${report.sellerUsername}` },
+          { l: "Süre", v: formatDuration(report.durationSeconds) },
           { l: "Satış", v: String(report.saleCount) },
           { l: "Toplam", v: formatTry(report.sumAmountTry) },
-          { l: "Güven", v: confidenceLabel(report.avgEventConfidence) },
-          {
-            l: "İnceleme",
-            v: String(report.needsReviewCount),
-          },
         ].map((s) => (
-          <div key={s.l} className="rounded-2xl border border-line bg-panel/70 px-4 py-3">
+          <div
+            key={s.l}
+            className="rounded-2xl border border-line bg-panel/70 px-4 py-3"
+          >
             <span className="text-xs font-semibold uppercase tracking-wide text-fog">
               {s.l}
             </span>
-            <strong className="mt-1 block font-display text-lg">{s.v}</strong>
+            <strong className="mt-1 block truncate font-display text-lg tracking-tight">
+              {s.v}
+            </strong>
           </div>
         ))}
       </div>
@@ -199,210 +274,228 @@ export function ReportDetailPage() {
 
       <Card className="mb-4">
         <CardHeader>
-          <CardTitle>Ürün / satış tablosu</CardTitle>
+          <CardTitle>Satış listesi</CardTitle>
+          <p className="text-sm text-fog">
+            Ne satıldı, kaça satıldı, kim aldı — satıra tıklayınca video kanıtına
+            gidilir. Onay / red için önce görüntüyü inceleyin.
+          </p>
         </CardHeader>
         <CardContent>
-          {!report.sales.length ? (
+          {!sales.length ? (
             <EmptyState
               title="Satış adayı yok"
-              hint="Analiz tamamlandığında tespit edilen satışlar burada listelenir."
+              hint={emptySalesHint(report)}
             />
           ) : (
-            <Table>
-              <THead>
-                <TR>
-                  <TH>Ürün</TH>
-                  <TH>Alıcı</TH>
-                  <TH>Tutar</TH>
-                  <TH>Durum</TH>
-                  <TH>Kanıt</TH>
-                  <TH>İşlem</TH>
-                </TR>
-              </THead>
-              <TBody>
-                {report.sales.map((s) => (
-                  <TR key={s.id}>
-                    <TD>{s.productTitle ?? "—"}</TD>
-                    <TD>{s.buyerUsername ? `@${s.buyerUsername}` : "—"}</TD>
-                    <TD>{formatTry(s.amountTry)}</TD>
-                    <TD>
-                      <Badge variant={saleBadge(s.status)}>
-                        {statusTr(s.status)}
-                      </Badge>
-                    </TD>
-                    <TD>
-                      <div className="flex flex-col gap-1">
-                        <button
-                          type="button"
-                          className="inline-flex items-center gap-1 text-left text-sm font-semibold text-mint hover:text-mint-bright"
-                          disabled={busyId === s.id}
-                          onClick={() =>
-                            void openEvidencePlayer(s.id, s.productTitle)
-                          }
-                        >
-                          <Film className="h-3.5 w-3.5" />
-                          Görüntüyü incele
-                        </button>
-                        <Link
-                          to={`/evidence/${s.id}`}
-                          className="text-sm font-semibold text-fog hover:text-mint"
-                        >
-                          Kanıt paneli →
-                        </Link>
-                      </div>
-                    </TD>
-                    <TD>
-                      <div className="flex flex-wrap gap-1.5">
-                        <Button
-                          size="sm"
-                          disabled={busyId === s.id || player?.saleId !== s.id}
-                          title={
-                            player?.saleId !== s.id
-                              ? "Önce görüntüyü inceleyin"
-                              : undefined
-                          }
-                          onClick={() => void review(s.id, "confirmed")}
-                        >
-                          Onayla
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="danger"
-                          disabled={busyId === s.id || player?.saleId !== s.id}
-                          title={
-                            player?.saleId !== s.id
-                              ? "Önce görüntüyü inceleyin"
-                              : undefined
-                          }
-                          onClick={() => void review(s.id, "rejected")}
-                        >
-                          Reddet
-                        </Button>
-                      </div>
-                    </TD>
-                  </TR>
-                ))}
-              </TBody>
-            </Table>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[720px] border-collapse text-left text-sm">
+                <thead>
+                  <tr className="border-b border-line text-xs uppercase tracking-wide text-fog">
+                    <th className="pb-2 pr-3 font-semibold">Görsel</th>
+                    <th className="pb-2 pr-3 font-semibold">Ürün</th>
+                    <th className="pb-2 pr-3 font-semibold">Alıcı</th>
+                    <th className="pb-2 pr-3 font-semibold">Tutar</th>
+                    <th className="pb-2 pr-3 font-semibold">Yöntem</th>
+                    <th className="pb-2 pr-3 font-semibold">Zaman</th>
+                    <th className="pb-2 pr-3 font-semibold">Güven</th>
+                    <th className="pb-2 font-semibold">Kanıt / işlem</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sales.map((s) => {
+                    const unlocked =
+                      reviewedIds.has(s.id) || player?.saleId === s.id;
+                    const productLabel =
+                      s.productTitle ??
+                      s.productDescription ??
+                      "Ürün tanımı yok";
+                    return (
+                      <tr
+                        key={s.id}
+                        className="border-b border-line/70 align-top transition-colors hover:bg-white/[0.03]"
+                      >
+                        <td className="py-3 pr-3">
+                          <button
+                            type="button"
+                            className="block rounded-xl focus-visible:outline focus-visible:outline-2 focus-visible:outline-mint"
+                            onClick={() => void openEvidencePlayer(s)}
+                            title="Görüntüyü incele"
+                          >
+                            <SaleThumb sale={s} />
+                          </button>
+                        </td>
+                        <td className="py-3 pr-3">
+                          <button
+                            type="button"
+                            className="max-w-[16rem] text-left"
+                            onClick={() => void openEvidencePlayer(s)}
+                          >
+                            <div className="font-semibold text-paper">
+                              {productLabel}
+                            </div>
+                            {s.productDescription &&
+                            s.productTitle &&
+                            s.productDescription !== s.productTitle ? (
+                              <div className="mt-0.5 line-clamp-2 text-xs text-fog">
+                                {s.productDescription}
+                              </div>
+                            ) : null}
+                            <Badge
+                              variant={saleBadge(s.status)}
+                              className="mt-1.5"
+                            >
+                              {statusTr(s.status)}
+                            </Badge>
+                          </button>
+                        </td>
+                        <td className="py-3 pr-3 whitespace-nowrap">
+                          {s.buyerUsername ? (
+                            <span className="font-semibold text-mint">
+                              @{s.buyerUsername.replace(/^@/, "")}
+                            </span>
+                          ) : (
+                            <span className="text-fog">Bilinmiyor</span>
+                          )}
+                        </td>
+                        <td className="py-3 pr-3 whitespace-nowrap font-display text-base font-semibold tracking-tight">
+                          {formatTry(s.amountTry)}
+                        </td>
+                        <td className="py-3 pr-3 whitespace-nowrap text-fog">
+                          {methodTr(s.detectionMethod)}
+                        </td>
+                        <td className="py-3 pr-3 whitespace-nowrap text-fog">
+                          {s.offsetMs != null
+                            ? formatOffset(s.offsetMs)
+                            : formatDateTr(s.soldAt)}
+                        </td>
+                        <td className="py-3 pr-3 whitespace-nowrap">
+                          {confidenceLabel(s.confidence)}
+                        </td>
+                        <td className="py-3">
+                          <div className="flex flex-col gap-1.5">
+                            <button
+                              type="button"
+                              className="inline-flex items-center gap-1 text-sm font-semibold text-mint hover:text-mint-bright disabled:opacity-50"
+                              disabled={busyId === s.id}
+                              onClick={() => void openEvidencePlayer(s)}
+                            >
+                              <Film className="h-3.5 w-3.5" />
+                              Görüntüyü incele
+                            </button>
+                            <Link
+                              to={`/evidence/${s.id}`}
+                              className="text-xs font-semibold text-fog hover:text-mint"
+                            >
+                              Kanıt paneli →
+                            </Link>
+                            <div className="mt-1 flex flex-wrap gap-1.5">
+                              <Button
+                                size="sm"
+                                disabled={busyId === s.id || !unlocked}
+                                title={
+                                  !unlocked
+                                    ? "Önce görüntüyü inceleyin"
+                                    : undefined
+                                }
+                                onClick={() => void review(s.id, "confirmed")}
+                              >
+                                Onayla
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="danger"
+                                disabled={busyId === s.id || !unlocked}
+                                title={
+                                  !unlocked
+                                    ? "Önce görüntüyü inceleyin"
+                                    : undefined
+                                }
+                                onClick={() => void review(s.id, "rejected")}
+                              >
+                                Reddet
+                              </Button>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           )}
         </CardContent>
       </Card>
 
-      <div className="mb-4 grid gap-4 lg:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Transkript vurguları</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {!transcriptHighlights.length ? (
-              <EmptyState
-                title="Vurgu yok"
-                hint={
-                  report.transcriptSegmentCount
-                    ? "Satış anahtar kelimesi bulunamadı."
-                    : "ASR tamamlanınca segmentler dolar."
-                }
-              />
+      <Card>
+        <CardHeader>
+          <button
+            type="button"
+            className="flex w-full items-center justify-between gap-2 text-left"
+            onClick={() => setTechOpen((v) => !v)}
+            aria-expanded={techOpen}
+          >
+            <CardTitle>Teknik özet</CardTitle>
+            {techOpen ? (
+              <ChevronUp className="h-5 w-5 text-fog" />
             ) : (
-              <ul className="space-y-2">
-                {transcriptHighlights.map((s) => (
-                  <li
-                    key={String(s.id)}
-                    className="rounded-xl border border-line/80 bg-ink/30 px-3 py-2 text-sm"
-                  >
-                    <span className="mr-2 text-xs text-fog">
-                      {Number(s.start_ms)}–{Number(s.end_ms)}ms
-                    </span>
-                    {String(s.text)}
-                  </li>
-                ))}
-              </ul>
+              <ChevronDown className="h-5 w-5 text-fog" />
             )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>OCR / fiyat vurguları</CardTitle>
-          </CardHeader>
+          </button>
+          <p className="text-sm text-fog">
+            İş kuyruğu ve sinyal sayıları — satış listesinin altında, isteğe bağlı.
+          </p>
+        </CardHeader>
+        {techOpen ? (
           <CardContent>
-            {!ocrHighlights.length ? (
-              <EmptyState
-                title="OCR vurgusu yok"
-                hint={
-                  Object.keys(report.eventCounts).length
-                    ? "Olaylar var; OCR/fiyat etiketi bulunamadı."
-                    : "Analiz olayları oluşunca burada görünür."
-                }
-              />
-            ) : (
-              <ul className="space-y-2">
-                {ocrHighlights.map((e) => (
-                  <li
-                    key={String(e.id)}
-                    className="rounded-xl border border-line/80 bg-ink/30 px-3 py-2 text-sm"
-                  >
-                    <Badge variant="muted" className="mr-2">
-                      {String(e.event_type)}
-                    </Badge>
-                    <span className="text-fog">
-                      offset {String(e.offset_ms ?? "—")} · güven{" "}
-                      {e.confidence != null
-                        ? Number(e.confidence).toFixed(2)
-                        : "—"}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
+            <div className="mb-4 flex flex-wrap gap-3 text-sm text-fog">
+              <span>Durum: {statusTr(report.status)}</span>
+              <span>Transkript: {report.transcriptSegmentCount}</span>
+              <span>Yorum: {report.commentCount}</span>
+              <span>İnceleme: {report.needsReviewCount}</span>
+              <span>Ort. güven: {confidenceLabel(report.avgEventConfidence)}</span>
+            </div>
             {!!Object.keys(report.eventCounts).length && (
-              <p className="mt-3 text-xs text-fog">
-                Olay özeti:{" "}
+              <p className="mb-4 text-xs text-fog">
+                Sinyaller:{" "}
                 {Object.entries(report.eventCounts)
                   .map(([k, v]) => `${k}:${v}`)
                   .join(" · ")}
               </p>
             )}
+            {!report.jobs.length ? (
+              <EmptyState title="İş yok" />
+            ) : (
+              <div className="space-y-3">
+                {report.jobs.map((j, i) => (
+                  <div key={`${j.jobType}-${i}`}>
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <strong className="text-sm">{j.jobType}</strong>
+                      <Badge variant="muted">{statusTr(j.status)}</Badge>
+                    </div>
+                    <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
+                      <i
+                        className="block h-full rounded-full bg-gradient-to-r from-mint to-signal transition-all"
+                        style={{ width: `${j.progressPercent || 0}%` }}
+                      />
+                    </div>
+                    {j.stage ? (
+                      <p className="mt-1 text-xs text-fog">{j.stage}</p>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            )}
+            <p className="mt-4 text-xs text-fog">
+              <Link
+                to={`/recordings/${report.recordingId}`}
+                className="text-mint"
+              >
+                Kayıt detayı
+              </Link>
+            </p>
           </CardContent>
-        </Card>
-      </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>İş kuyruğu</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {!report.jobs.length ? (
-            <EmptyState title="İş yok" />
-          ) : (
-            <div className="space-y-3">
-              {report.jobs.map((j, i) => (
-                <div key={`${j.jobType}-${i}`}>
-                  <div className="mb-1 flex items-center justify-between gap-2">
-                    <strong className="text-sm">{j.jobType}</strong>
-                    <Badge variant="muted">{statusTr(j.status)}</Badge>
-                  </div>
-                  <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
-                    <i
-                      className="block h-full rounded-full bg-gradient-to-r from-mint to-signal transition-all"
-                      style={{ width: `${j.progressPercent || 0}%` }}
-                    />
-                  </div>
-                  {j.stage ? (
-                    <p className="mt-1 text-xs text-fog">{j.stage}</p>
-                  ) : null}
-                </div>
-              ))}
-            </div>
-          )}
-          <p className="mt-4 text-xs text-fog">
-            Transkript segment: {report.transcriptSegmentCount} · Yorum:{" "}
-            {report.commentCount} ·{" "}
-            <Link to={`/recordings/${report.recordingId}`} className="text-mint">
-              Kayıt detayı
-            </Link>
-          </p>
-        </CardContent>
+        ) : null}
       </Card>
     </div>
   );

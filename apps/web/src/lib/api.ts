@@ -53,16 +53,29 @@ export type ReportListItem = {
   analysisStage?: string | null;
 };
 
+/** One sale candidate inside a recording report (sales-first detail). */
+export type ReportSale = {
+  id: string;
+  buyerUsername: string | null;
+  amountCents: number | null;
+  amountTry: number | null;
+  status: string;
+  productTitle: string | null;
+  /** Longer product blurb when distinct from title. */
+  productDescription: string | null;
+  soldAt: string | null;
+  /** Frame / product still — absolute or same-origin URL. */
+  thumbnailUrl: string | null;
+  /** How the sale was detected: transcript | ocr | comment | video | … */
+  detectionMethod: string | null;
+  /** 0–1 confidence when API provides it. */
+  confidence: number | null;
+  /** Timeline offset in muxed recording (ms) for video seek. */
+  offsetMs: number | null;
+};
+
 export type ReportDetail = ReportListItem & {
-  sales: Array<{
-    id: string;
-    buyerUsername: string | null;
-    amountCents: number | null;
-    amountTry: number | null;
-    status: string;
-    productTitle: string | null;
-    soldAt: string | null;
-  }>;
+  sales: ReportSale[];
   eventCounts: Record<string, number>;
   transcriptSegmentCount: number;
   commentCount: number;
@@ -74,6 +87,76 @@ export type ReportDetail = ReportListItem & {
     finishedAt: string | null;
   }>;
 };
+
+/** Turn storage keys / relative paths into fetchable same-origin URLs. */
+export function resolveMediaUrl(path: string | null | undefined): string | null {
+  if (path == null) return null;
+  const s = String(path).trim();
+  if (!s) return null;
+  if (/^(https?:|data:|blob:)/i.test(s)) return s;
+  if (s.startsWith("/")) return url(s.startsWith("/api/") ? s : `/api${s}`);
+  return url(`/api/files/${s.replace(/^\/+/, "")}`);
+}
+
+/** Normalize report sale rows (camel or snake, optional fields from analysis worker). */
+export function normalizeReportSale(raw: Record<string, unknown>): ReportSale {
+  const num = (v: unknown): number | null => {
+    if (v == null || v === "") return null;
+    const n = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const str = (v: unknown): string | null => {
+    if (v == null) return null;
+    const s = String(v).trim();
+    return s.length ? s : null;
+  };
+  const amountCents = num(raw.amountCents ?? raw.amount_cents);
+  const amountTryDirect = num(raw.amountTry ?? raw.amount_try);
+  const amountTry =
+    amountTryDirect ?? (amountCents != null ? amountCents / 100 : null);
+  let confidence = num(raw.confidence ?? raw.avgConfidence ?? raw.avg_confidence);
+  if (confidence != null && confidence > 1) confidence = confidence / 100;
+
+  const thumbRaw = str(
+    raw.thumbnailUrl ??
+      raw.thumbnail_url ??
+      raw.thumbUrl ??
+      raw.thumb_url ??
+      raw.frameUrl ??
+      raw.frame_url ??
+      raw.imageUrl ??
+      raw.image_url ??
+      raw.imagePath ??
+      raw.image_path,
+  );
+
+  return {
+    id: String(raw.id ?? ""),
+    buyerUsername: str(raw.buyerUsername ?? raw.buyer_username),
+    amountCents,
+    amountTry,
+    status: String(raw.status ?? "candidate"),
+    productTitle: str(raw.productTitle ?? raw.product_title ?? raw.title),
+    productDescription: str(
+      raw.productDescription ??
+        raw.product_description ??
+        raw.description ??
+        raw.product_blurb,
+    ),
+    soldAt: str(raw.soldAt ?? raw.sold_at),
+    thumbnailUrl: resolveMediaUrl(thumbRaw),
+    detectionMethod: str(
+      raw.detectionMethod ??
+        raw.detection_method ??
+        raw.method ??
+        raw.source ??
+        raw.evidenceSource ??
+        raw.evidence_source,
+    ),
+    confidence,
+    offsetMs: num(raw.offsetMs ?? raw.offset_ms ?? raw.seekMs ?? raw.seek_ms),
+  };
+}
 
 export const api = {
   base: API_BASE || "(same-origin)",
@@ -107,8 +190,19 @@ export const api = {
         currency: string;
       };
     }>("/api/reports"),
-  report: (recordingId: string) =>
-    request<{ report: ReportDetail }>(`/api/reports/${recordingId}`),
+  report: async (recordingId: string) => {
+    const d = await request<{ report: ReportDetail & { sales?: Array<Record<string, unknown>> } }>(
+      `/api/reports/${recordingId}`,
+    );
+    return {
+      report: {
+        ...d.report,
+        sales: (d.report.sales ?? []).map((s) =>
+          normalizeReportSale(s as Record<string, unknown>),
+        ),
+      } satisfies ReportDetail,
+    };
+  },
   evidence: (id: string) =>
     request<{
       sale: Record<string, unknown>;
