@@ -51,6 +51,16 @@ export async function streamFileWithRanges(
     "Cache-Control": "private, max-age=3600",
   };
 
+  if (req.method === "HEAD") {
+    return new Response(null, {
+      status: 200,
+      headers: {
+        ...baseHeaders,
+        "Content-Length": String(size),
+      },
+    });
+  }
+
   if (!range) {
     const file = Bun.file(absPath);
     return new Response(file, {
