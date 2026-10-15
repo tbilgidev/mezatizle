@@ -102,6 +102,15 @@ export type ReportListItem = {
   analysisState?: string | null;
   analysisProgress?: number | null;
   analysisStage?: string | null;
+  /** Funnel KPIs (names may vary — UI reads via extractReportKpis). */
+  productsOffered?: number | null;
+  products_offered?: number | null;
+  totalAskTry?: number | null;
+  total_ask_try?: number | null;
+  productsSold?: number | null;
+  products_sold?: number | null;
+  totalSoldTry?: number | null;
+  total_sold_try?: number | null;
 };
 
 /** One sale candidate inside a recording report (sales-first detail). */

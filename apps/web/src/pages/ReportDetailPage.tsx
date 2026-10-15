@@ -11,6 +11,10 @@ import {
 import { api, type ReportDetail, type ReportSale } from "@/lib/api";
 import { resolveOffsetMs } from "@/lib/seek";
 import {
+  extractReportKpis,
+  reportKpiChips,
+} from "@/lib/report-kpis";
+import {
   confidenceLabel,
   formatDateTr,
   formatDuration,
@@ -213,6 +217,27 @@ export function ReportDetailPage() {
 
   if (!report) return null;
 
+  const kpiChips = reportKpiChips(
+    extractReportKpis(report as unknown as Record<string, unknown>),
+  );
+  const headerChips =
+    kpiChips.length > 0
+      ? kpiChips
+      : [
+          { key: "seller", label: "Satıcı", value: `@${report.sellerUsername}` },
+          {
+            key: "dur",
+            label: "Süre",
+            value: formatDuration(report.durationSeconds),
+          },
+          { key: "sold", label: "Satılan", value: String(report.saleCount) },
+          {
+            key: "totalSold",
+            label: "Toplam satış",
+            value: formatTry(report.sumAmountTry),
+          },
+        ];
+
   return (
     <div className="mx-auto max-w-[1100px] animate-rise">
       <p className="mb-3">
@@ -244,22 +269,20 @@ export function ReportDetailPage() {
 
       {error && <ErrorState message={error} className="mb-4" />}
 
-      <div className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
-        {[
-          { l: "Satıcı", v: `@${report.sellerUsername}` },
-          { l: "Süre", v: formatDuration(report.durationSeconds) },
-          { l: "Satış", v: String(report.saleCount) },
-          { l: "Toplam", v: formatTry(report.sumAmountTry) },
-        ].map((s) => (
+      <div
+        className="mb-5 grid grid-cols-2 gap-3 sm:grid-cols-4"
+        data-report-kpis={kpiChips.length ? "1" : undefined}
+      >
+        {headerChips.map((s) => (
           <div
-            key={s.l}
+            key={s.key}
             className="rounded-2xl border border-line bg-panel/70 px-4 py-3"
           >
             <span className="text-xs font-semibold uppercase tracking-wide text-fog">
-              {s.l}
+              {s.label}
             </span>
             <strong className="mt-1 block truncate font-display text-lg tracking-tight">
-              {s.v}
+              {s.value}
             </strong>
           </div>
         ))}

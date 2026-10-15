@@ -7,7 +7,11 @@ import {
   isAnalysisRunning,
 } from "@/lib/analysis-progress";
 import {
-  confidenceLabel,
+  extractReportKpis,
+  hasAnyKpi,
+  reportKpiChips,
+} from "@/lib/report-kpis";
+import {
   formatDateTr,
   formatDuration,
   formatTry,
@@ -16,7 +20,6 @@ import {
 import { EmptyState, ErrorState, LoadingState, PageHeader } from "@/components/States";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Table, TBody, TD, TH, THead, TR } from "@/components/ui/table";
 
 function statusVariant(status: string): "ok" | "warn" | "danger" | "muted" {
   if (status === "complete" || status === "confirmed") return "ok";
@@ -27,15 +30,7 @@ function statusVariant(status: string): "ok" | "warn" | "danger" | "muted" {
 }
 
 function reportAsRow(r: ReportListItem): Record<string, unknown> {
-  return {
-    status: r.status,
-    analysisState: r.analysisState,
-    analysis_state: r.analysisState,
-    analysisProgress: r.analysisProgress,
-    analysis_progress: r.analysisProgress,
-    analysisStage: r.analysisStage,
-    analysis_stage: r.analysisStage,
-  };
+  return { ...(r as unknown as Record<string, unknown>) };
 }
 
 export function ReportsPage() {
@@ -65,7 +60,6 @@ export function ReportsPage() {
         );
         pollRef.current = setTimeout(() => void tick(), running ? 2500 : 12000);
       } catch (e) {
-        // Keep last good list on transient API blips.
         if (e instanceof Error) setError(e.message);
         if (!cancelled) {
           pollRef.current = setTimeout(() => void tick(), 12000);
@@ -86,32 +80,34 @@ export function ReportsPage() {
     <div className="mx-auto max-w-[1100px] animate-rise">
       <PageHeader
         title="Raporlar"
-        lead="Her kayıt bir analiz raporu. Satıcı, süre, tespit edilen satışlar ve güven özeti — detaya tıklayın."
+        lead="Her kayıt bir analiz raporu. Sunulan / satılan özeti ve satış listesi — detaya tıklayın."
       />
 
       {error && <ErrorState message={error} className="mb-4" />}
       {loading && <LoadingState label="Raporlar yükleniyor…" />}
 
-      {!loading && !error && totals && (
+      {!loading && totals && (
         <div className="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-4">
           {[
             { v: String(totals.recordings), l: "Rapor" },
-            { v: String(totals.sales), l: "Satış adayı" },
+            { v: String(totals.sales), l: "Satılan (aday)" },
             { v: String(totals.needsReview), l: "İnceleme" },
-            { v: formatTry(totals.sumAmountTry), l: "Toplam (yaklaşık)" },
+            { v: formatTry(totals.sumAmountTry), l: "Toplam satış" },
           ].map((s) => (
             <div
               key={s.l}
               className="rounded-2xl border border-line bg-panel/70 px-4 py-4"
             >
-              <strong className="font-display block text-xl tracking-tight">{s.v}</strong>
+              <strong className="font-display block text-xl tracking-tight">
+                {s.v}
+              </strong>
               <span className="mt-1 block text-sm text-fog">{s.l}</span>
             </div>
           ))}
         </div>
       )}
 
-      {!loading && !error && (
+      {!loading && (
         <Card>
           <CardHeader>
             <CardTitle>Kayıt raporları</CardTitle>
@@ -123,94 +119,92 @@ export function ReportsPage() {
                 hint="Bir canlı yayın ekleyip analiz tamamlanınca burada özet görünür."
               />
             ) : (
-              <Table>
-                <THead>
-                  <TR>
-                    <TH>Özet</TH>
-                    <TH>Tarih</TH>
-                    <TH>Süre</TH>
-                    <TH>Satış</TH>
-                    <TH>Toplam</TH>
-                    <TH>Güven</TH>
-                    <TH>Durum</TH>
-                    <TH></TH>
-                  </TR>
-                </THead>
-                <TBody>
-                  {reports.map((r) => {
-                    const progress = analysisProgressInfo(reportAsRow(r));
-                    return (
-                      <TR key={r.recordingId}>
-                        <TD>
-                          <Link
-                            to={`/reports/${r.recordingId}`}
-                            className="group block max-w-[28rem]"
-                          >
+              <ul className="space-y-3">
+                {reports.map((r) => {
+                  const progress = analysisProgressInfo(reportAsRow(r));
+                  const kpis = extractReportKpis(reportAsRow(r));
+                  const chips = reportKpiChips(kpis);
+                  return (
+                    <li key={r.recordingId}>
+                      <Link
+                        to={`/reports/${r.recordingId}`}
+                        className="group block rounded-2xl border border-line bg-ink/25 px-4 py-4 transition-colors hover:border-mint/40 hover:bg-ink/40"
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
                             <div className="font-semibold text-paper group-hover:text-mint">
                               {r.headline || `@${r.sellerUsername}`}
                             </div>
-                            <div className="mt-0.5 truncate text-xs text-fog">
-                              {r.displayName ? `${r.displayName} · ` : ""}
-                              {r.originalFilename}
+                            <div className="mt-0.5 text-xs text-fog">
+                              {formatDateTr(r.recordedAt ?? r.uploadedAt)}
+                              {" · "}
+                              {formatDuration(r.durationSeconds)}
+                              {r.displayName ? ` · ${r.displayName}` : ""}
                             </div>
-                          </Link>
-                        </TD>
-                        <TD className="whitespace-nowrap text-fog">
-                          {formatDateTr(r.recordedAt ?? r.uploadedAt)}
-                        </TD>
-                        <TD className="whitespace-nowrap">
-                          {formatDuration(r.durationSeconds)}
-                        </TD>
-                        <TD>
-                          <span className="font-semibold">{r.saleCount}</span>
-                          {r.needsReviewCount > 0 ? (
-                            <span className="ml-1 text-xs text-amber">
-                              ({r.needsReviewCount} inceleme)
-                            </span>
-                          ) : null}
-                        </TD>
-                        <TD className="whitespace-nowrap">
-                          {formatTry(r.sumAmountTry)}
-                        </TD>
-                        <TD>{confidenceLabel(r.avgEventConfidence)}</TD>
-                        <TD>
-                          <div className="flex flex-col gap-1">
+                          </div>
+                          <div className="flex items-center gap-2">
                             <Badge
                               variant={
-                                progress
-                                  ? "warn"
-                                  : statusVariant(r.status)
+                                progress ? "warn" : statusVariant(r.status)
                               }
                             >
                               {statusTr(r.status)}
                             </Badge>
-                            {progress ? (
-                              <span
-                                className="text-xs font-medium text-amber"
-                                title={progress.label}
-                                data-analysis-progress={
-                                  progress.percent ?? undefined
-                                }
-                              >
-                                {progress.label}
-                              </span>
-                            ) : null}
+                            <span className="inline-flex items-center gap-1 text-sm font-semibold text-mint">
+                              Aç
+                              <ChevronRight className="h-4 w-4" />
+                            </span>
                           </div>
-                        </TD>
-                        <TD>
-                          <Link
-                            to={`/reports/${r.recordingId}`}
-                            className="inline-flex items-center gap-1 text-sm font-semibold text-mint hover:text-mint-bright"
+                        </div>
+
+                        {progress ? (
+                          <p className="mt-2 text-xs font-medium text-amber">
+                            {progress.label}
+                          </p>
+                        ) : null}
+
+                        {chips.length ? (
+                          <div
+                            className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4"
+                            data-report-kpis={
+                              hasAnyKpi(kpis) ? "1" : undefined
+                            }
                           >
-                            Aç
-                            <ChevronRight className="h-4 w-4" />
-                          </Link>
-                        </TD>
-                      </TR>
-                    );
-                  })}
-                </TBody>
-              </Table>
+                            {chips.map((c) => (
+                              <div
+                                key={c.key}
+                                className="rounded-xl border border-line/80 bg-panel/60 px-3 py-2"
+                              >
+                                <div className="text-[0.65rem] font-semibold uppercase tracking-wide text-fog">
+                                  {c.label}
+                                </div>
+                                <div className="mt-0.5 font-display text-base font-semibold tracking-tight text-paper">
+                                  {c.value}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="mt-3 flex flex-wrap gap-3 text-sm text-fog">
+                            <span>
+                              Satılan:{" "}
+                              <strong className="text-paper">
+                                {r.saleCount}
+                              </strong>
+                            </span>
+                            <span>
+                              Toplam satış:{" "}
+                              <strong className="text-paper">
+                                {formatTry(r.sumAmountTry)}
+                              </strong>
+                            </span>
+                          </div>
+                        )}
+                      </Link>
+                    </li>
+                  );
+                })}
+              </ul>
             )}
           </CardContent>
         </Card>
