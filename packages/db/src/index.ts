@@ -6,5 +6,6 @@ export {
   completeJob,
   failJob,
   enqueueJob,
+  reclaimStaleRunningJobs,
   type ClaimedJob,
 } from "./queue.ts";

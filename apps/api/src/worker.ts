@@ -4,6 +4,7 @@ import {
   updateJobProgress,
   completeJob,
   failJob,
+  reclaimStaleRunningJobs,
 } from "@mezatizle/db";
 import { loadEnv } from "./lib/env.ts";
 import { runProbeJob, runExtractJob } from "./modules/ingestion.ts";
@@ -22,6 +23,7 @@ const env = loadEnv();
 const sql = createSql(env.databaseUrl);
 const workerId = process.env.WORKER_ID ?? `ts-worker-${process.pid}`;
 const pollMs = Number(process.env.WORKER_POLL_INTERVAL_MS ?? "1500");
+let lastStaleReclaimAt = 0;
 
 async function processJob() {
   await assertUnderSpendLimit(sql, env.hardSpendLimitUsd);
@@ -161,9 +163,26 @@ async function processJob() {
   return true;
 }
 
+async function maybeReclaimStale() {
+  const now = Date.now();
+  // On boot and every ~2 minutes
+  if (lastStaleReclaimAt && now - lastStaleReclaimAt < 120_000) return;
+  lastStaleReclaimAt = now;
+  try {
+    const n = await reclaimStaleRunningJobs(sql);
+    if (n > 0) {
+      console.warn(`[worker] reclaimed ${n} stale running job(s)`);
+    }
+  } catch (err) {
+    console.error("[worker] stale reclaim failed", err);
+  }
+}
+
 export async function workerLoop(maxIdleRounds = Infinity) {
   let idle = 0;
+  await maybeReclaimStale();
   while (idle < maxIdleRounds) {
+    await maybeReclaimStale();
     const did = await processJob();
     if (!did) {
       idle++;

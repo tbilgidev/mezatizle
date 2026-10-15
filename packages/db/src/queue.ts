@@ -130,3 +130,28 @@ export async function enqueueJob(
   `;
   return rows[0]!.id;
 }
+
+/**
+ * Requeue jobs left "running" after worker/API crash (no heartbeats).
+ * Default stale threshold: 30 minutes since locked_at/updated_at.
+ */
+export async function reclaimStaleRunningJobs(
+  sql: Sql,
+  staleMinutes = Number(process.env.JOB_STALE_MINUTES ?? "30"),
+): Promise<number> {
+  const mins = Math.max(5, Math.min(24 * 60, Math.floor(staleMinutes)));
+  const rows = await sql<{ id: string }[]>`
+    UPDATE processing_jobs
+    SET status = 'queued',
+        locked_by = NULL,
+        locked_at = NULL,
+        stage = 'reclaimed_stale',
+        error_message = COALESCE(error_message, ${"reclaimed: stale running lock"}),
+        available_at = now(),
+        updated_at = now()
+    WHERE status = 'running'
+      AND COALESCE(locked_at, updated_at, started_at) < now() - make_interval(mins => ${mins})
+    RETURNING id
+  `;
+  return rows.length;
+}

@@ -1,5 +1,5 @@
 /**
- * Enrich recording rows for API/UI: real on-disk size + analysisState.
+ * Enrich recording rows for API/UI: real on-disk size + analysis progress.
  */
 import { stat } from "node:fs/promises";
 import type { Sql } from "@mezatizle/db";
@@ -7,6 +7,23 @@ import type { AppEnv } from "./env.ts";
 import { safeJoinStorage } from "./storage.ts";
 
 export type AnalysisState = "none" | "running" | "done" | "failed";
+
+/** Pipeline stage order + weights (sum = 100). Documented for UI. */
+export const ANALYSIS_STAGE_WEIGHTS = [
+  { jobType: "probe_media", weight: 5, labelTr: "Medya kontrolü" },
+  { jobType: "extract_audio_frames", weight: 15, labelTr: "Ses/kare çıkarımı" },
+  { jobType: "transcribe", weight: 40, labelTr: "Ses çözülüyor (ASR)" },
+  { jobType: "ocr_frames", weight: 20, labelTr: "OCR (yorum kareleri)" },
+  { jobType: "segment_auction", weight: 10, labelTr: "Mezat olayları" },
+  { jobType: "reconcile_sales", weight: 10, labelTr: "Satış birleştirme" },
+] as const;
+
+export type JobRow = {
+  job_type: string;
+  status: string;
+  progress_percent?: number | null;
+  stage?: string | null;
+};
 
 export function deriveAnalysisState(
   recordingStatus: string | null | undefined,
@@ -33,6 +50,62 @@ export function deriveAnalysisState(
     return "running";
   }
   return "none";
+}
+
+/**
+ * Weighted 0–100 pipeline progress from job rows.
+ * succeeded → full weight; running → weight * job.progress/100; queued/failed → 0 contribution for that stage.
+ */
+export function deriveAnalysisProgress(jobs: JobRow[]): {
+  analysisProgress: number;
+  analysisStage: string | null;
+} {
+  if (!jobs.length) {
+    return { analysisProgress: 0, analysisStage: null };
+  }
+  const byType = new Map(jobs.map((j) => [j.job_type, j]));
+  let score = 0;
+  let activeLabel: string | null = null;
+
+  for (const stage of ANALYSIS_STAGE_WEIGHTS) {
+    const j = byType.get(stage.jobType);
+    if (!j) continue;
+    if (j.status === "succeeded" || j.status === "cancelled") {
+      score += stage.weight;
+      continue;
+    }
+    if (j.status === "running") {
+      const p = Math.max(0, Math.min(100, Number(j.progress_percent ?? 0))) / 100;
+      score += stage.weight * p;
+      if (!activeLabel) activeLabel = stage.labelTr;
+      continue;
+    }
+    if (j.status === "queued" || j.status === "failed") {
+      if (!activeLabel) activeLabel = stage.labelTr;
+      // no score yet
+    }
+  }
+
+  const allDone = ANALYSIS_STAGE_WEIGHTS.every((s) => {
+    const j = byType.get(s.jobType);
+    return j && (j.status === "succeeded" || j.status === "cancelled");
+  });
+  if (allDone) {
+    return { analysisProgress: 100, analysisStage: "Tamamlandı" };
+  }
+
+  const anyFailed = jobs.some((j) => j.status === "failed");
+  if (anyFailed && !jobs.some((j) => j.status === "running" || j.status === "queued")) {
+    return {
+      analysisProgress: Math.round(Math.min(99, Math.max(0, score))),
+      analysisStage: "Analiz başarısız",
+    };
+  }
+
+  return {
+    analysisProgress: Math.round(Math.min(99, Math.max(0, score))),
+    analysisStage: activeLabel ?? "Analiz bekleniyor",
+  };
 }
 
 async function statSize(abs: string): Promise<number> {
@@ -75,7 +148,6 @@ export async function resolveRecordingFileSize(
     best > 0 &&
     (!Number.isFinite(dbSize) || dbSize <= 0 || dbSize !== disk)
   ) {
-    // Only heal upward / from zero — don't shrink a larger DB value unless disk is authoritative final
     if (disk > 0 && (dbSize <= 0 || Math.abs(dbSize - disk) > 0)) {
       await sql`
         UPDATE recordings
@@ -110,13 +182,15 @@ export async function enrichRecordingRow(
     { persist: true },
   );
 
-  const jobs = await sql<{ status: string }[]>`
-    SELECT status FROM processing_jobs WHERE recording_id = ${id}
+  const jobs = await sql<JobRow[]>`
+    SELECT job_type, status, progress_percent, stage
+    FROM processing_jobs WHERE recording_id = ${id}
   `;
   const analysisState = deriveAnalysisState(
     row.status as string | null,
     jobs,
   );
+  const { analysisProgress, analysisStage } = deriveAnalysisProgress(jobs);
 
   return {
     ...row,
@@ -126,5 +200,7 @@ export async function enrichRecordingRow(
         ? Math.max(Number(row.capture_bytes ?? 0), fileSizeBytes)
         : row.capture_bytes,
     analysisState,
+    analysisProgress,
+    analysisStage,
   };
 }
