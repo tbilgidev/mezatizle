@@ -42,15 +42,56 @@ function captureLastError(r: Record<string, unknown>): string | null {
 type ReportLinkTone = "green" | "yellow" | "red";
 
 /**
- * Color Rapor by analysis phase (recording.status from API).
- * Yeşil = bitti · Sarı = sürüyor · Kırmızı = henüz yok / başarısız.
+ * Color Rapor by analysis phase.
+ * Prefer API `analysisState` (done|running|none|failed) — `status=complete`
+ * can still be running. Fall back to status only if analysisState missing.
  */
 function reportLinkTone(r: Record<string, unknown>): {
   tone: ReportLinkTone;
   title: string;
   className: string;
 } {
+  const analysisState = String(
+    r.analysisState ?? r.analysis_state ?? "",
+  ).toLowerCase();
   const status = String(r.status ?? "");
+
+  if (analysisState === "done") {
+    return {
+      tone: "green",
+      title: "Analiz tamam — rapor hazır",
+      className: "text-emerald hover:text-emerald/80",
+    };
+  }
+  if (analysisState === "running") {
+    return {
+      tone: "yellow",
+      title: `Analiz sürüyor${status ? ` (${statusTr(status)})` : ""}`,
+      className: "text-amber hover:text-amber/80",
+    };
+  }
+  if (analysisState === "failed") {
+    return {
+      tone: "red",
+      title: "Analiz başarısız — rapor sınırlı olabilir",
+      className: "text-rose hover:text-rose/80",
+    };
+  }
+  if (analysisState === "none") {
+    const title =
+      status === "awaiting_live" || status === "recording"
+        ? "Kayıt henüz bitmedi — analiz yok"
+        : status === "cancelled"
+          ? "İptal — analiz yok"
+          : "Henüz analiz edilmedi";
+    return {
+      tone: "red",
+      title,
+      className: "text-rose hover:text-rose/80",
+    };
+  }
+
+  // Fallback when analysisState absent (older API)
   if (status === "complete") {
     return {
       tone: "green",
@@ -73,7 +114,6 @@ function reportLinkTone(r: Record<string, unknown>): {
       className: "text-amber hover:text-amber/80",
     };
   }
-  // uploaded / awaiting_live / recording / failed / cancelled / unknown
   const title =
     status === "failed"
       ? "Analiz başarısız — rapor sınırlı olabilir"
