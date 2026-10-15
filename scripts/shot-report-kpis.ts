@@ -119,7 +119,8 @@ await page.screenshot({ path: out, fullPage: true });
 console.log("wrote", out);
 await browser.close();
 
-if (!/Sunulan ürün/i.test(headerText) || !/Toplam satış/i.test(headerText)) {
-  console.error("KPI labels missing in header");
+const norm = headerText.toLocaleLowerCase("tr-TR");
+if (!norm.includes("sunulan ürün") || !norm.includes("toplam satış")) {
+  console.error("KPI labels missing in header", headerText);
   process.exit(1);
 }
