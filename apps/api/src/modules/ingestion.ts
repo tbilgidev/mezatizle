@@ -4,7 +4,11 @@ import type { Sql } from "@mezatizle/db";
 import { enqueueJob } from "@mezatizle/db";
 import { normalizeInstagramUsername } from "@mezatizle/shared";
 import type { AppEnv } from "../lib/env.ts";
-import { probeMedia, extractAudioAndFrames } from "../lib/ffmpeg.ts";
+import {
+  probeMedia,
+  probeAvSync,
+  extractAudioAndFrames,
+} from "../lib/ffmpeg.ts";
 import { safeJoinStorage, toStorageKey } from "../lib/storage.ts";
 import { recordMetric } from "../lib/cost.ts";
 
@@ -98,6 +102,7 @@ export async function runProbeJob(
   const abs = safeJoinStorage(env.storageRoot, rec[0].storage_path);
   const started = performance.now();
   const probe = await probeMedia(env.ffprobePath, abs);
+  const sync = await probeAvSync(env.ffprobePath, abs);
   await sql`
     UPDATE recordings SET
       duration_seconds = ${probe.durationSeconds},
@@ -110,6 +115,9 @@ export async function runProbeJob(
       updated_at = now()
     WHERE id = ${recordingId}
   `;
+  if (!sync.ok) {
+    console.warn(`[probe] ${recordingId} ${sync.detailTr}`);
+  }
   await recordMetric(sql, {
     name: "probe_duration_ms",
     value: performance.now() - started,
@@ -117,7 +125,15 @@ export async function runProbeJob(
     recordingId,
     jobId,
   });
-  return probe;
+  await recordMetric(sql, {
+    name: "av_duration_skew_sec",
+    value: sync.durationSkewSec ?? -1,
+    unit: "s",
+    recordingId,
+    jobId,
+    labels: { ok: String(sync.ok), hasAudio: String(sync.hasAudio) },
+  });
+  return { ...probe, avSync: sync };
 }
 
 export async function runExtractJob(

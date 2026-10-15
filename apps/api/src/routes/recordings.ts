@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { access, constants } from "node:fs/promises";
 import type { Sql } from "@mezatizle/db";
 import type { AppEnv } from "../lib/env.ts";
 import { createRecordingFromUpload } from "../modules/ingestion.ts";
@@ -7,6 +8,76 @@ import {
   createLiveCapture,
   LIVE_CAPTURE_POLICY,
 } from "../modules/live_capture.ts";
+import { safeJoinStorage } from "../lib/storage.ts";
+
+/** Serve muxed recording MP4 with Accept-Ranges (for evidence seek + audio). */
+async function serveRecordingMedia(
+  c: { req: { header: (n: string) => string | undefined; method: string } },
+  absPath: string,
+): Promise<Response> {
+  try {
+    await access(absPath, constants.R_OK);
+  } catch {
+    return new Response(JSON.stringify({ error: "Medya dosyası yok" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+  const file = Bun.file(absPath);
+  const size = file.size;
+  const range = c.req.header("range") ?? c.req.header("Range");
+  const baseHeaders: Record<string, string> = {
+    "Content-Type": "video/mp4",
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "private, max-age=120",
+  };
+
+  if (c.req.method === "HEAD") {
+    return new Response(null, {
+      status: 200,
+      headers: { ...baseHeaders, "Content-Length": String(size) },
+    });
+  }
+
+  if (range) {
+    const m = /^bytes=(\d*)-(\d*)$/i.exec(range.trim());
+    if (!m) {
+      return new Response("Invalid Range", {
+        status: 416,
+        headers: { ...baseHeaders, "Content-Range": `bytes */${size}` },
+      });
+    }
+    let start = m[1] ? Number(m[1]) : 0;
+    let end = m[2] ? Number(m[2]) : size - 1;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0) {
+      return new Response("Invalid Range", {
+        status: 416,
+        headers: { ...baseHeaders, "Content-Range": `bytes */${size}` },
+      });
+    }
+    if (end >= size) end = size - 1;
+    if (start > end) {
+      return new Response("Invalid Range", {
+        status: 416,
+        headers: { ...baseHeaders, "Content-Range": `bytes */${size}` },
+      });
+    }
+    const chunk = file.slice(start, end + 1);
+    return new Response(chunk, {
+      status: 206,
+      headers: {
+        ...baseHeaders,
+        "Content-Length": String(end - start + 1),
+        "Content-Range": `bytes ${start}-${end}/${size}`,
+      },
+    });
+  }
+
+  return new Response(file, {
+    status: 200,
+    headers: { ...baseHeaders, "Content-Length": String(size) },
+  });
+}
 
 export function recordingsRoutes(sql: Sql, env: AppEnv) {
   const app = new Hono();
@@ -84,6 +155,24 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
       ORDER BY priority ASC, created_at ASC
     `;
     return c.json({ recording: rows[0], jobs });
+  });
+
+  /** Muxed MP4 stream (video+audio) for evidence review — not OCR frame dumps. */
+  app.on(["GET", "HEAD"], "/:id/media", async (c) => {
+    const id = c.req.param("id");
+    const rows = await sql<{ storage_path: string }[]>`
+      SELECT storage_path FROM recordings WHERE id = ${id}
+    `;
+    if (!rows[0]?.storage_path) {
+      return c.json({ error: "Kayıt bulunamadı" }, 404);
+    }
+    let abs: string;
+    try {
+      abs = safeJoinStorage(env.storageRoot, String(rows[0].storage_path));
+    } catch {
+      return c.json({ error: "Güvensiz medya yolu" }, 400);
+    }
+    return serveRecordingMedia(c, abs);
   });
 
   app.post("/upload", async (c) => {

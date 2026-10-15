@@ -20,7 +20,9 @@ import {
 import {
   CAPTURE_QUALITY,
   ffmpegCaptureArgs,
+  type CaptureInput,
 } from "./capture_quality.ts";
+import { probeAvSync } from "../lib/ffmpeg.ts";
 
 export const LIVE_CAPTURE_POLICY = {
   status: "operator_session_optional" as const,
@@ -280,10 +282,18 @@ async function fileSize(path: string): Promise<number> {
   }
 }
 
-async function resolveStreamUrl(
+/**
+ * Resolve live media URL(s). Prefer one progressive muxed URL.
+ * If yt-dlp returns video+audio separately, keep both for one ffmpeg mux
+ * (shared encode clock — never record A and V on different processes).
+ */
+async function resolveStreamInput(
   env: AppEnv,
   watchUrl: string,
-): Promise<{ url: string } | { error: string; kind: "blocked" | "not_found" }> {
+): Promise<
+  | { input: CaptureInput }
+  | { error: string; kind: "blocked" | "not_found" }
+> {
   const bin = ytDlpBin();
   const auth = await ytDlpAuthArgs(env);
   const r = await runCapture(
@@ -304,7 +314,14 @@ async function resolveStreamUrl(
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter((l) => /^https?:\/\//i.test(l));
-  if (lines[0]) return { url: lines[0]! };
+  if (lines.length >= 2) {
+    return {
+      input: { kind: "separate", videoUrl: lines[0]!, audioUrl: lines[1]! },
+    };
+  }
+  if (lines[0]) {
+    return { input: { kind: "muxed", url: lines[0]! } };
+  }
   const low = `${r.stdout}\n${r.stderr}`.toLowerCase();
   if (
     low.includes("login required") ||
@@ -340,7 +357,7 @@ async function startRecordingProcess(
     /* ok */
   }
 
-  const resolved = await resolveStreamUrl(env, watchUrl);
+  const resolved = await resolveStreamInput(env, watchUrl);
   if ("error" in resolved) {
     await sql`
       UPDATE live_captures
@@ -370,7 +387,7 @@ async function startRecordingProcess(
 
   const args = ffmpegCaptureArgs({
     ffmpegPath: env.ffmpegPath,
-    inputUrl: resolved.url,
+    input: resolved.input,
     outputPath: partAbs,
     maxDurationSeconds,
   });
@@ -527,8 +544,21 @@ async function finalizeRecording(
   }
 
   const finalBytes = await fileSize(destAbs);
+  let syncDetail = "A/V sync check skipped";
+  try {
+    const sync = await probeAvSync(env.ffprobePath, destAbs);
+    syncDetail = sync.detailTr;
+    if (!sync.ok) {
+      console.warn(`[live-capture] ${recordingId} ${sync.detailTr}`);
+    }
+  } catch (err) {
+    syncDetail = err instanceof Error ? err.message : String(err);
+  }
   await sql`
-    UPDATE live_captures SET status = 'completed', updated_at = now()
+    UPDATE live_captures
+    SET status = 'completed',
+        last_probe_detail = ${syncDetail},
+        updated_at = now()
     WHERE recording_id = ${recordingId}
   `;
   await sql`
