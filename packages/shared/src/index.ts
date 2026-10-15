@@ -96,6 +96,7 @@ export {
   isAuctionNoise,
   enrichSoldFromBids,
   reconcileMezatWindows,
+  summarizeOfferWindows,
   explainSaleTr,
   SALE_MIN_CONFIDENCE,
   SALE_BID_LOOKBACK_MS,

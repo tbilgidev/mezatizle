@@ -11,13 +11,13 @@ Code: `~/projects/mezatizle` · Branch: `cursor/analysis-pipeline-tighten-de0f`
 
 | Stage | Engine | Notes |
 |-------|--------|--------|
-| ASR | **faster-whisper** `small` (default after fixture eval), CPU **int8**, `language=tr`, VAD on, beam=1 | Override `WHISPER_MODEL=base` to save CPU |
-| OCR | **Tesseract** (`eng`, PSM 6), comment **crop** `OCR_CROP_FRAC` | Paddle path kept but ABI-broken on this host |
-| Frames | ffmpeg extract ~**1 fps**; OCR **change-aware** select ≤`OCR_MAX_FRAMES` (200–240) | Skip near-identical comment crops |
-| Rules | `packages/shared/src/auction.ts` Turkish heuristics | **No LLM**, no paid API |
-| Sales | `reconcileSales` → always `needs_review` | Gate: `SALE_MIN_CONFIDENCE` default **0.78** |
-| Evidence | `sale_evidence` + enriched GET `/api/sales/:id/evidence` | Timestamps, transcript/OCR window, `explanationTr` |
-| Reports | GET `/api/reports`, `/api/reports/:recordingId` | saleCount, sum TRY, needs_review, duration |
+| ASR | **faster-whisper** `small` (default), CPU **int8**, `language=tr`, VAD on, beam=1 | Quality over `base` for Turkish sale phrases |
+| **Live comments** | Playwright poll `get_comment` every 5s while recording | **Primary** `@username`+«aldım» — DASH has **no** comment UI |
+| OCR | **Tesseract** `tur+eng`, PSM 6, crop **bottom-left** `0.02,0.48,0.62,0.94` | Best-effort; ended DASH lives often OCR-blind |
+| Frames | ffmpeg ~**1 fps**; change-aware ≤`OCR_MAX_FRAMES` (320) | Product thumbs from frames |
+| Rules | `packages/shared` mezat windows | Seller ask ≠ sale; first follower aldım wins |
+| Sales | `reconcileSales` → `needs_review` | Buyer evidence required |
+| Reports KPIs | `productsOfferedCount/SumTry`, `productsSoldCount/SumTry`, `productsUnsoldCount`, `salesByMethod` | Headline: sunulan · satılan |
 
 **Paid paths:** OFF. `PROCESSING_PROFILE=LOCAL` → `allowPaidApis=false`, `hardSpendLimitUsd=0`.
 
@@ -68,14 +68,22 @@ Seller «aldım X lira» is an **opening / listing (ask) price**, **not** a comp
 
 ---
 
-## 3. OCR sampling / dedupe
+## 3. Comments + OCR (trust note — verified 2026-10-15)
 
-**File:** `workers/extractor/tools.py`
+**Critical:** Instagram Live **DASH** masters captured by ffmpeg are **camera video only**. The IG comment overlay is **not** burned into the stream. Spot-check of yesilkoy frames (bottom-left crop) showed **no readable comment text**; Tesseract returned glyph noise. Ended broadcast `get_comment` API returns `media has been deleted`.
 
-1. Scan frames with stride; build tiny grayscale **signature** of comment crop.
-2. OCR a frame when crop **changes** vs last kept (or fill to stride sample).
-3. Cap at `OCR_MAX_FRAMES` (sane for ~10–180 min @ 1 fps).
-4. **Fuzzy dedupe** (exact / containment / token Jaccard ≥0.85) — don’t invent lines; don’t spam duplicates.
+| Source | When | Buyer usernames? |
+|--------|------|------------------|
+| `live_api` (Playwright poll during record) | **While live** | Yes — authoritative |
+| OCR Tesseract on frames | After extract | Only if overlay somehow present (rare on DASH) |
+| Operator `POST /api/comments` | Manual export | Yes |
+
+**OCR when used** (`workers/extractor/tools.py`):
+
+1. Crop **bottom-left** portrait comment stack (`OCR_CROP_FRAC=0.02,0.48,0.62,0.94`).
+2. Upscale + autocontrast; `tur+eng` PSM 6 (eng PSM 11 fallback on timeout).
+3. Change-aware denser sampling; parse `@user` / `username aldım` into `author_username` — **never invent**.
+4. Fuzzy dedupe. Cap `OCR_MAX_FRAMES` (default 320).
 
 ---
 
@@ -113,7 +121,21 @@ GET /api/reports
 GET /api/reports/:recordingId
 ```
 
-Stable fields: `saleCount`, `needsReviewCount`, `sumAmountTry`, `durationSeconds`, plus detail sales/events/jobs. LOCAL only.
+KPI fields (always numeric, never null):
+
+| Field | Alias | Meaning |
+|-------|-------|---------|
+| `productsOfferedCount` | `productsOffered` | Sunulan ürün (ask windows) |
+| `productsOfferedSumTry` | `totalAskTry` | Satışa sunulan toplam tutar |
+| `productsSoldCount` | `productsSold` | Satılan ürün |
+| `productsSoldSumTry` | `totalSoldTry` | Toplam satış tutarı |
+| `productsUnsoldCount` | | offered − sold |
+| `salesByMethod` | | aldım / pey / counter split |
+| `headline` | | sunulan · satılan · TRY · süre |
+
+Also: `saleCount`, `needsReviewCount`, `sumAmountTry`, `durationSeconds`, detail sales/events/jobs. LOCAL only.
+
+Ask-sum excludes ASR garbage amounts &gt; `OFFER_AMOUNT_SANITY_MAX_TRY` (100_000).
 
 ---
 
@@ -167,3 +189,20 @@ Tests: `FORCE_MOCK_ASR=1 FORCE_MOCK_OCR=1 bun test`
 - OCR English lang pack: usernames/prices OK; Turkish diacritics in overlays may degrade — bids still often carry `@user` + digits.
 - Whisper `base` may drop a short “satıldı”; burned comment OCR + bid lookback recovers many cases without paying for APIs.
 - Human **Kanıt** review remains the source of truth (`needs_review` default).
+
+
+---
+
+## 11. Yesilkoy keeper reanalyze (verified 2026-10-15)
+
+**PYTHON_BIN hard fix:** absolute `/home/tolga/projects/mezatizle/.venv/bin/python3` in `.env` + `resolvePythonBin()` never returns `./.venv/...` (spawn cwd is `workers/extractor`).
+
+| Recording | ASR (Whisper small) | Comments | Events | Sales | KPIs |
+|-----------|---------------------|----------|--------|-------|------|
+| `6c7e9508…` 20dk | **536** segments | 0 (DASH blind) | 81 | **0** | 59 sunulan · ≈475 316 TRY ask |
+| `99b0f63c…` 15dk | **232** segments | 0 (DASH blind) | 69 | **0** | 38 sunulan · ≈100 415 TRY ask |
+| `8e357c0a…` glam 60dk | paused | — | — | — | requeue later |
+
+**Why 0 sales:** seller «aldım X» is ask (price_mention), not a sale. No `live_api` follower comments were stored during capture; OCR on DASH frames has no comment overlay. False `sold`/`counter_accept` ASR lines without buyer were correctly **not** materialized.
+
+**Funnel:** after fix, `analysisState=done` / 100% (no ENOENT). Progress prefers running over stale failed jobs.

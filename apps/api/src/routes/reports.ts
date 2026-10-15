@@ -8,6 +8,10 @@
  */
 import { Hono } from "hono";
 import type { Sql } from "@mezatizle/db";
+import {
+  summarizeOfferWindows,
+  type TimelineEvent,
+} from "@mezatizle/shared";
 
 export type ReportListItem = {
   recordingId: string;
@@ -27,6 +31,31 @@ export type ReportListItem = {
   sourceType: string | null;
   avgEventConfidence: number | null;
   headline: string;
+  /** Sunulan ürün sayısı (ask windows). */
+  productsOfferedCount: number;
+  /** Alias for UI workers. */
+  productsOffered: number;
+  /** Satışa sunulan toplam tutar (ask sum TRY). */
+  productsOfferedSumTry: number;
+  /** Alias for UI workers. */
+  totalAskTry: number;
+  /** Satılan ürün sayısı (= saleCount with amount; alias for UI). */
+  productsSoldCount: number;
+  /** Alias for UI workers. */
+  productsSold: number;
+  /** Toplam satış tutarı (= sumAmountTry). */
+  productsSoldSumTry: number;
+  /** Alias for UI workers. */
+  totalSoldTry: number;
+  /** Offered but not sold (offer windows − sold). */
+  productsUnsoldCount: number;
+  /** Sales by method when known. */
+  salesByMethod: {
+    aldimFirstComment: number;
+    bidWinConfirm: number;
+    counterAccept: number;
+    other: number;
+  };
 };
 
 export type ReportSaleRow = {
@@ -79,19 +108,93 @@ function formatDurationShort(seconds: number): string {
 
 function buildHeadline(r: ReportListItem): string {
   const seller = r.sellerUsername ? `@${r.sellerUsername}` : "Satıcı";
-  const sales =
-    r.saleCount === 0
-      ? "satış tespit edilmedi"
-      : `${r.saleCount} satış adayı`;
-  const total =
-    r.sumAmountTry != null && r.sumAmountTry > 0
-      ? ` · ≈${Math.round(r.sumAmountTry).toLocaleString("tr-TR")} TRY`
+  const offered = `${r.productsOfferedCount} sunulan`;
+  const sold =
+    r.productsSoldCount === 0
+      ? "0 satılan"
+      : `${r.productsSoldCount} satılan`;
+  const soldSum =
+    r.productsSoldSumTry != null && r.productsSoldSumTry > 0
+      ? ` · satış ≈${Math.round(r.productsSoldSumTry).toLocaleString("tr-TR")} TRY`
+      : "";
+  const offerSum =
+    r.productsOfferedSumTry != null && r.productsOfferedSumTry > 0
+      ? ` · sunulan ≈${Math.round(r.productsOfferedSumTry).toLocaleString("tr-TR")} TRY`
       : "";
   const dur =
     r.durationSeconds != null && r.durationSeconds > 0
       ? ` · ${formatDurationShort(r.durationSeconds)}`
       : "";
-  return `${seller} — ${sales}${total}${dur}`;
+  return `${seller} — ${offered} · ${sold}${soldSum}${offerSum}${dur}`;
+}
+
+async function loadOfferKpis(
+  sql: Sql,
+  recordingId: string,
+): Promise<{ productsOfferedCount: number; productsOfferedSumTry: number }> {
+  const rows = await sql<{
+    offset_ms: number | null;
+    event_type: string;
+    payload: Record<string, unknown>;
+    confidence: number | null;
+  }[]>`
+    SELECT offset_ms, event_type, payload, confidence
+    FROM auction_events
+    WHERE recording_id = ${recordingId}
+      AND event_type IN ('price_mention', 'item_intro')
+    ORDER BY COALESCE(offset_ms, 0) ASC
+  `;
+  const timeline: TimelineEvent[] = rows.map((r) => {
+    const p = r.payload ?? {};
+    return {
+      id: "kpi",
+      offsetMs: Number(r.offset_ms ?? 0),
+      eventType: r.event_type as TimelineEvent["eventType"],
+      source: p.source === "comment" ? "comment" : "transcript",
+      amountTry:
+        p.amountTry != null && Number.isFinite(Number(p.amountTry))
+          ? Number(p.amountTry)
+          : undefined,
+      reason: typeof p.reason === "string" ? p.reason : undefined,
+      matched: typeof p.matched === "string" ? p.matched : "",
+      confidence: Number(r.confidence ?? 0),
+      productHint:
+        typeof p.productHint === "string" ? p.productHint : undefined,
+    };
+  });
+  const s = summarizeOfferWindows(timeline);
+  return {
+    productsOfferedCount: s.productsOffered,
+    productsOfferedSumTry: s.offeredSumTry,
+  };
+}
+
+async function loadSalesByMethod(
+  sql: Sql,
+  recordingId: string,
+): Promise<ReportListItem["salesByMethod"]> {
+  const rows = await sql<{ method: string | null; n: string }[]>`
+    SELECT p.attributes->>'saleMethod' AS method, COUNT(*)::text AS n
+    FROM sales sa
+    LEFT JOIN products p ON p.id = sa.product_id
+    WHERE sa.recording_id = ${recordingId}
+    GROUP BY 1
+  `;
+  const out = {
+    aldimFirstComment: 0,
+    bidWinConfirm: 0,
+    counterAccept: 0,
+    other: 0,
+  };
+  for (const r of rows) {
+    const n = Number(r.n);
+    const m = r.method ?? "";
+    if (m === "aldim_first_comment") out.aldimFirstComment += n;
+    else if (m === "bid_win_confirm") out.bidWinConfirm += n;
+    else if (m === "counter_accept") out.counterAccept += n;
+    else out.other += n;
+  }
+  return out;
 }
 
 function toIso(v: unknown): string | null {
@@ -102,7 +205,14 @@ function toIso(v: unknown): string | null {
   return Number.isNaN(d.getTime()) ? s : d.toISOString();
 }
 
-function rowToListItem(r: Record<string, unknown>): ReportListItem {
+function rowToListItem(
+  r: Record<string, unknown>,
+  kpis?: {
+    productsOfferedCount: number;
+    productsOfferedSumTry: number;
+    salesByMethod: ReportListItem["salesByMethod"];
+  },
+): ReportListItem {
   const saleCount = Number(r.sale_count ?? 0);
   const sumCents = r.sum_amount_cents != null ? Number(r.sum_amount_cents) : null;
   const avgConf =
@@ -110,6 +220,10 @@ function rowToListItem(r: Record<string, unknown>): ReportListItem {
     Number.isFinite(Number(r.avg_event_confidence))
       ? Number(r.avg_event_confidence)
       : null;
+  const offered = kpis?.productsOfferedCount ?? 0;
+  const offeredSum = Number(kpis?.productsOfferedSumTry ?? 0);
+  const soldSum =
+    sumCents != null && Number.isFinite(sumCents) ? sumCents / 100 : 0;
   const item: ReportListItem = {
     recordingId: String(r.recording_id),
     sellerUsername: String(r.instagram_username ?? ""),
@@ -129,12 +243,26 @@ function rowToListItem(r: Record<string, unknown>): ReportListItem {
     needsReviewCount: Number(r.needs_review_count ?? 0),
     confirmedCount: Number(r.confirmed_count ?? 0),
     rejectedCount: Number(r.rejected_count ?? 0),
-    sumAmountTry:
-      sumCents != null && Number.isFinite(sumCents) ? sumCents / 100 : null,
+    sumAmountTry: soldSum,
     currency: "TRY",
     sourceType: r.source_type != null ? String(r.source_type) : null,
     avgEventConfidence: avgConf,
     headline: "",
+    productsOfferedCount: offered,
+    productsOffered: offered,
+    productsOfferedSumTry: offeredSum,
+    totalAskTry: offeredSum,
+    productsSoldCount: saleCount,
+    productsSold: saleCount,
+    productsSoldSumTry: soldSum,
+    totalSoldTry: soldSum,
+    productsUnsoldCount: Math.max(0, offered - saleCount),
+    salesByMethod: kpis?.salesByMethod ?? {
+      aldimFirstComment: 0,
+      bidWinConfirm: 0,
+      counterAccept: 0,
+      other: 0,
+    },
   };
   item.headline = buildHeadline(item);
   return item;
@@ -201,7 +329,21 @@ export function reportsRoutes(sql: Sql) {
       ORDER BY r.recorded_at DESC NULLS LAST, r.created_at DESC
       LIMIT 500
     `;
-    const reports = rows.map(rowToListItem);
+    const reports: ReportListItem[] = [];
+    for (const row of rows) {
+      const id = String(row.recording_id);
+      const [offer, methods] = await Promise.all([
+        loadOfferKpis(sql, id),
+        loadSalesByMethod(sql, id),
+      ]);
+      reports.push(
+        rowToListItem(row, {
+          productsOfferedCount: offer.productsOfferedCount,
+          productsOfferedSumTry: offer.productsOfferedSumTry,
+          salesByMethod: methods,
+        }),
+      );
+    }
     return c.json({
       reports,
       totals: {
@@ -209,6 +351,19 @@ export function reportsRoutes(sql: Sql) {
         sales: reports.reduce((a, x) => a + x.saleCount, 0),
         needsReview: reports.reduce((a, x) => a + x.needsReviewCount, 0),
         sumAmountTry: reports.reduce((a, x) => a + (x.sumAmountTry ?? 0), 0),
+        productsOfferedCount: reports.reduce(
+          (a, x) => a + x.productsOfferedCount,
+          0,
+        ),
+        productsOfferedSumTry: reports.reduce(
+          (a, x) => a + (x.productsOfferedSumTry ?? 0),
+          0,
+        ),
+        productsSoldCount: reports.reduce((a, x) => a + x.productsSoldCount, 0),
+        productsSoldSumTry: reports.reduce(
+          (a, x) => a + (x.productsSoldSumTry ?? 0),
+          0,
+        ),
         currency: "TRY",
       },
     });
@@ -281,7 +436,15 @@ export function reportsRoutes(sql: Sql) {
     `;
     if (!rows[0]) return c.json({ error: "Kayıt bulunamadı" }, 404);
 
-    const base = rowToListItem(rows[0]);
+    const [offer, methods] = await Promise.all([
+      loadOfferKpis(sql, recordingId),
+      loadSalesByMethod(sql, recordingId),
+    ]);
+    const base = rowToListItem(rows[0], {
+      productsOfferedCount: offer.productsOfferedCount,
+      productsOfferedSumTry: offer.productsOfferedSumTry,
+      salesByMethod: methods,
+    });
 
     const sales = await sql<Record<string, unknown>[]>`
       SELECT

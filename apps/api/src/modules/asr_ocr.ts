@@ -5,13 +5,38 @@ import type { AppEnv } from "../lib/env.ts";
 import { safeJoinStorage } from "../lib/storage.ts";
 import { recordApiUsage } from "../lib/cost.ts";
 
-/** Resolve Python interpreter: repo `.venv` first, then PYTHON_BIN, then python3. */
+/** Repo root (…/mezatizle) — asr_ocr lives at apps/api/src/modules/. */
+const REPO_ROOT = join(import.meta.dir, "../../../..");
+
+/**
+ * Resolve Python interpreter to an **absolute** path.
+ * Spawn cwd is `workers/extractor` — never return `./.venv/...` (ENOENT).
+ */
 export function resolvePythonBin(): string {
+  const candidates: string[] = [];
   const fromEnv = process.env.PYTHON_BIN?.trim();
-  if (fromEnv) return fromEnv;
-  const venv = join(import.meta.dir, "../../../../.venv/bin/python3");
-  const check = Bun.spawnSync(["test", "-x", venv]);
-  if (check.exitCode === 0) return venv;
+  if (fromEnv) {
+    if (fromEnv.startsWith("/") || /^[A-Za-z]:[\\/]/.test(fromEnv)) {
+      candidates.push(fromEnv);
+    } else {
+      // "./.venv/bin/python3" → repo-root absolute
+      candidates.push(join(REPO_ROOT, fromEnv.replace(/^\.\//, "")));
+    }
+  }
+  candidates.push(join(REPO_ROOT, ".venv/bin/python3"));
+  candidates.push("/home/tolga/projects/mezatizle/.venv/bin/python3");
+  for (const cand of candidates) {
+    const check = Bun.spawnSync(["test", "-x", cand]);
+    if (check.exitCode === 0) return cand;
+  }
+  // Last resort: PATH python3 (still absolute via `command -v` when possible)
+  const which = Bun.spawnSync(["bash", "-lc", "command -v python3"], {
+    stdout: "pipe",
+  });
+  const resolved = new TextDecoder()
+    .decode(which.stdout)
+    .trim();
+  if (resolved.startsWith("/")) return resolved;
   return "python3";
 }
 
@@ -90,6 +115,12 @@ export async function tryPythonWorker(
 ): Promise<{ ok: boolean; backend?: string; detail?: string; [k: string]: unknown }> {
   const workerDir = join(import.meta.dir, "../../../../workers/extractor");
   const python = resolvePythonBin();
+  if (!python.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(python)) {
+    return {
+      ok: false,
+      detail: `PYTHON_BIN must be absolute (got ${JSON.stringify(python)}); set PYTHON_BIN=/home/tolga/projects/mezatizle/.venv/bin/python3`,
+    };
+  }
   const proc = Bun.spawn(
     [python, "tools.py", script, recordingId, env.storageRoot],
     {
@@ -98,19 +129,21 @@ export async function tryPythonWorker(
       stderr: "pipe",
       env: {
         ...process.env,
+        PYTHON_BIN: python,
         DATABASE_URL: env.databaseUrl,
-        WHISPER_MODEL: process.env.WHISPER_MODEL ?? "base",
+        WHISPER_MODEL: process.env.WHISPER_MODEL ?? "small",
         OCR_ENGINE: process.env.OCR_ENGINE ?? "tesseract",
         OCR_FPS:
           process.env.OCR_FPS ??
           String(1 / Math.max(0.1, env.frameIntervalSeconds)),
-        OCR_CROP_FRAC: process.env.OCR_CROP_FRAC ?? "0.55,0.40,0.98,0.90",
-        OCR_FRAME_STRIDE: process.env.OCR_FRAME_STRIDE ?? "3",
-        OCR_MAX_FRAMES: process.env.OCR_MAX_FRAMES ?? "200",
-        OCR_MAX_WIDTH: process.env.OCR_MAX_WIDTH ?? "360",
-        OCR_MAX_HEIGHT: process.env.OCR_MAX_HEIGHT ?? "480",
-        OCR_FRAME_TIMEOUT_S: process.env.OCR_FRAME_TIMEOUT_S ?? "8",
-        TESSERACT_LANG: process.env.TESSERACT_LANG ?? "eng",
+        // IG Live portrait: comment stack bottom-LEFT (not product pane on right)
+        OCR_CROP_FRAC: process.env.OCR_CROP_FRAC ?? "0.02,0.48,0.62,0.94",
+        OCR_FRAME_STRIDE: process.env.OCR_FRAME_STRIDE ?? "2",
+        OCR_MAX_FRAMES: process.env.OCR_MAX_FRAMES ?? "320",
+        OCR_MAX_WIDTH: process.env.OCR_MAX_WIDTH ?? "480",
+        OCR_MAX_HEIGHT: process.env.OCR_MAX_HEIGHT ?? "640",
+        OCR_FRAME_TIMEOUT_S: process.env.OCR_FRAME_TIMEOUT_S ?? "12",
+        TESSERACT_LANG: process.env.TESSERACT_LANG ?? "tur+eng",
         TESSERACT_CONFIG: process.env.TESSERACT_CONFIG ?? "--psm 6 --oem 1",
       },
     },

@@ -18,7 +18,13 @@ export YT_DLP_PATH="${YT_DLP_PATH:-$ROOT/.venv/bin/yt-dlp}"
 # small: better short TR sale phrases on fixture (~3× CPU vs base). Override with WHISPER_MODEL=base to save CPU.
 export WHISPER_MODEL="${WHISPER_MODEL:-small}"
 export OCR_ENGINE="${OCR_ENGINE:-tesseract}"
+export TESSERACT_LANG="${TESSERACT_LANG:-tur+eng}"
+export TESSERACT_CONFIG="${TESSERACT_CONFIG:---psm 6 --oem 1}"
+# IG Live portrait: comments bottom-left (DASH often has no UI overlay — live_api is primary)
+export OCR_CROP_FRAC="${OCR_CROP_FRAC:-0.02,0.48,0.62,0.94}"
 export OCR_FPS="${OCR_FPS:-1}"
+export OCR_FRAME_STRIDE="${OCR_FRAME_STRIDE:-2}"
+export OCR_MAX_FRAMES="${OCR_MAX_FRAMES:-320}"
 export FRAME_INTERVAL_SECONDS="${FRAME_INTERVAL_SECONDS:-1}"
 
 mkdir -p storage/recordings storage/audio storage/frames storage/products storage/secrets logs
@@ -58,10 +64,13 @@ nohup env -u FORCE_MOCK_ASR -u FORCE_MOCK_OCR \
   YT_DLP_PATH="${YT_DLP_PATH:-$ROOT/.venv/bin/yt-dlp}" \
   WHISPER_MODEL="$WHISPER_MODEL" \
   OCR_ENGINE="$OCR_ENGINE" \
+  TESSERACT_LANG="$TESSERACT_LANG" \
+  TESSERACT_CONFIG="$TESSERACT_CONFIG" \
+  OCR_CROP_FRAC="$OCR_CROP_FRAC" \
   OCR_FPS="$OCR_FPS" \
   FRAME_INTERVAL_SECONDS="$FRAME_INTERVAL_SECONDS" \
-  OCR_FRAME_STRIDE="${OCR_FRAME_STRIDE:-3}" \
-  OCR_MAX_FRAMES="${OCR_MAX_FRAMES:-200}" \
+  OCR_FRAME_STRIDE="${OCR_FRAME_STRIDE:-2}" \
+  OCR_MAX_FRAMES="${OCR_MAX_FRAMES:-320}" \
   STORAGE_ROOT="$ROOT/storage" \
   bun run apps/api/src/index.ts >> logs/api.log 2>&1 &
 echo $! > logs/api.pid

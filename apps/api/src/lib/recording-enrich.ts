@@ -29,10 +29,11 @@ export function deriveAnalysisState(
   recordingStatus: string | null | undefined,
   jobs: Array<{ status: string }>,
 ): AnalysisState {
-  if (jobs.some((j) => j.status === "failed")) return "failed";
+  // Prefer active work over stale failures (re-queue / ordered pipeline).
   if (jobs.some((j) => j.status === "running" || j.status === "queued")) {
     return "running";
   }
+  if (jobs.some((j) => j.status === "failed")) return "failed";
   if (
     jobs.length > 0 &&
     jobs.every((j) => j.status === "succeeded" || j.status === "cancelled")

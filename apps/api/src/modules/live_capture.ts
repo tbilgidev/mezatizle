@@ -31,9 +31,60 @@ import {
   startLiveViewerPresence,
   stopLiveViewerPresence,
   usernameFromWatchUrl,
+  type LiveCommentHit,
 } from "./ig_live_playwright.ts";
 import { access } from "node:fs/promises";
 import { resolve } from "node:path";
+
+/** Persist live API comments (DASH video has no comment overlay for OCR). */
+async function persistLiveComments(
+  sql: Sql,
+  recordingId: string,
+  hits: LiveCommentHit[],
+) {
+  const now = Date.now();
+  const [rec] = await sql<{ capture_started_at: Date | string | null }[]>`
+    SELECT capture_started_at FROM recordings WHERE id = ${recordingId}
+  `;
+  const startMs = rec?.capture_started_at
+    ? new Date(rec.capture_started_at).getTime()
+    : null;
+  for (const h of hits) {
+    const body = h.text.trim();
+    if (body.length < 1) continue;
+    const author =
+      h.username && /^[a-z0-9._]{1,30}$/i.test(h.username)
+        ? h.username.toLowerCase()
+        : null;
+    let offsetMs: number | null = null;
+    if (h.createdAtMs != null && startMs != null) {
+      offsetMs = Math.max(0, h.createdAtMs - startMs);
+    } else if (startMs != null) {
+      offsetMs = Math.max(0, now - startMs);
+    }
+    await sql`
+      INSERT INTO observed_comments
+        (recording_id, body, author_username, source, offset_ms, raw_json)
+      VALUES (
+        ${recordingId},
+        ${body},
+        ${author},
+        ${"live_api"},
+        ${offsetMs},
+        ${sql.json({
+          pk: h.pk,
+          createdAtMs: h.createdAtMs,
+          username: h.username,
+        })}
+      )
+    `;
+  }
+  if (hits.length) {
+    console.log(
+      `[live-comments] ${recordingId} +${hits.length} (authors=${hits.filter((x) => x.username).length})`,
+    );
+  }
+}
 
 export const LIVE_CAPTURE_POLICY = {
   status: "operator_session_optional" as const,
@@ -678,6 +729,7 @@ async function startRecordingProcess(
     watchUrl,
     username: usernameFromWatchUrl(watchUrl) ?? undefined,
     broadcastId: extractBroadcastIdFromUrl(watchUrl),
+    onComments: (hits) => persistLiveComments(sql, recordingId, hits),
   }).then((r) => {
     if (!r.ok) {
       console.warn(`[live-viewer] ${recordingId}: ${r.detail}`);
@@ -1195,6 +1247,7 @@ async function tickRecordingWatchdogs(sql: Sql, env: AppEnv) {
         watchUrl: row.watch_url,
         username: usernameFromWatchUrl(row.watch_url) ?? undefined,
         broadcastId: extractBroadcastIdFromUrl(row.watch_url),
+        onComments: (hits) => persistLiveComments(sql, row.recording_id, hits),
       }).then((r) => {
         if (!r.ok) {
           console.warn(`[live-viewer] resume ${row.recording_id}: ${r.detail}`);

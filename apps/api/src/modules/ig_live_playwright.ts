@@ -568,6 +568,13 @@ export function getLiveViewerPresenceHealth() {
  * /api/v1/live/{id}/heartbeat_and_get_viewer_count/ (works even when /live/ is 429).
  * No anti-bot kits.
  */
+export type LiveCommentHit = {
+  username: string | null;
+  text: string;
+  createdAtMs: number | null;
+  pk: string | null;
+};
+
 export async function startLiveViewerPresence(
   env: AppEnv,
   opts: {
@@ -575,6 +582,8 @@ export async function startLiveViewerPresence(
     watchUrl: string;
     username?: string;
     broadcastId?: string | null;
+    /** Persist follower comments while live (DASH video has no comment UI). */
+    onComments?: (hits: LiveCommentHit[]) => void | Promise<void>;
   },
 ): Promise<
   | { ok: true; presence: LiveViewerPresence }
@@ -642,8 +651,91 @@ export async function startLiveViewerPresence(
   let cookieUsername: string | null = null;
   let stopped = false;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let commentTimer: ReturnType<typeof setInterval> | null = null;
   let lastHeartbeatOk = false;
   let lastHeartbeatDetail = "starting";
+  let lastCommentTs = 0;
+  const seenCommentPks = new Set<string>();
+
+  const pollCommentsOnce = async () => {
+    if (stopped || !opts.onComments) return;
+    try {
+      const r = await page.evaluate(
+        async ({ broadcastId, lastCommentTs }) => {
+          const csrf =
+            document.cookie
+              .split(";")
+              .map((s) => s.trim())
+              .find((s) => s.startsWith("csrftoken="))
+              ?.split("=")[1] || "";
+          const url =
+            `https://www.instagram.com/api/v1/live/${broadcastId}/get_comment/` +
+            `?last_comment_ts=${lastCommentTs || 0}`;
+          const res = await fetch(url, {
+            credentials: "include",
+            headers: {
+              "X-IG-App-ID": "936619743392459",
+              "X-Requested-With": "XMLHttpRequest",
+              "X-CSRFToken": csrf,
+              Accept: "*/*",
+            },
+          });
+          const text = await res.text();
+          let comments: Array<{
+            pk?: string | number;
+            user?: { username?: string };
+            text?: string;
+            created_at?: number;
+            created_time?: number;
+          }> = [];
+          let nextTs = lastCommentTs;
+          try {
+            const j = JSON.parse(text) as {
+              comments?: typeof comments;
+              last_comment_ts?: number;
+            };
+            comments = Array.isArray(j.comments) ? j.comments : [];
+            if (typeof j.last_comment_ts === "number") nextTs = j.last_comment_ts;
+          } catch {
+            /* ignore */
+          }
+          return { status: res.status, comments, nextTs, raw: text.slice(0, 120) };
+        },
+        { broadcastId: broadcastId!, lastCommentTs },
+      );
+      if (r.status !== 200) return;
+      lastCommentTs = r.nextTs || lastCommentTs;
+      const hits: LiveCommentHit[] = [];
+      for (const c of r.comments) {
+        const pk = c.pk != null ? String(c.pk) : null;
+        if (pk && seenCommentPks.has(pk)) continue;
+        if (pk) seenCommentPks.add(pk);
+        const text = String(c.text ?? "").trim();
+        if (text.length < 1) continue;
+        const username =
+          typeof c.user?.username === "string"
+            ? c.user.username.toLowerCase()
+            : null;
+        hits.push({
+          username,
+          text,
+          createdAtMs:
+            typeof c.created_at === "number"
+              ? c.created_at * 1000
+              : typeof c.created_time === "number"
+                ? c.created_time * 1000
+                : null,
+          pk,
+        });
+      }
+      if (hits.length) await opts.onComments(hits);
+    } catch (err) {
+      console.warn(
+        `[live-comments] ${opts.recordingId}:`,
+        err instanceof Error ? err.message.slice(0, 120) : err,
+      );
+    }
+  };
 
   const heartbeatOnce = async () => {
     if (stopped) return;
@@ -765,6 +857,12 @@ export async function startLiveViewerPresence(
     heartbeatTimer = setInterval(() => {
       void heartbeatOnce();
     }, 12_000);
+    if (opts.onComments) {
+      await pollCommentsOnce();
+      commentTimer = setInterval(() => {
+        void pollCommentsOnce();
+      }, 5_000);
+    }
   } catch (err) {
     try {
       await browser.close();
@@ -790,6 +888,8 @@ export async function startLiveViewerPresence(
       stopped = true;
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       heartbeatTimer = null;
+      if (commentTimer) clearInterval(commentTimer);
+      commentTimer = null;
       viewerSessions.delete(opts.recordingId);
       try {
         await browser.close();

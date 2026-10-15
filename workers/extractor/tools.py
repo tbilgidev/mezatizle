@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Local ASR (faster-whisper) + OCR (PaddleOCR / Tesseract) helpers for mezatizle."""
+"""Local ASR (faster-whisper) + OCR (Tesseract / PaddleOCR) for mezatizle.
+
+IG Live DASH masters usually do NOT burn the comment UI into the video.
+OCR still targets the bottom-left comment stack (portrait) for any overlay
+that is present, and parses @username / aldım / bids when readable.
+Live follower comments should also be captured via the Playwright live API
+while the broadcast is active.
+"""
 from __future__ import annotations
 
 import json
@@ -8,15 +15,33 @@ import re
 import sys
 from pathlib import Path
 
-# Comment overlay region as fractions of frame (left, top, right, bottom).
-# Instagram live comments usually sit on the right/lower third.
-DEFAULT_CROP = os.environ.get("OCR_CROP_FRAC", "0.55,0.40,0.98,0.90")
+# Instagram Live (portrait): comments scroll bottom-LEFT over the video.
+# Right side is usually the product presentation — do NOT OCR there as comments.
+DEFAULT_CROP = os.environ.get("OCR_CROP_FRAC", "0.02,0.48,0.62,0.94")
+
+USER_RE = re.compile(r"@([A-Za-z0-9._]{2,30})")
+# username-like token without @ (IG overlay sometimes drops the @ glyph)
+BARE_USER_RE = re.compile(r"(?<![A-Za-z0-9._])([A-Za-z][A-Za-z0-9._]{2,29})(?![A-Za-z0-9._])")
+ALDIM_RE = re.compile(r"ald[ıiİI]m", re.I)
+STOP_USERS = {
+    "instagram",
+    "meta",
+    "live",
+    "reel",
+    "aldım",
+    "aldim",
+    "veririm",
+    "lira",
+    "bin",
+    "dostlar",
+    "tamam",
+}
 
 
 def _parse_crop(raw: str) -> tuple[float, float, float, float]:
     parts = [float(x.strip()) for x in raw.split(",")]
     if len(parts) != 4:
-        return (0.45, 0.35, 0.98, 0.95)
+        return (0.02, 0.48, 0.62, 0.94)
     return (parts[0], parts[1], parts[2], parts[3])
 
 
@@ -28,14 +53,12 @@ def _norm_text(s: str) -> str:
 
 
 def _near_dup(a: str, b: str) -> bool:
-    """Fuzzy dedupe: exact, containment, or high char-overlap (prefer miss over spam)."""
     if not a or not b:
         return False
     if a == b:
         return True
     if a in b or b in a:
         return abs(len(a) - len(b)) <= max(4, int(0.35 * max(len(a), len(b))))
-    # cheap token Jaccard
     ta, tb = set(a.split()), set(b.split())
     if not ta or not tb:
         return False
@@ -45,7 +68,6 @@ def _near_dup(a: str, b: str) -> bool:
 
 
 def _crop_signature(fp: Path, crop_frac: tuple[float, float, float, float]) -> bytes:
-    """Tiny grayscale thumbnail of comment crop — detect region change cheaply."""
     from PIL import Image
 
     img = Image.open(fp).convert("L")
@@ -54,7 +76,7 @@ def _crop_signature(fp: Path, crop_frac: tuple[float, float, float, float]) -> b
     return thumb.tobytes()
 
 
-def _sig_changed(a: bytes, b: bytes, threshold: float = 0.08) -> bool:
+def _sig_changed(a: bytes, b: bytes, threshold: float = 0.06) -> bool:
     if not a or not b or len(a) != len(b):
         return True
     diff = sum(1 for x, y in zip(a, b) if abs(x - y) > 18)
@@ -62,7 +84,6 @@ def _sig_changed(a: bytes, b: bytes, threshold: float = 0.08) -> bool:
 
 
 def _frame_offset_ms(name: str, fps: float) -> int:
-    """frame_00001.jpg → offset from 1-based index and OCR fps."""
     m = re.search(r"(\d+)", Path(name).stem)
     if not m:
         return 0
@@ -86,7 +107,7 @@ def try_faster_whisper(recording_id: str, storage_root: str) -> dict:
     if not audio.exists():
         return _fail(f"audio missing: {audio}")
 
-    model_size = os.environ.get("WHISPER_MODEL", "base")
+    model_size = os.environ.get("WHISPER_MODEL", "small")
     compute = os.environ.get("WHISPER_COMPUTE", "int8")
     model = WhisperModel(model_size, device="cpu", compute_type=compute)
     segments_iter, info = model.transcribe(
@@ -125,7 +146,6 @@ def try_faster_whisper(recording_id: str, storage_root: str) -> dict:
                     continue
                 conf = None
                 if hasattr(seg, "avg_logprob") and seg.avg_logprob is not None:
-                    # map logprob roughly into 0..1 for metrics
                     conf = max(0.0, min(1.0, 1.0 + float(seg.avg_logprob) / 5.0))
                 cur.execute(
                     """
@@ -165,24 +185,89 @@ def try_faster_whisper(recording_id: str, storage_root: str) -> dict:
 def _crop_image(img, crop_frac: tuple[float, float, float, float]):
     w, h = img.size
     l, t, r, b = crop_frac
-    box = (
-        int(w * l),
-        int(h * t),
-        int(w * r),
-        int(h * b),
-    )
+    box = (int(w * l), int(h * t), int(w * r), int(h * b))
     if box[2] <= box[0] or box[3] <= box[1]:
         return img
     return img.crop(box)
 
 
+def parse_comment_line(text: str) -> tuple[str | None, str]:
+    """Extract optional author username + cleaned body. Never invent usernames."""
+    raw = (text or "").strip()
+    if len(raw) < 2:
+        return None, raw
+
+    author: str | None = None
+    m = USER_RE.search(raw)
+    if m:
+        cand = m.group(1).lower()
+        if cand not in STOP_USERS and not ALDIM_RE.fullmatch(cand):
+            author = cand
+
+    body = USER_RE.sub(" ", raw)
+    body = re.sub(r"\s+", " ", body).strip()
+
+    # "username aldım" without @ — only if second token looks like a claim/bid
+    if author is None:
+        parts = body.split()
+        if len(parts) >= 2:
+            maybe = parts[0]
+            rest = " ".join(parts[1:])
+            if (
+                BARE_USER_RE.fullmatch(maybe)
+                and maybe.lower() not in STOP_USERS
+                and (
+                    ALDIM_RE.search(rest)
+                    or re.search(r"\d{2,7}|veririm|\+", rest, re.I)
+                )
+            ):
+                author = maybe.lower()
+                body = rest
+
+    # Drop obvious OCR garbage bodies
+    letters = len(re.findall(r"[A-Za-zÀ-ÿĞğÜüŞşİıÖöÇç]", body))
+    digits = len(re.findall(r"\d", body))
+    if author is None and letters + digits < 3:
+        return None, ""
+    if author is None and letters < 2 and not re.search(r"\d{2,}", body):
+        # keep short bid amounts like "500"
+        if not re.fullmatch(r"\+?\d{2,7}", body.replace(" ", "")):
+            return None, ""
+
+    return author, body or raw
+
+
+def _preprocess_comment_crop(cropped):
+    """Upscale + contrast for small white IG overlay text on dark video."""
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+    img = cropped.convert("L")
+    scale = float(os.environ.get("OCR_UPSCALE", "2.0"))
+    if scale > 1.01:
+        img = img.resize(
+            (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    max_w = int(os.environ.get("OCR_MAX_WIDTH", "480"))
+    max_h = int(os.environ.get("OCR_MAX_HEIGHT", "640"))
+    if img.width > max_w or img.height > max_h:
+        ratio = min(max_w / img.width, max_h / img.height)
+        img = img.resize(
+            (max(1, int(img.width * ratio)), max(1, int(img.height * ratio))),
+            Image.Resampling.LANCZOS,
+        )
+    img = ImageOps.autocontrast(img, cutoff=1)
+    img = ImageEnhance.Contrast(img).enhance(
+        float(os.environ.get("OCR_CONTRAST", "1.8"))
+    )
+    img = img.filter(ImageFilter.SHARPEN)
+    return img
+
+
 def _ocr_paddle(files: list[Path], crop_frac) -> list[tuple[str, str, float]]:
-    """Return list of (filename, text, conf)."""
     from paddleocr import PaddleOCR  # type: ignore
     from PIL import Image
 
-    # lang=en covers latin usernames + numbers; Turkish letters often still readable.
-    # Use chinese_cht / latin variants only if available — keep en for IG overlays.
     ocr = PaddleOCR(
         use_angle_cls=True,
         lang=os.environ.get("PADDLE_LANG", "en"),
@@ -192,9 +277,11 @@ def _ocr_paddle(files: list[Path], crop_frac) -> list[tuple[str, str, float]]:
     out: list[tuple[str, str, float]] = []
     for fp in files:
         img = Image.open(fp).convert("RGB")
-        cropped = _crop_image(img, crop_frac)
+        cropped = _preprocess_comment_crop(_crop_image(img, crop_frac)).convert(
+            "RGB"
+        )
         tmp = fp.parent / f".ocr_{fp.name}"
-        cropped.save(tmp, quality=90)
+        cropped.save(tmp, quality=92)
         try:
             result = ocr.ocr(str(tmp), cls=True)
         finally:
@@ -216,24 +303,17 @@ def _ocr_paddle(files: list[Path], crop_frac) -> list[tuple[str, str, float]]:
 def _ocr_tesseract(files: list[Path], crop_frac) -> list[tuple[str, str, float]]:
     import subprocess
     import tempfile
-    from PIL import Image, ImageOps
+    from PIL import Image
 
-    lang = os.environ.get("TESSERACT_LANG", "eng")  # eng faster; usernames/prices ASCII-heavy
+    # tur+eng when available — usernames ASCII + Turkish aldım/lira
+    lang = os.environ.get("TESSERACT_LANG", "tur+eng")
+    # PSM 6 = block; 11 = sparse text (IG overlays)
     config = os.environ.get("TESSERACT_CONFIG", "--psm 6 --oem 1")
-    timeout_s = float(os.environ.get("OCR_FRAME_TIMEOUT_S", "8"))
+    timeout_s = float(os.environ.get("OCR_FRAME_TIMEOUT_S", "12"))
     out: list[tuple[str, str, float]] = []
     for fp in files:
-        img = Image.open(fp).convert("L")
-        cropped = _crop_image(img, crop_frac)
-        max_w = int(os.environ.get("OCR_MAX_WIDTH", "360"))
-        max_h = int(os.environ.get("OCR_MAX_HEIGHT", "480"))
-        if cropped.width > max_w or cropped.height > max_h:
-            ratio = min(max_w / cropped.width, max_h / cropped.height)
-            cropped = cropped.resize(
-                (max(1, int(cropped.width * ratio)), max(1, int(cropped.height * ratio))),
-                Image.Resampling.BILINEAR,
-            )
-        cropped = ImageOps.autocontrast(cropped)
+        img = Image.open(fp)
+        cropped = _preprocess_comment_crop(_crop_image(img, crop_frac))
         with tempfile.TemporaryDirectory() as td:
             png = Path(td) / "f.png"
             base = Path(td) / "out"
@@ -254,7 +334,27 @@ def _ocr_tesseract(files: list[Path], crop_frac) -> list[tuple[str, str, float]]
                     stderr=subprocess.DEVNULL,
                 )
             except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-                continue
+                # Fallback eng-only sparse (faster) if tur+eng times out
+                try:
+                    subprocess.run(
+                        [
+                            "tesseract",
+                            str(png),
+                            str(base),
+                            "-l",
+                            "eng",
+                            "--psm",
+                            "11",
+                            "--oem",
+                            "1",
+                        ],
+                        check=True,
+                        timeout=timeout_s,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+                    continue
             txt_path = Path(str(base) + ".txt")
             if not txt_path.exists():
                 continue
@@ -262,26 +362,23 @@ def _ocr_tesseract(files: list[Path], crop_frac) -> list[tuple[str, str, float]]
         for line in (text or "").splitlines():
             line = line.strip()
             if len(line) >= 2:
-                out.append((fp.name, line, 0.6))
+                out.append((fp.name, line, 0.55))
     return out
 
 
 def _select_ocr_frames(
     all_files: list[Path], crop_frac: tuple[float, float, float, float]
 ) -> list[Path]:
-    """Keep frame budget; OCR denser only when comment-region crop changes.
-
-    Walk every Nth frame for signatures; when the crop changes vs last kept
-    frame, include it. Always keep first/last. Cap at OCR_MAX_FRAMES.
-    """
+    """Denser sampling when the comment-region crop changes."""
     if not all_files:
         return []
     stride = max(1, int(os.environ.get("OCR_FRAME_STRIDE", "2")))
-    max_frames = int(os.environ.get("OCR_MAX_FRAMES", "240"))
-    # Scan denser than OCR budget so we can pick change frames
-    scan = all_files[:: max(1, stride // 2 or 1)] if stride > 1 else all_files
-    if len(scan) > max_frames * 3:
-        step = max(1, len(scan) // (max_frames * 3))
+    max_frames = int(os.environ.get("OCR_MAX_FRAMES", "320"))
+    # Scan denser so we catch brief aldım flashes
+    scan_step = max(1, stride // 2)
+    scan = all_files[::scan_step]
+    if len(scan) > max_frames * 4:
+        step = max(1, len(scan) // (max_frames * 4))
         scan = scan[::step]
 
     selected: list[Path] = []
@@ -296,7 +393,6 @@ def _select_ocr_frames(
             last_sig = sig if sig else last_sig
         if len(selected) >= max_frames:
             break
-    # Ensure coverage: if change-detect under-selected, fill with stride sample
     if len(selected) < min(max_frames, max(8, len(all_files) // max(stride, 1))):
         for fp in all_files[::stride]:
             if fp not in selected:
@@ -316,7 +412,7 @@ def try_ocr(recording_id: str, storage_root: str) -> dict:
     crop_frac = _parse_crop(DEFAULT_CROP)
     files = _select_ocr_frames(all_files, crop_frac)
     fps = float(os.environ.get("OCR_FPS", "1"))
-    engine = (os.environ.get("OCR_ENGINE") or "auto").lower()
+    engine = (os.environ.get("OCR_ENGINE") or "tesseract").lower()
 
     hits: list[tuple[str, str, float]] = []
     backend = "none"
@@ -342,18 +438,23 @@ def try_ocr(recording_id: str, storage_root: str) -> dict:
     if not hits and errors:
         return _fail("; ".join(errors))
 
-    # Fuzzy dedupe near-identical lines (keep earliest offset)
-    unique: list[tuple[str, str, float, int]] = []
+    # Parse + fuzzy dedupe (keep earliest offset); prefer lines with author/aldım
+    unique: list[tuple[str, str, float, int, str | None]] = []
     for fname, text, conf in hits:
-        key = _norm_text(text)
+        author, body = parse_comment_line(text)
+        if not body:
+            continue
+        key = _norm_text(f"{author or ''}:{body}")
         if len(key) < 2:
             continue
-        if any(_near_dup(key, _norm_text(u[1])) for u in unique):
+        if any(_near_dup(key, _norm_text(f"{u[4] or ''}:{u[1]}")) for u in unique):
             continue
-        unique.append((fname, text, conf, _frame_offset_ms(fname, fps)))
+        unique.append((fname, body, conf, _frame_offset_ms(fname, fps), author))
 
     dsn = os.environ.get("DATABASE_URL")
     inserted = 0
+    with_author = 0
+    aldimish = 0
     if dsn:
         import psycopg
 
@@ -363,16 +464,21 @@ def try_ocr(recording_id: str, storage_root: str) -> dict:
                     "DELETE FROM observed_comments WHERE recording_id = %s AND source LIKE %s",
                     (recording_id, "ocr_%"),
                 )
-                for fname, text, conf, offset_ms in unique:
+                for fname, body, conf, offset_ms, author in unique:
+                    if author:
+                        with_author += 1
+                    if ALDIM_RE.search(body):
+                        aldimish += 1
                     cur.execute(
                         """
                         INSERT INTO observed_comments
-                          (recording_id, body, source, offset_ms, raw_json)
-                        VALUES (%s, %s, %s, %s, %s::jsonb)
+                          (recording_id, body, author_username, source, offset_ms, raw_json)
+                        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
                         """,
                         (
                             recording_id,
-                            text,
+                            body,
+                            author,
                             f"ocr_{backend}",
                             offset_ms,
                             json.dumps(
@@ -380,6 +486,7 @@ def try_ocr(recording_id: str, storage_root: str) -> dict:
                                     "frame": fname,
                                     "confidence": conf,
                                     "crop": DEFAULT_CROP,
+                                    "parsedAuthor": author,
                                 }
                             ),
                         ),
@@ -395,9 +502,15 @@ def try_ocr(recording_id: str, storage_root: str) -> dict:
         "rawHits": len(hits),
         "texts": inserted or len(unique),
         "deduped": len(unique),
+        "withAuthor": with_author,
+        "aldimish": aldimish,
         "crop": DEFAULT_CROP,
-        "selection": "change_aware",
+        "selection": "change_aware_left_comments",
         "errors": errors or None,
+        "note": (
+            "DASH masters often lack IG comment UI overlays; "
+            "prefer live API comment capture while broadcast is active."
+        ),
     }
 
 

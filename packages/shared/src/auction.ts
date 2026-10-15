@@ -864,6 +864,51 @@ export function reconcileMezatWindows(
   return sales;
 }
 
+/**
+ * ASR sometimes concatenates repeated «bin beş yüz» into absurd TRY amounts
+ * (e.g. 501_500, 1_002_000). Exclude those from ask-sum KPIs only.
+ */
+export const OFFER_AMOUNT_SANITY_MAX_TRY = 100_000;
+
+/** KPI: product windows opened (asks) — not sales. */
+export function summarizeOfferWindows(events: TimelineEvent[]): {
+  productsOffered: number;
+  offeredSumTry: number;
+} {
+  const sorted = [...events].sort((a, b) => a.offsetMs - b.offsetMs);
+  let productsOffered = 0;
+  let offeredSumTry = 0;
+  let open = false;
+  for (const ev of sorted) {
+    const reason = ev.reason ?? "";
+    const isAsk =
+      ev.eventType === "price_mention" ||
+      ev.eventType === "item_intro";
+    if (!isAsk) continue;
+    if (
+      reason === "seller_aldim_ask" ||
+      reason === "seller_price_line" ||
+      reason === "price_mention" ||
+      ev.eventType === "item_intro"
+    ) {
+      // New window
+      productsOffered += 1;
+      if (
+        ev.amountTry != null &&
+        Number.isFinite(ev.amountTry) &&
+        ev.amountTry > 0 &&
+        ev.amountTry <= OFFER_AMOUNT_SANITY_MAX_TRY
+      ) {
+        offeredSumTry += ev.amountTry;
+      }
+      open = true;
+    } else if (open && ev.amountTry != null) {
+      // price update inside window — do not double-count product
+    }
+  }
+  return { productsOffered, offeredSumTry };
+}
+
 export function explainSaleTr(opts: {
   confidence: number;
   reason?: string | null;
