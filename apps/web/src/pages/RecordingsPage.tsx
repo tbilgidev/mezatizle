@@ -148,8 +148,10 @@ export function RecordingsPage() {
 
   async function refresh() {
     const data = await api.recordings();
-    setRows(data.recordings);
-    return data.recordings;
+    const list = Array.isArray(data.recordings) ? data.recordings : [];
+    setRows(list);
+    setError(null);
+    return list;
   }
 
   useEffect(() => {
@@ -163,7 +165,8 @@ export function RecordingsPage() {
         const ms = list.some((r) => isAnalysisRunning(r)) ? 2500 : 8000;
         pollRef.current = setTimeout(() => void tick(), ms);
       } catch (e) {
-        if (first && e instanceof Error) setError(e.message);
+        // Keep last good rows on poll failure — don't flash empty.
+        if (e instanceof Error) setError(e.message);
         if (!cancelled) {
           pollRef.current = setTimeout(() => void tick(), 8000);
         }

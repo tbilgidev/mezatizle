@@ -57,14 +57,16 @@ export function ReportsPage() {
       try {
         const d = await api.reports();
         if (cancelled) return;
-        setReports(d.reports);
+        setReports(Array.isArray(d.reports) ? d.reports : []);
         setTotals(d.totals);
-        const running = d.reports.some((r) =>
+        setError(null);
+        const running = (d.reports ?? []).some((r) =>
           isAnalysisRunning(reportAsRow(r)),
         );
         pollRef.current = setTimeout(() => void tick(), running ? 2500 : 12000);
       } catch (e) {
-        if (first && e instanceof Error) setError(e.message);
+        // Keep last good list on transient API blips.
+        if (e instanceof Error) setError(e.message);
         if (!cancelled) {
           pollRef.current = setTimeout(() => void tick(), 12000);
         }

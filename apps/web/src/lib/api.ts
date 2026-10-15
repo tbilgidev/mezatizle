@@ -14,19 +14,70 @@ function url(path: string) {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url(path), init);
+  const ct = res.headers.get("content-type") || "";
   if (!res.ok) {
-    let msg = res.statusText;
+    let msg = res.statusText || `HTTP ${res.status}`;
     try {
-      const j = (await res.json()) as { error?: string };
-      if (j.error) msg = j.error;
+      if (ct.includes("application/json")) {
+        const j = (await res.json()) as { error?: string };
+        if (j.error) msg = j.error;
+      }
     } catch {
       /* ignore */
     }
     throw new Error(msg);
   }
-  const ct = res.headers.get("content-type") || "";
-  if (ct.includes("application/json")) return res.json() as Promise<T>;
+  // SPA HTML fallback under /api looks like "empty lists" — reject explicitly.
+  if (ct.includes("text/html")) {
+    throw new Error(
+      "API yanıtı HTML döndü (proxy/API kapalı olabilir). Sayfayı yenileyin.",
+    );
+  }
+  if (ct.includes("application/json") || ct === "") {
+    const text = await res.text();
+    if (!text.trim()) {
+      throw new Error("API boş yanıt döndü.");
+    }
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new Error("API JSON çözülemedi.");
+    }
+  }
   return res.text() as Promise<T>;
+}
+
+/** Pull recordings array from list payload (tolerant of nested shapes). */
+export function extractRecordingsArray(
+  payload: unknown,
+): Array<Record<string, unknown>> {
+  if (!payload || typeof payload !== "object") return [];
+  const root = payload as Record<string, unknown>;
+  const candidates = [root.recordings, root.items, root.rows, root.data];
+  for (const c of candidates) {
+    if (Array.isArray(c)) {
+      return c.filter((x) => x && typeof x === "object") as Array<
+        Record<string, unknown>
+      >;
+    }
+    if (c && typeof c === "object") {
+      const o = c as Record<string, unknown>;
+      if (Array.isArray(o.recordings)) return extractRecordingsArray(o);
+      if (Array.isArray(o.items)) return extractRecordingsArray(o);
+    }
+  }
+  return [];
+}
+
+/** Pull reports array from list payload. */
+export function extractReportsArray(payload: unknown): ReportListItem[] {
+  if (!payload || typeof payload !== "object") return [];
+  const root = payload as Record<string, unknown>;
+  const candidates = [root.reports, root.items, root.rows];
+  for (const c of candidates) {
+    if (Array.isArray(c)) return c as ReportListItem[];
+  }
+  return [];
 }
 
 export type ReportListItem = {
@@ -249,8 +300,10 @@ export const api = {
   dashboard: () => request<Record<string, unknown>>("/api/dashboard"),
   settings: () => request<Record<string, unknown>>("/api/settings"),
   metrics: () => request<Record<string, unknown>>("/api/metrics"),
-  recordings: () =>
-    request<{ recordings: Array<Record<string, unknown>> }>("/api/recordings"),
+  recordings: async () => {
+    const d = await request<Record<string, unknown>>("/api/recordings");
+    return { recordings: extractRecordingsArray(d) };
+  },
   recording: (id: string) =>
     request<{
       recording: Record<string, unknown>;
@@ -265,17 +318,23 @@ export const api = {
       `/api/recordings/${id}/events`,
     ),
   sales: () => request<{ sales: Array<Record<string, unknown>> }>("/api/sales"),
-  reports: () =>
-    request<{
-      reports: ReportListItem[];
+  reports: async () => {
+    const d = await request<Record<string, unknown>>("/api/reports");
+    const totalsRaw =
+      d.totals && typeof d.totals === "object"
+        ? (d.totals as Record<string, unknown>)
+        : {};
+    return {
+      reports: extractReportsArray(d),
       totals: {
-        recordings: number;
-        sales: number;
-        needsReview: number;
-        sumAmountTry: number;
-        currency: string;
-      };
-    }>("/api/reports"),
+        recordings: Number(totalsRaw.recordings ?? 0),
+        sales: Number(totalsRaw.sales ?? 0),
+        needsReview: Number(totalsRaw.needsReview ?? 0),
+        sumAmountTry: Number(totalsRaw.sumAmountTry ?? 0),
+        currency: String(totalsRaw.currency ?? "TRY"),
+      },
+    };
+  },
   report: async (recordingId: string) => {
     const d = await request<Record<string, unknown>>(
       `/api/reports/${recordingId}`,

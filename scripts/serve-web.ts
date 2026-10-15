@@ -58,11 +58,23 @@ async function proxyApi(req: Request, apiPath: string): Promise<Response> {
   if (req.method !== "GET" && req.method !== "HEAD") {
     init.body = await req.arrayBuffer();
   }
-  const upstream = await fetch(target, init);
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: upstream.headers,
-  });
+  try {
+    const upstream = await fetch(target, init);
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: upstream.headers,
+    });
+  } catch (err) {
+    // Never fall through to SPA HTML for /api — UI would parse HTML as empty lists.
+    const detail = err instanceof Error ? err.message : String(err);
+    return Response.json(
+      {
+        error: `API erişilemiyor (${API}). Bir an sonra yenileyin.`,
+        detail,
+      },
+      { status: 502 },
+    );
+  }
 }
 
 async function serveStatic(relPath: string): Promise<Response | null> {
