@@ -1,4 +1,6 @@
-import { NavLink, Route, Routes } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { NavLink, Route, Routes, useLocation } from "react-router-dom";
+import { api } from "./lib/api";
 import { DashboardPage } from "./pages/DashboardPage";
 import { RecordingsPage } from "./pages/RecordingsPage";
 import { RecordingDetailPage } from "./pages/RecordingDetailPage";
@@ -13,6 +15,53 @@ const nav = [
   { to: "/evidence", label: "Kanıt", ico: "İ" },
   { to: "/settings", label: "Ayarlar", ico: "A" },
 ] as const;
+
+type FootStatus = {
+  hasCookies: boolean;
+  profileLabel: string;
+  allowPaidApis: boolean;
+};
+
+function SidebarFoot() {
+  const location = useLocation();
+  const [foot, setFoot] = useState<FootStatus | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [ig, settings] = await Promise.all([
+          api.igSession(),
+          api.settings(),
+        ]);
+        if (cancelled) return;
+        const profile = (settings.profile ?? {}) as Record<string, unknown>;
+        setFoot({
+          hasCookies: Boolean(ig.hasCookies) || ig.status === "yuklu",
+          profileLabel: String(profile.profile ?? "LOCAL"),
+          allowPaidApis: Boolean(profile.allowPaidApis),
+        });
+      } catch {
+        if (!cancelled) setFoot(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [location.pathname]);
+
+  const paid = foot?.allowPaidApis ? "Ücretli API açık" : "Ücretli API yok";
+  const ig = foot?.hasCookies
+    ? "IG oturum yüklü"
+    : "Instagram girişi yok";
+  const profile = `${foot?.profileLabel ?? "LOCAL"} profil`;
+
+  return (
+    <div className="sidebar-foot" aria-live="polite">
+      {paid} · {ig} · {profile}
+    </div>
+  );
+}
 
 export function App() {
   return (
@@ -32,9 +81,7 @@ export function App() {
             </NavLink>
           ))}
         </nav>
-        <div className="sidebar-foot">
-          Ücretli API yok · Instagram girişi yok · LOCAL profil
-        </div>
+        <SidebarFoot />
       </aside>
       <main className="main">
         <Routes>
