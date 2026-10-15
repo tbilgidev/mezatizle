@@ -30,6 +30,19 @@ Code: `~/projects/mezatizle` · Branch: `cursor/analysis-pipeline-tighten-de0f`
 | OCR Tesseract | Dominated by frame count; change-aware keeps budget for 10–180 min lives |
 | Disk | Compact live encode ≤720p CRF28 AAC 80k |
 
+### A/V sync (master vs analysis extracts)
+
+**Invariant:** The file in `storage/recordings/<id>.mp4` is the **master timeline**. ASR `start_ms`/`end_ms`, OCR `offset_ms`, auction events, and sales evidence all refer to this timeline. A desynced master makes analysis useless.
+
+| Step | What happens | Sync rule |
+|------|----------------|-----------|
+| Live capture | yt-dlp URL(s) → **one** ffmpeg process → muxed H.264+AAC MP4 | Prefer progressive single URL; if adaptive video+audio URLs, dual `-i` in **same** encode. `fps=` filter (not bare `-r`), `aresample=async=1:first_pts=0`, `+genpts`, `-shortest` |
+| Finalize / probe | `probeAvSync` (ffprobe video vs audio duration/start) | Warn if \|Δ\| > `LIVE_MAX_AV_SKEW_SEC` (default 0.35s). API: `GET /api/recordings/:id/av-sync` |
+| Extract | WAV + JPG frames from master (**read-only**) | Never rewrite master. Frame `N` → offset `(N-1)/OCR_FPS` seconds on **master** PTS |
+| Playback / Kanıt | `GET /api/recordings/:id/media` | Byte-Range 206 for seek; serves master as-is |
+
+20 fps / 720p is OK: fps is applied in the video filter while audio is re-encoded in the same process, so A/V share one clock. OCR at ~1 fps is a **side extract only**.
+
 ---
 
 ## 2. Turkish auction rules (tightened)
