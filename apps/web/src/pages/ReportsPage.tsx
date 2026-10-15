@@ -1,7 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { ChevronRight } from "lucide-react";
 import { api, type ReportListItem } from "@/lib/api";
+import {
+  analysisProgressInfo,
+  isAnalysisRunning,
+} from "@/lib/analysis-progress";
 import {
   confidenceLabel,
   formatDateTr,
@@ -22,6 +26,18 @@ function statusVariant(status: string): "ok" | "warn" | "danger" | "muted" {
   return "muted";
 }
 
+function reportAsRow(r: ReportListItem): Record<string, unknown> {
+  return {
+    status: r.status,
+    analysisState: r.analysisState,
+    analysis_state: r.analysisState,
+    analysisProgress: r.analysisProgress,
+    analysis_progress: r.analysisProgress,
+    analysisStage: r.analysisStage,
+    analysis_stage: r.analysisStage,
+  };
+}
+
 export function ReportsPage() {
   const [reports, setReports] = useState<ReportListItem[]>([]);
   const [totals, setTotals] = useState<{
@@ -32,16 +48,36 @@ export function ReportsPage() {
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    api
-      .reports()
-      .then((d) => {
+    let cancelled = false;
+
+    async function tick(first = false) {
+      try {
+        const d = await api.reports();
+        if (cancelled) return;
         setReports(d.reports);
         setTotals(d.totals);
-      })
-      .catch((e: Error) => setError(e.message))
-      .finally(() => setLoading(false));
+        const running = d.reports.some((r) =>
+          isAnalysisRunning(reportAsRow(r)),
+        );
+        pollRef.current = setTimeout(() => void tick(), running ? 2500 : 12000);
+      } catch (e) {
+        if (first && e instanceof Error) setError(e.message);
+        if (!cancelled) {
+          pollRef.current = setTimeout(() => void tick(), 12000);
+        }
+      } finally {
+        if (first) setLoading(false);
+      }
+    }
+
+    void tick(true);
+    return () => {
+      cancelled = true;
+      if (pollRef.current) clearTimeout(pollRef.current);
+    };
   }, []);
 
   return (
@@ -99,56 +135,78 @@ export function ReportsPage() {
                   </TR>
                 </THead>
                 <TBody>
-                  {reports.map((r) => (
-                    <TR key={r.recordingId}>
-                      <TD>
-                        <Link
-                          to={`/reports/${r.recordingId}`}
-                          className="group block max-w-[28rem]"
-                        >
-                          <div className="font-semibold text-paper group-hover:text-mint">
-                            {r.headline || `@${r.sellerUsername}`}
+                  {reports.map((r) => {
+                    const progress = analysisProgressInfo(reportAsRow(r));
+                    return (
+                      <TR key={r.recordingId}>
+                        <TD>
+                          <Link
+                            to={`/reports/${r.recordingId}`}
+                            className="group block max-w-[28rem]"
+                          >
+                            <div className="font-semibold text-paper group-hover:text-mint">
+                              {r.headline || `@${r.sellerUsername}`}
+                            </div>
+                            <div className="mt-0.5 truncate text-xs text-fog">
+                              {r.displayName ? `${r.displayName} · ` : ""}
+                              {r.originalFilename}
+                            </div>
+                          </Link>
+                        </TD>
+                        <TD className="whitespace-nowrap text-fog">
+                          {formatDateTr(r.recordedAt ?? r.uploadedAt)}
+                        </TD>
+                        <TD className="whitespace-nowrap">
+                          {formatDuration(r.durationSeconds)}
+                        </TD>
+                        <TD>
+                          <span className="font-semibold">{r.saleCount}</span>
+                          {r.needsReviewCount > 0 ? (
+                            <span className="ml-1 text-xs text-amber">
+                              ({r.needsReviewCount} inceleme)
+                            </span>
+                          ) : null}
+                        </TD>
+                        <TD className="whitespace-nowrap">
+                          {formatTry(r.sumAmountTry)}
+                        </TD>
+                        <TD>{confidenceLabel(r.avgEventConfidence)}</TD>
+                        <TD>
+                          <div className="flex flex-col gap-1">
+                            <Badge
+                              variant={
+                                progress
+                                  ? "warn"
+                                  : statusVariant(r.status)
+                              }
+                            >
+                              {statusTr(r.status)}
+                            </Badge>
+                            {progress ? (
+                              <span
+                                className="text-xs font-medium text-amber"
+                                title={progress.label}
+                                data-analysis-progress={
+                                  progress.percent ?? undefined
+                                }
+                              >
+                                {progress.label}
+                              </span>
+                            ) : null}
                           </div>
-                          <div className="mt-0.5 truncate text-xs text-fog">
-                            {r.displayName ? `${r.displayName} · ` : ""}
-                            {r.originalFilename}
-                          </div>
-                        </Link>
-                      </TD>
-                      <TD className="whitespace-nowrap text-fog">
-                        {formatDateTr(r.recordedAt ?? r.uploadedAt)}
-                      </TD>
-                      <TD className="whitespace-nowrap">
-                        {formatDuration(r.durationSeconds)}
-                      </TD>
-                      <TD>
-                        <span className="font-semibold">{r.saleCount}</span>
-                        {r.needsReviewCount > 0 ? (
-                          <span className="ml-1 text-xs text-amber">
-                            ({r.needsReviewCount} inceleme)
-                          </span>
-                        ) : null}
-                      </TD>
-                      <TD className="whitespace-nowrap">
-                        {formatTry(r.sumAmountTry)}
-                      </TD>
-                      <TD>{confidenceLabel(r.avgEventConfidence)}</TD>
-                      <TD>
-                        <Badge variant={statusVariant(r.status)}>
-                          {statusTr(r.status)}
-                        </Badge>
-                      </TD>
-                      <TD>
-                        <Link
-                          to={`/reports/${r.recordingId}`}
-                          className="inline-flex items-center gap-1 text-sm font-semibold text-mint hover:text-mint-bright"
-                        >
-                          Aç
-                          <ChevronRight className="h-4 w-4" />
-                        </Link>
-                      </TD>
-                    </TR>
-                  ))}
+                        </TD>
+                        <TD>
+                          <Link
+                            to={`/reports/${r.recordingId}`}
+                            className="inline-flex items-center gap-1 text-sm font-semibold text-mint hover:text-mint-bright"
+                          >
+                            Aç
+                            <ChevronRight className="h-4 w-4" />
+                          </Link>
+                        </TD>
+                      </TR>
+                    );
+                  })}
                 </TBody>
               </Table>
             )}

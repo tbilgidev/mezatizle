@@ -1,6 +1,10 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "@/lib/api";
+import {
+  analysisProgressInfo,
+  isAnalysisRunning,
+} from "@/lib/analysis-progress";
 import { statusTr } from "@/lib/utils";
 import { EmptyState, ErrorState, LoadingState, PageHeader } from "@/components/States";
 import { Badge } from "@/components/ui/badge";
@@ -64,9 +68,10 @@ function reportLinkTone(r: Record<string, unknown>): {
     };
   }
   if (analysisState === "running") {
+    const progress = analysisProgressInfo(r);
     return {
       tone: "yellow",
-      title: `Analiz sürüyor${status ? ` (${statusTr(status)})` : ""}`,
+      title: progress?.label ?? `Analiz sürüyor${status ? ` (${statusTr(status)})` : ""}`,
       className: "text-amber hover:text-amber/80",
     };
   }
@@ -108,9 +113,10 @@ function reportLinkTone(r: Record<string, unknown>): {
     "analyzing",
   ]);
   if (inProgress.has(status)) {
+    const progress = analysisProgressInfo(r);
     return {
       tone: "yellow",
-      title: `Analiz sürüyor (${statusTr(status)})`,
+      title: progress?.label ?? `Analiz sürüyor (${statusTr(status)})`,
       className: "text-amber hover:text-amber/80",
     };
   }
@@ -138,19 +144,40 @@ export function RecordingsPage() {
   const [limitation, setLimitation] = useState<string | null>(null);
   const [showUpload, setShowUpload] = useState(false);
 
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   async function refresh() {
     const data = await api.recordings();
     setRows(data.recordings);
+    return data.recordings;
   }
 
   useEffect(() => {
-    refresh()
-      .catch((e: Error) => setError(e.message))
-      .finally(() => setLoading(false));
-    const t = setInterval(() => {
-      void refresh().catch(() => undefined);
-    }, 8000);
-    return () => clearInterval(t);
+    let cancelled = false;
+
+    async function tick(first = false) {
+      try {
+        const list = await refresh();
+        if (cancelled) return;
+        // Faster while any analysis is running so % / stage stay fresh.
+        const ms = list.some((r) => isAnalysisRunning(r)) ? 2500 : 8000;
+        pollRef.current = setTimeout(() => void tick(), ms);
+      } catch (e) {
+        if (first && e instanceof Error) setError(e.message);
+        if (!cancelled) {
+          pollRef.current = setTimeout(() => void tick(), 8000);
+        }
+      } finally {
+        if (first) setLoading(false);
+      }
+    }
+
+    void tick(true);
+
+    return () => {
+      cancelled = true;
+      if (pollRef.current) clearTimeout(pollRef.current);
+    };
   }, []);
 
   async function onLiveSubmit(e: FormEvent<HTMLFormElement>) {
@@ -400,33 +427,50 @@ export function RecordingsPage() {
                             : "—"}
                       </TD>
                       <TD>
-                        <div className="flex flex-wrap gap-2">
-                          {(() => {
-                            const link = reportLinkTone(r);
-                            return (
-                              <Link
-                                to={`/reports/${r.id}`}
-                                title={link.title}
-                                aria-label={`Rapor — ${link.title}`}
-                                data-tone={link.tone}
-                                className={`text-sm font-semibold ${link.className}`}
+                        <div className="flex flex-col gap-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            {(() => {
+                              const link = reportLinkTone(r);
+                              return (
+                                <Link
+                                  to={`/reports/${r.id}`}
+                                  title={link.title}
+                                  aria-label={`Rapor — ${link.title}`}
+                                  data-tone={link.tone}
+                                  className={`text-sm font-semibold ${link.className}`}
+                                >
+                                  Rapor
+                                </Link>
+                              );
+                            })()}
+                            {(() => {
+                              const progress = analysisProgressInfo(r);
+                              if (!progress) return null;
+                              return (
+                                <span
+                                  className="text-xs font-medium text-amber"
+                                  title={progress.label}
+                                  data-analysis-progress={
+                                    progress.percent ?? undefined
+                                  }
+                                >
+                                  {progress.label}
+                                </span>
+                              );
+                            })()}
+                            {String(r.source_type) === "live" &&
+                            (r.status === "awaiting_live" ||
+                              r.status === "recording") ? (
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="secondary"
+                                onClick={() => void onCancel(String(r.id))}
                               >
-                                Rapor
-                              </Link>
-                            );
-                          })()}
-                          {String(r.source_type) === "live" &&
-                          (r.status === "awaiting_live" ||
-                            r.status === "recording") ? (
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="secondary"
-                              onClick={() => void onCancel(String(r.id))}
-                            >
-                              İptal
-                            </Button>
-                          ) : null}
+                                İptal
+                              </Button>
+                            ) : null}
+                          </div>
                         </div>
                       </TD>
                     </TR>

@@ -47,6 +47,10 @@ export type ReportListItem = {
   sourceType: string | null;
   avgEventConfidence: number | null;
   headline: string;
+  /** Optional — present once analysis worker publishes progress. */
+  analysisState?: string | null;
+  analysisProgress?: number | null;
+  analysisStage?: string | null;
 };
 
 export type ReportDetail = ReportListItem & {
