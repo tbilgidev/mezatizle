@@ -39,6 +39,56 @@ function captureLastError(r: Record<string, unknown>): string | null {
   return s.length ? s : null;
 }
 
+type ReportLinkTone = "green" | "yellow" | "red";
+
+/**
+ * Color Rapor by analysis phase (recording.status from API).
+ * Yeşil = bitti · Sarı = sürüyor · Kırmızı = henüz yok / başarısız.
+ */
+function reportLinkTone(r: Record<string, unknown>): {
+  tone: ReportLinkTone;
+  title: string;
+  className: string;
+} {
+  const status = String(r.status ?? "");
+  if (status === "complete") {
+    return {
+      tone: "green",
+      title: "Analiz tamam — rapor hazır",
+      className: "text-emerald hover:text-emerald/80",
+    };
+  }
+  const inProgress = new Set([
+    "probing",
+    "ready",
+    "extracting",
+    "extracted",
+    "transcribing",
+    "analyzing",
+  ]);
+  if (inProgress.has(status)) {
+    return {
+      tone: "yellow",
+      title: `Analiz sürüyor (${statusTr(status)})`,
+      className: "text-amber hover:text-amber/80",
+    };
+  }
+  // uploaded / awaiting_live / recording / failed / cancelled / unknown
+  const title =
+    status === "failed"
+      ? "Analiz başarısız — rapor sınırlı olabilir"
+      : status === "cancelled"
+        ? "İptal — analiz yok"
+        : status === "awaiting_live" || status === "recording"
+          ? "Kayıt henüz bitmedi — analiz yok"
+          : "Henüz analiz edilmedi";
+  return {
+    tone: "red",
+    title,
+    className: "text-rose hover:text-rose/80",
+  };
+}
+
 export function RecordingsPage() {
   const [rows, setRows] = useState<Array<Record<string, unknown>>>([]);
   const [error, setError] = useState<string | null>(null);
@@ -239,8 +289,19 @@ export function RecordingsPage() {
 
       {!loading && (
         <Card>
-          <CardHeader>
+          <CardHeader className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
             <CardTitle>Kayıt listesi</CardTitle>
+            <p
+              className="text-xs text-fog"
+              aria-label="Rapor bağlantısı renk açıklaması"
+            >
+              <span className="font-semibold text-emerald">Rapor yeşil</span>
+              {" = tamam · "}
+              <span className="font-semibold text-amber">sarı</span>
+              {" = analiz sürüyor · "}
+              <span className="font-semibold text-rose">kırmızı</span>
+              {" = henüz yok / başarısız"}
+            </p>
           </CardHeader>
           <CardContent>
             {!rows.length ? (
@@ -300,12 +361,20 @@ export function RecordingsPage() {
                       </TD>
                       <TD>
                         <div className="flex flex-wrap gap-2">
-                          <Link
-                            to={`/reports/${r.id}`}
-                            className="text-sm font-semibold text-fog hover:text-mint"
-                          >
-                            Rapor
-                          </Link>
+                          {(() => {
+                            const link = reportLinkTone(r);
+                            return (
+                              <Link
+                                to={`/reports/${r.id}`}
+                                title={link.title}
+                                aria-label={`Rapor — ${link.title}`}
+                                data-tone={link.tone}
+                                className={`text-sm font-semibold ${link.className}`}
+                              >
+                                Rapor
+                              </Link>
+                            );
+                          })()}
                           {String(r.source_type) === "live" &&
                           (r.status === "awaiting_live" ||
                             r.status === "recording") ? (
