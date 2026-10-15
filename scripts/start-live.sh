@@ -9,6 +9,7 @@ cd "$ROOT"
 unset FORCE_MOCK_ASR FORCE_MOCK_OCR || true
 export PROCESSING_PROFILE="${PROCESSING_PROFILE:-LOCAL}"
 export EMBEDDED_WORKER="${EMBEDDED_WORKER:-1}"
+# Live probe/record loop (bekleniyor → kaydediliyor). Keep ON unless debugging.
 export LIVE_CAPTURE_SUPERVISOR="${LIVE_CAPTURE_SUPERVISOR:-1}"
 export DATABASE_URL="${DATABASE_URL:-postgres://mezatizle:mezatizle@127.0.0.1:5433/mezatizle}"
 export PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python3}"
@@ -72,6 +73,7 @@ fi
 
 sleep 2
 curl -sf "http://127.0.0.1:${API_PORT:-43127}/api/health" && echo
+curl -s "http://127.0.0.1:${API_PORT:-43127}/api/health" | head -c 500; echo
 curl -s "http://127.0.0.1:${API_PORT:-43127}/api/settings" | head -c 400; echo
 curl -sfI "https://tolga-mini.tailf479ba.ts.net/mezatizle/" | head -3 || true
 echo "[start] ready — FORCE_MOCK unset"
