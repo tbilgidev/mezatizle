@@ -695,6 +695,142 @@ async function startRecordingProcess(
   });
 }
 
+function pidAlive(pid: number | null | undefined): boolean {
+  if (pid == null || !Number.isFinite(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function killCapturePid(pid: number | null | undefined) {
+  if (!pidAlive(pid)) return;
+  const p = Number(pid);
+  try {
+    process.kill(p, "SIGTERM");
+  } catch {
+    /* ignore */
+  }
+  await Bun.sleep(1500);
+  if (pidAlive(p)) {
+    try {
+      process.kill(p, "SIGKILL");
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * Enforce max duration / dead-ffmpeg reclaim for a recording row.
+ * Critical after API restart: orphaned ffmpeg may exit (e.g. -t) without our
+ * close handler — without this, UI stays kaydediliyor forever.
+ */
+async function enforceRecordingWatchdog(
+  sql: Sql,
+  env: AppEnv,
+  row: {
+    recording_id: string;
+    process_pid: number | null;
+    max_duration_minutes: number | null;
+    capture_started_at: Date | string | null;
+    max_bytes: number | string | null;
+  },
+): Promise<"ok" | "finalized" | "killed_waiting_finalize"> {
+  const recordingId = row.recording_id;
+  if (activeProcs.has(recordingId)) {
+    // In-process timer also runs; still enforce wall-clock from DB start
+  }
+
+  const destAbs = safeJoinStorage(
+    env.storageRoot,
+    "recordings",
+    `${recordingId}.mp4`,
+  );
+  const partAbs = `${destAbs}.part.mp4`;
+  const partBytes = await fileSize(partAbs);
+  const finalBytes = await fileSize(destAbs);
+  const pid = row.process_pid != null ? Number(row.process_pid) : null;
+  const alive = pidAlive(pid) || activeProcs.has(recordingId);
+
+  const startedAt = row.capture_started_at
+    ? new Date(row.capture_started_at).getTime()
+    : NaN;
+  const maxMin =
+    row.max_duration_minutes != null && Number(row.max_duration_minutes) > 0
+      ? Number(row.max_duration_minutes)
+      : null;
+  const pastMax =
+    maxMin != null &&
+    Number.isFinite(startedAt) &&
+    Date.now() - startedAt >= maxMin * 60_000 + 5_000;
+
+  const maxBytes = Number(row.max_bytes ?? 0);
+  const overBytes =
+    maxBytes > 0 && Math.max(partBytes, finalBytes) >= maxBytes;
+
+  if (pastMax || overBytes) {
+    const why = pastMax
+      ? `max_duration ${maxMin}dk aşıldı — zorla durduruluyor`
+      : `max_bytes aşıldı — zorla durduruluyor`;
+    console.warn(`[live-capture] watchdog ${recordingId}: ${why}`);
+    const proc = activeProcs.get(recordingId);
+    if (proc && !proc.killed) {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        /* ignore */
+      }
+    }
+    await killCapturePid(pid);
+    await stopLiveViewerPresence(recordingId);
+    // If close handler will finalize via activeProcs, give it a moment
+    if (activeProcs.has(recordingId)) {
+      await Bun.sleep(2000);
+      if (!activeProcs.has(recordingId)) return "finalized";
+    }
+    if (partBytes >= 64_000 || finalBytes >= 64_000) {
+      await finalizeRecording(
+        sql,
+        env,
+        recordingId,
+        destAbs,
+        partAbs,
+        pastMax ? 0 : null,
+        why,
+      );
+      return "finalized";
+    }
+  }
+
+  // ffmpeg exited but we lost the close handler (API restart / orphan)
+  if (!alive && (partBytes >= 64_000 || finalBytes >= 64_000)) {
+    console.warn(
+      `[live-capture] reclaim orphan ${recordingId} partBytes=${partBytes} finalBytes=${finalBytes}`,
+    );
+    await stopLiveViewerPresence(recordingId);
+    await finalizeRecording(
+      sql,
+      env,
+      recordingId,
+      destAbs,
+      partAbs,
+      0,
+      "orphan_ffmpeg_reclaim",
+    );
+    return "finalized";
+  }
+
+  if (!alive && partBytes < 64_000 && finalBytes < 64_000) {
+    // Dead with nothing useful — return to waiting only if still early
+    return "ok";
+  }
+
+  return "ok";
+}
+
 async function finalizeRecording(
   sql: Sql,
   env: AppEnv,
@@ -708,13 +844,21 @@ async function finalizeRecording(
     SELECT status FROM live_captures WHERE recording_id = ${recordingId}
   `;
   if (!rows[0] || rows[0].status === "cancelled") return;
+  if (rows[0].status === "completed") return;
 
   await sql`
     UPDATE live_captures SET status = 'finalizing', updated_at = now(), process_pid = NULL
     WHERE recording_id = ${recordingId}
   `;
 
-  const bytes = await fileSize(partAbs);
+  // Prefer part; if already renamed, treat dest as done
+  let bytes = await fileSize(partAbs);
+  if (bytes < 64_000) {
+    const existing = await fileSize(destAbs);
+    if (existing >= 64_000) {
+      bytes = existing;
+    }
+  }
   const low = stderr.toLowerCase();
   const blocked =
     low.includes("login required") ||
@@ -767,18 +911,38 @@ async function finalizeRecording(
     return;
   }
 
-  try {
-    await rename(partAbs, destAbs);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+  const partExists = (await fileSize(partAbs)) > 0;
+  if (partExists) {
+    try {
+      await rename(partAbs, destAbs);
+    } catch (err) {
+      // Dest may already exist from a prior partial finalize
+      if ((await fileSize(destAbs)) < 64_000) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await sql`
+          UPDATE live_captures SET status = 'failed', last_probe_detail = ${msg}, updated_at = now()
+          WHERE recording_id = ${recordingId}
+        `;
+        await sql`
+          UPDATE recordings
+          SET status = 'failed', capture_status = 'hata', capture_error = ${msg},
+              error_message = ${msg}, capture_ended_at = now(), updated_at = now()
+          WHERE id = ${recordingId}
+        `;
+        return;
+      }
+    }
+  } else if ((await fileSize(destAbs)) < 64_000) {
     await sql`
-      UPDATE live_captures SET status = 'failed', last_probe_detail = ${msg}, updated_at = now()
+      UPDATE live_captures SET status = 'failed',
+        last_probe_detail = ${"Finalize: ne part ne final dosya yok"}, updated_at = now()
       WHERE recording_id = ${recordingId}
     `;
     await sql`
       UPDATE recordings
-      SET status = 'failed', capture_status = 'hata', capture_error = ${msg},
-          error_message = ${msg}, capture_ended_at = now(), updated_at = now()
+      SET status = 'failed', capture_status = 'hata',
+          capture_error = ${"Kayıt dosyası bulunamadı"},
+          capture_ended_at = now(), updated_at = now()
       WHERE id = ${recordingId}
     `;
     return;
@@ -935,62 +1099,23 @@ export async function liveCaptureLoop(sql: Sql, env: AppEnv) {
   supervisorStartedAt = new Date().toISOString();
   console.log("[live-capture] supervisor started");
 
-  // Resume: only reclaim rows whose ffmpeg pid is dead. Keep orphaned
-  // recorders (API restart mid-capture) marked recording so we can attach viewer.
-  const maybeRecording = await sql<{
-    recording_id: string;
-    watch_url: string;
-    process_pid: number | null;
-  }[]>`
-    SELECT recording_id, watch_url, process_pid
-    FROM live_captures
-    WHERE status IN ('recording', 'finalizing')
-  `;
-  for (const row of maybeRecording) {
-    const pid = row.process_pid != null ? Number(row.process_pid) : null;
-    let alive = false;
-    if (pid && pid > 1) {
-      try {
-        process.kill(pid, 0);
-        alive = true;
-      } catch {
-        alive = false;
-      }
-    }
-    if (alive) {
-      // ffmpeg still running (API restarted without killing child) — attach viewer only
-      void startLiveViewerPresence(env, {
-        recordingId: row.recording_id,
-        watchUrl: row.watch_url,
-        username: usernameFromWatchUrl(row.watch_url) ?? undefined,
-        broadcastId: extractBroadcastIdFromUrl(row.watch_url),
-      }).then((r) => {
-        if (!r.ok) console.warn(`[live-viewer] resume ${row.recording_id}: ${r.detail}`);
-      });
-      continue;
-    }
-    await sql`
-      UPDATE live_captures
-      SET status = 'waiting', process_pid = NULL, updated_at = now()
-      WHERE recording_id = ${row.recording_id}
-    `;
-    await sql`
-      UPDATE recordings
-      SET status = 'awaiting_live', capture_status = 'bekleniyor', updated_at = now()
-      WHERE id = ${row.recording_id} AND status = 'recording' AND source_type = 'live'
-    `;
-  }
+  // Resume in-flight captures: enforce max duration / finalize orphans first.
   await sql`
     UPDATE live_captures
     SET status = 'waiting', process_pid = NULL, updated_at = now()
     WHERE status = 'pending'
   `;
+  await tickRecordingWatchdogs(sql, env);
 
   for (;;) {
     try {
       supervisorTickCount += 1;
       supervisorLastTickAt = new Date().toISOString();
       supervisorLastError = null;
+
+      // Always enforce max minutes + orphan finalize (do not rely only on ffmpeg -t)
+      await tickRecordingWatchdogs(sql, env);
+
       const rows = await sql<{
         recording_id: string;
         watch_url: string;
@@ -1015,5 +1140,64 @@ export async function liveCaptureLoop(sql: Sql, env: AppEnv) {
       console.error("[live-capture] tick error", err);
     }
     await Bun.sleep(probeIntervalMs());
+  }
+}
+
+async function tickRecordingWatchdogs(sql: Sql, env: AppEnv) {
+  const rows = await sql<{
+    recording_id: string;
+    watch_url: string;
+    process_pid: number | null;
+    max_duration_minutes: number | null;
+    max_bytes: number | null;
+    capture_started_at: Date | null;
+  }[]>`
+    SELECT lc.recording_id, lc.watch_url, lc.process_pid, lc.max_duration_minutes,
+           lc.max_bytes, r.capture_started_at
+    FROM live_captures lc
+    JOIN recordings r ON r.id = lc.recording_id
+    WHERE lc.status IN ('recording', 'finalizing')
+       OR r.capture_status = 'kaydediliyor'
+  `;
+  for (const row of rows) {
+    const result = await enforceRecordingWatchdog(sql, env, row);
+    if (result === "finalized") continue;
+
+    const alive =
+      activeProcs.has(row.recording_id) ||
+      pidAlive(row.process_pid != null ? Number(row.process_pid) : null);
+    if (alive) {
+      // ffmpeg still running after API restart — ensure viewer presence
+      void startLiveViewerPresence(env, {
+        recordingId: row.recording_id,
+        watchUrl: row.watch_url,
+        username: usernameFromWatchUrl(row.watch_url) ?? undefined,
+        broadcastId: extractBroadcastIdFromUrl(row.watch_url),
+      }).then((r) => {
+        if (!r.ok) {
+          console.warn(`[live-viewer] resume ${row.recording_id}: ${r.detail}`);
+        }
+      });
+    } else {
+      // Dead with no usable media — leave waiting only if still flagged recording
+      const st = await sql<{ status: string }[]>`
+        SELECT status FROM live_captures WHERE recording_id = ${row.recording_id}
+      `;
+      if (st[0]?.status === "recording" || st[0]?.status === "finalizing") {
+        await sql`
+          UPDATE live_captures
+          SET status = 'waiting', process_pid = NULL,
+              last_probe_detail = ${"ffmpeg bitti / yok — yeniden bekleniyor"},
+              updated_at = now()
+          WHERE recording_id = ${row.recording_id}
+        `;
+        await sql`
+          UPDATE recordings
+          SET status = 'awaiting_live', capture_status = 'bekleniyor', updated_at = now()
+          WHERE id = ${row.recording_id} AND source_type = 'live'
+            AND status IN ('recording', 'awaiting_live')
+        `;
+      }
+    }
   }
 }

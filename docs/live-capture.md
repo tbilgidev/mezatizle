@@ -66,6 +66,11 @@ See also: `docs/ready-for-10min-test.md` (operator checklist + smoke timings).
 - `media/sales-nonmock.png` — sales from real ASR/OCR
 - `media/live-capture-ui.png` — Canlı yayın ekle (+ süre)
 
+
+## Max duration watchdog (20 dk bug)
+
+ffmpeg `-t` alone is not enough after API restart (close handler lost → UI stuck on **kaydediliyor**). Supervisor now ticks all `recording`/`kaydediliyor` rows every probe interval: if past `max_duration_minutes` from `capture_started_at` **or** ffmpeg pid is dead with a `.part.mp4`, it stops the process, finalizes MP4, stops viewer presence, and enqueues analysis. Manual reclaim: `bun scripts/finalize-stuck-live.ts <recordingId>`.
+
 ## Restart (no FORCE_MOCK)
 
 ```bash
