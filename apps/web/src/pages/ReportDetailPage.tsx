@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ArrowLeft, Download } from "lucide-react";
+import { ArrowLeft, Download, Film } from "lucide-react";
 import { api, type ReportDetail } from "@/lib/api";
+import { resolveOffsetMs } from "@/lib/seek";
 import {
   confidenceLabel,
   formatDateTr,
@@ -9,6 +10,7 @@ import {
   formatTry,
   statusTr,
 } from "@/lib/utils";
+import { EvidencePlayer } from "@/components/EvidencePlayer";
 import { EmptyState, ErrorState, LoadingState, PageHeader } from "@/components/States";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -30,6 +32,10 @@ export function ReportDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [player, setPlayer] = useState<{
+    saleId: string;
+    offsetMs: number;
+  } | null>(null);
 
   async function load() {
     const [rep, tr, ev] = await Promise.all([
@@ -83,6 +89,31 @@ export function ReportDetailPage() {
     try {
       await api.reviewSale(saleId, status);
       await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function openEvidencePlayer(saleId: string, productTitle: string | null) {
+    setBusyId(saleId);
+    setError(null);
+    try {
+      const d = await api.evidence(saleId);
+      const ms = resolveOffsetMs({
+        offsetMs: d.offsetMs,
+        evidence: d.evidence,
+        productTitle:
+          productTitle ??
+          (d.sale.product_title != null ? String(d.sale.product_title) : null),
+        auctionEvent: d.auctionEvent,
+      });
+      if (ms == null) {
+        setError("Bu satış için video zaman damgası bulunamadı.");
+        return;
+      }
+      setPlayer({ saleId, offsetMs: ms });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -156,6 +187,16 @@ export function ReportDetailPage() {
         ))}
       </div>
 
+      {player && (
+        <EvidencePlayer
+          recordingId={report.recordingId}
+          offsetMs={player.offsetMs}
+          open
+          onClose={() => setPlayer(null)}
+          title="Kanıt videosu"
+        />
+      )}
+
       <Card className="mb-4">
         <CardHeader>
           <CardTitle>Ürün / satış tablosu</CardTitle>
@@ -190,18 +231,36 @@ export function ReportDetailPage() {
                       </Badge>
                     </TD>
                     <TD>
-                      <Link
-                        to={`/evidence/${s.id}`}
-                        className="text-sm font-semibold text-mint hover:text-mint-bright"
-                      >
-                        Kanıt →
-                      </Link>
+                      <div className="flex flex-col gap-1">
+                        <button
+                          type="button"
+                          className="inline-flex items-center gap-1 text-left text-sm font-semibold text-mint hover:text-mint-bright"
+                          disabled={busyId === s.id}
+                          onClick={() =>
+                            void openEvidencePlayer(s.id, s.productTitle)
+                          }
+                        >
+                          <Film className="h-3.5 w-3.5" />
+                          Görüntüyü incele
+                        </button>
+                        <Link
+                          to={`/evidence/${s.id}`}
+                          className="text-sm font-semibold text-fog hover:text-mint"
+                        >
+                          Kanıt paneli →
+                        </Link>
+                      </div>
                     </TD>
                     <TD>
                       <div className="flex flex-wrap gap-1.5">
                         <Button
                           size="sm"
-                          disabled={busyId === s.id}
+                          disabled={busyId === s.id || player?.saleId !== s.id}
+                          title={
+                            player?.saleId !== s.id
+                              ? "Önce görüntüyü inceleyin"
+                              : undefined
+                          }
                           onClick={() => void review(s.id, "confirmed")}
                         >
                           Onayla
@@ -209,7 +268,12 @@ export function ReportDetailPage() {
                         <Button
                           size="sm"
                           variant="danger"
-                          disabled={busyId === s.id}
+                          disabled={busyId === s.id || player?.saleId !== s.id}
+                          title={
+                            player?.saleId !== s.id
+                              ? "Önce görüntüyü inceleyin"
+                              : undefined
+                          }
                           onClick={() => void review(s.id, "rejected")}
                         >
                           Reddet

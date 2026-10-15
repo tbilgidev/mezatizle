@@ -84,8 +84,19 @@ export {
 } from "./profiles.ts";
 export {
   parseAuctionText,
+  parseAuctionTexts,
+  splitAuctionClauses,
+  parsePriceTry,
+  parseBuyerHint,
+  isSaleWorthy,
+  isAuctionNoise,
+  enrichSoldFromBids,
+  explainSaleTr,
+  SALE_MIN_CONFIDENCE,
+  SALE_BID_LOOKBACK_MS,
   type AuctionEventType,
   type ParsedAuctionSignal,
+  type BidContext,
 } from "./auction.ts";
 export {
   parseLiveSourceInput,

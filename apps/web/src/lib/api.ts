@@ -109,7 +109,17 @@ export const api = {
     request<{
       sale: Record<string, unknown>;
       evidence: Array<Record<string, unknown>>;
+      auctionEvent?: Record<string, unknown> | null;
+      offsetMs?: number | null;
+      explanationTr?: string;
+      confidence?: number;
+      gaps?: string[];
+      windowMs?: number;
+      transcriptAround?: Array<Record<string, unknown>>;
+      commentsAround?: Array<Record<string, unknown>>;
     }>(`/api/sales/${id}/evidence`),
+  /** Muxed recording MP4 (range-request friendly). */
+  mediaUrl: (recordingId: string) => url(`/api/recordings/${recordingId}/media`),
   reviewSale: (id: string, status: string) =>
     request(`/api/sales/${id}/review`, {
       method: "PATCH",

@@ -1,7 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { Film } from "lucide-react";
 import { api } from "@/lib/api";
+import { resolveOffsetMs } from "@/lib/seek";
 import { formatTry, statusTr } from "@/lib/utils";
+import { EvidencePlayer } from "@/components/EvidencePlayer";
 import { EmptyState, ErrorState, LoadingState, PageHeader } from "@/components/States";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,9 +17,15 @@ export function EvidencePage() {
   const [selected, setSelected] = useState<string | null>(id ?? null);
   const [evidence, setEvidence] = useState<Array<Record<string, unknown>>>([]);
   const [sale, setSale] = useState<Record<string, unknown> | null>(null);
+  const [auctionEvent, setAuctionEvent] = useState<Record<string, unknown> | null>(
+    null,
+  );
+  const [apiOffsetMs, setApiOffsetMs] = useState<number | null>(null);
+  const [explanationTr, setExplanationTr] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [playerOpen, setPlayerOpen] = useState(false);
 
   useEffect(() => {
     api
@@ -32,15 +41,34 @@ export function EvidencePage() {
   useEffect(() => {
     if (!selected) return;
     setBusy(true);
+    setPlayerOpen(false);
     api
       .evidence(selected)
       .then((d) => {
         setSale(d.sale);
         setEvidence(d.evidence);
+        setAuctionEvent(d.auctionEvent ?? null);
+        setApiOffsetMs(d.offsetMs ?? null);
+        setExplanationTr(d.explanationTr ?? null);
       })
       .catch((e: Error) => setError(e.message))
       .finally(() => setBusy(false));
   }, [selected]);
+
+  const offsetMs = useMemo(
+    () =>
+      resolveOffsetMs({
+        offsetMs: apiOffsetMs,
+        evidence,
+        productTitle:
+          sale?.product_title != null ? String(sale.product_title) : null,
+        auctionEvent,
+      }),
+    [apiOffsetMs, evidence, sale, auctionEvent],
+  );
+
+  const recordingId =
+    sale?.recording_id != null ? String(sale.recording_id) : null;
 
   async function review(status: string) {
     if (!selected) return;
@@ -49,6 +77,10 @@ export function EvidencePage() {
       await api.reviewSale(selected, status);
       const d = await api.evidence(selected);
       setSale(d.sale);
+      setEvidence(d.evidence);
+      setAuctionEvent(d.auctionEvent ?? null);
+      setApiOffsetMs(d.offsetMs ?? null);
+      setExplanationTr(d.explanationTr ?? null);
       const list = await api.sales();
       setSales(list.sales);
     } catch (e) {
@@ -64,7 +96,7 @@ export function EvidencePage() {
     <div className="mx-auto max-w-[1100px] animate-rise">
       <PageHeader
         title="Kanıt inceleme"
-        lead="Her satış adayının dayandığı olay ve referansları kontrol edin; onaylayın veya reddedin."
+        lead="Onay / red öncesi ilgili video dilimini izleyin ve dinleyin. Görüntü muxed kayıttan açılır."
       />
 
       {error && <ErrorState message={error} className="mb-4" />}
@@ -96,22 +128,46 @@ export function EvidencePage() {
                   ))}
                 </Select>
               </Field>
+              {sale && recordingId && offsetMs != null && (
+                <Button
+                  type="button"
+                  onClick={() => setPlayerOpen(true)}
+                  disabled={busy}
+                >
+                  <Film className="h-4 w-4" />
+                  Görüntüyü incele
+                </Button>
+              )}
               {sale && (
                 <>
-                  <Button type="button" disabled={busy} onClick={() => review("confirmed")}>
+                  <Button
+                    type="button"
+                    disabled={busy || !playerOpen}
+                    title={
+                      !playerOpen
+                        ? "Önce görüntüyü inceleyin"
+                        : undefined
+                    }
+                    onClick={() => review("confirmed")}
+                  >
                     Onayla
                   </Button>
                   <Button
                     type="button"
                     variant="danger"
-                    disabled={busy}
+                    disabled={busy || !playerOpen}
+                    title={
+                      !playerOpen
+                        ? "Önce görüntüyü inceleyin"
+                        : undefined
+                    }
                     onClick={() => review("rejected")}
                   >
                     Reddet
                   </Button>
-                  {sale.recording_id ? (
+                  {recordingId ? (
                     <Link
-                      to={`/reports/${String(sale.recording_id)}`}
+                      to={`/reports/${recordingId}`}
                       className="inline-flex h-10 items-center rounded-xl border border-line px-4 text-sm font-semibold text-fog hover:text-paper"
                     >
                       Rapora dön
@@ -131,13 +187,23 @@ export function EvidencePage() {
 
           {busy && !sale && <LoadingState label="Kanıtlar getiriliyor…" />}
 
+          {sale && recordingId && offsetMs != null && (
+            <EvidencePlayer
+              recordingId={recordingId}
+              offsetMs={offsetMs}
+              open={playerOpen}
+              onClose={() => setPlayerOpen(false)}
+              title="Kanıt videosu"
+            />
+          )}
+
           {sale && (
             <Card>
               <CardHeader>
                 <CardTitle>Satış özeti</CardTitle>
               </CardHeader>
               <CardContent>
-                <p className="mb-4 text-sm">
+                <p className="mb-3 text-sm">
                   Durum:{" "}
                   <Badge
                     variant={
@@ -156,7 +222,32 @@ export function EvidencePage() {
                     : "—"}{" "}
                   · Alıcı:{" "}
                   {sale.buyer_username ? `@${sale.buyer_username}` : "—"}
+                  {offsetMs != null ? (
+                    <>
+                      {" "}
+                      · Zaman:{" "}
+                      <span className="font-mono text-mint">
+                        {(offsetMs / 1000).toFixed(1)}s
+                      </span>
+                    </>
+                  ) : null}
                 </p>
+                {explanationTr ? (
+                  <p className="mb-4 rounded-xl border border-line bg-ink/30 px-3 py-2 text-sm text-fog">
+                    {explanationTr}
+                  </p>
+                ) : null}
+                {!playerOpen && recordingId && offsetMs != null ? (
+                  <p className="mb-4 text-sm text-amber">
+                    Onay / red için önce <strong>Görüntüyü incele</strong> ile
+                    ilgili dilimi izleyin.
+                  </p>
+                ) : null}
+                {recordingId && offsetMs == null ? (
+                  <p className="mb-4 text-sm text-fog">
+                    Bu satış için video zaman damgası bulunamadı.
+                  </p>
+                ) : null}
                 <h3 className="font-display mb-2 text-base font-bold">Kanıtlar</h3>
                 {!evidence.length ? (
                   <EmptyState title="Kanıt kaydı yok" />

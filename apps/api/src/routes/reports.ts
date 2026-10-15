@@ -288,7 +288,7 @@ export function reportsRoutes(sql: Sql) {
           s.amount_cents != null ? Number(s.amount_cents) / 100 : null,
         status: String(s.status),
         productTitle: s.product_title != null ? String(s.product_title) : null,
-        soldAt: s.sold_at != null ? String(s.sold_at) : null,
+        soldAt: toIso(s.sold_at),
       })),
       eventCounts,
       transcriptSegmentCount: Number(tr?.n ?? 0),
@@ -298,7 +298,7 @@ export function reportsRoutes(sql: Sql) {
         status: String(j.status),
         progressPercent: Number(j.progress_percent ?? 0),
         stage: j.stage != null ? String(j.stage) : null,
-        finishedAt: j.finished_at != null ? String(j.finished_at) : null,
+        finishedAt: toIso(j.finished_at),
       })),
     };
 

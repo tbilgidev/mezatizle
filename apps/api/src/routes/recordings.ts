@@ -7,6 +7,9 @@ import {
   createLiveCapture,
   LIVE_CAPTURE_POLICY,
 } from "../modules/live_capture.ts";
+import { safeJoinStorage } from "../lib/storage.ts";
+import { streamFileWithRanges } from "../lib/media-stream.ts";
+import { probeAvSync } from "../lib/ffmpeg.ts";
 
 export function recordingsRoutes(sql: Sql, env: AppEnv) {
   const app = new Hono();
@@ -134,6 +137,39 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
       ORDER BY priority ASC
     `;
     return c.json({ jobs: rows });
+  });
+
+  /** Master MP4 — byte-range friendly for Kanıt / Raporlar seek (read-only). */
+  app.get("/:id/media", async (c) => {
+    const id = c.req.param("id");
+    const rows = await sql<{ storage_path: string }[]>`
+      SELECT storage_path FROM recordings WHERE id = ${id}
+    `;
+    if (!rows[0]) return c.json({ error: "Bulunamadı" }, 404);
+    try {
+      const abs = safeJoinStorage(env.storageRoot, rows[0].storage_path);
+      return streamFileWithRanges(abs, c.req.raw, "video/mp4");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
+  });
+
+  /** A/V sync diagnostic on master timeline. */
+  app.get("/:id/av-sync", async (c) => {
+    const id = c.req.param("id");
+    const rows = await sql<{ storage_path: string }[]>`
+      SELECT storage_path FROM recordings WHERE id = ${id}
+    `;
+    if (!rows[0]) return c.json({ error: "Bulunamadı" }, 404);
+    try {
+      const abs = safeJoinStorage(env.storageRoot, rows[0].storage_path);
+      const sync = await probeAvSync(env.ffprobePath, abs);
+      return c.json({ recordingId: id, sync });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
   });
 
   return app;
