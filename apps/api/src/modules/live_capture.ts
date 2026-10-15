@@ -721,16 +721,6 @@ async function startRecordingProcess(
   });
 }
 
-function pidAlive(pid: number | null | undefined): boolean {
-  if (pid == null || !Number.isFinite(pid) || pid <= 1) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function killCapturePid(pid: number | null | undefined) {
   if (!pidAlive(pid)) return;
   const p = Number(pid);
