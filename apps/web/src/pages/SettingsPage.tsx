@@ -54,10 +54,11 @@ export function SettingsPage() {
 
   async function onCookiesFile(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    const form = e.currentTarget;
     setBusy(true);
     setError(null);
     setOk(null);
-    const fd = new FormData(e.currentTarget);
+    const fd = new FormData(form);
     const file = fd.get("cookiesFile");
     try {
       if (!(file instanceof File) || !file.size) {
@@ -65,8 +66,12 @@ export function SettingsPage() {
       }
       const st = (await api.saveIgCookiesFile(file)) as unknown as IgSession;
       setIg(st);
-      setOk("Çerez oturumu kaydedildi (içerik bir daha gösterilmez).");
-      e.currentTarget.reset();
+      setOk(
+        st.hasCookies
+          ? "Çerez oturumu kaydedildi — durum: Yüklü (içerik bir daha gösterilmez)."
+          : "Çerez isteği tamamlandı; durumu kontrol edin.",
+      );
+      form.reset();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -76,17 +81,22 @@ export function SettingsPage() {
 
   async function onCookiesPaste(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    const form = e.currentTarget;
     setBusy(true);
     setError(null);
     setOk(null);
-    const fd = new FormData(e.currentTarget);
+    const fd = new FormData(form);
     try {
       const st = (await api.saveIgSessionJson({
         cookiesText: String(fd.get("cookiesText") ?? ""),
       })) as unknown as IgSession;
       setIg(st);
-      setOk("Yapıştırılan çerezler kaydedildi.");
-      e.currentTarget.reset();
+      setOk(
+        st.hasCookies
+          ? "Yapıştırılan çerezler kaydedildi — durum: Yüklü."
+          : "Çerez isteği tamamlandı; durumu kontrol edin.",
+      );
+      form.reset();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -96,17 +106,22 @@ export function SettingsPage() {
 
   async function onCookiesPath(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    const form = e.currentTarget;
     setBusy(true);
     setError(null);
     setOk(null);
-    const fd = new FormData(e.currentTarget);
+    const fd = new FormData(form);
     try {
       const st = (await api.saveIgSessionJson({
         cookiesPath: String(fd.get("cookiesPath") ?? ""),
       })) as unknown as IgSession;
       setIg(st);
-      setOk("Çerez dosya yolu okundu ve güvenli alana kopyalandı.");
-      e.currentTarget.reset();
+      setOk(
+        st.hasCookies
+          ? "Çerez dosya yolu okundu — durum: Yüklü."
+          : "Dosya yolu işlendi; durumu kontrol edin.",
+      );
+      form.reset();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -116,10 +131,11 @@ export function SettingsPage() {
 
   async function onCredentials(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    const form = e.currentTarget;
     setBusy(true);
     setError(null);
     setOk(null);
-    const fd = new FormData(e.currentTarget);
+    const fd = new FormData(form);
     try {
       const st = (await api.saveIgSessionJson({
         username: String(fd.get("username") ?? ""),
@@ -127,7 +143,7 @@ export function SettingsPage() {
       })) as unknown as IgSession;
       setIg(st);
       setOk("Kullanıcı/parola sunucuda şifreli saklandı (••••).");
-      e.currentTarget.reset();
+      form.reset();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

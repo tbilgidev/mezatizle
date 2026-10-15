@@ -29,4 +29,24 @@ Instagram giriş formu alan adlarını değiştirdi: artık çoğu zaman `input[
 
 ## Test notu (ferahsevecen)
 
-Playwright formu doldurdu; Instagram yanıtı: *“Girdiğin giriş bilgileri yanlış…”* → oturum **Yüklü olmadı**. Doğru parola veya cookies.txt gerekli.
+Playwright formu doldurdu; Instagram yanıtı: *“Girdiğin giriş bilgileri yanlış…”* → oturum **Yüklü olmadı**. Parola sunucuya tam iletildi (truncation yok).
+
+### Chrome’da giriyorsan ama Playwright başarısızsa
+
+Bu sık görülür. Chrome’daki **senin** oturumun (zaten geçmiş challenge / güvenilir cihaz) ile sunucudaki **yeni headless Chromium** aynı şey değil. Instagram otomasyona bazen sahte “yanlış parola” veya checkpoint döner — şifren Chrome’da doğru olsa bile.
+
+**Ne yap:** Chrome’da yedek hesapla açık oturumdayken Netscape **cookies.txt** dışa aktar → Ayarlar’dan yükle. yt-dlp bu çerezlerle yayın çeker; Playwright login’e gerek kalmaz.
+
+Chrome cookie alma (kısa):
+
+1. Chrome’da https://www.instagram.com — `ferahsevecen` ile girişli olduğundan emin ol  
+2. Eklenti: **Get cookies.txt LOCALLY** (veya eşdeğeri) → `instagram.com` → Export  
+3. https://tolga-mini.tailf479ba.ts.net/mezatizle/settings#ig-oturum → dosyayı yükle  
+4. Durum **Yüklü** olmalı → sonra 10 dk canlı test
+
+## Form reset bug (fixed)
+
+React: after `await`, `event.currentTarget` can be null — calling `.reset()` threw `can't access property "reset", tt.currentTarget is null` and looked like a failed cookie save even when the API succeeded.
+
+**Fix:** capture `const form = e.currentTarget` before any `await`, then `form.reset()` only on success. Clear Türkçe başarı mesajı: «durum: Yüklü».
+

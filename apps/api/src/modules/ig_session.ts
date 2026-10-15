@@ -182,6 +182,18 @@ export async function saveIgCookiesText(
   if (cookiesText.length > 2_000_000) {
     throw new Error("Çerez dosyası çok büyük");
   }
+  const hasSessionId = cookiesText
+    .split(/\r?\n/)
+    .some((line) => {
+      if (!line || line.startsWith("#")) return false;
+      const cols = line.split("\t");
+      return cols.length >= 7 && cols[5] === "sessionid" && Boolean(cols[6]?.trim());
+    });
+  if (!hasSessionId) {
+    throw new Error(
+      "cookies.txt içinde sessionid satırı yok. Instagram oturumu için sessionid gerekli.",
+    );
+  }
   const dir = await ensureSecretsDir(env);
   const path = join(dir, COOKIES_FILE);
   const tmp = `${path}.tmp`;
