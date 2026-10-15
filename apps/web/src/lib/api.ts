@@ -56,7 +56,10 @@ export type ReportListItem = {
 /** One sale candidate inside a recording report (sales-first detail). */
 export type ReportSale = {
   id: string;
+  productId: string | null;
   buyerUsername: string | null;
+  /** Spoken name when IG handle unknown. */
+  spokenBuyerName: string | null;
   amountCents: number | null;
   amountTry: number | null;
   status: string;
@@ -66,12 +69,13 @@ export type ReportSale = {
   soldAt: string | null;
   /** Frame / product still — absolute or same-origin URL. */
   thumbnailUrl: string | null;
-  /** How the sale was detected: transcript | ocr | comment | video | … */
+  /** How the sale was detected: saleMethod / transcript / ocr / … */
   detectionMethod: string | null;
   /** 0–1 confidence when API provides it. */
   confidence: number | null;
   /** Timeline offset in muxed recording (ms) for video seek. */
   offsetMs: number | null;
+  explanationTr: string | null;
 };
 
 export type ReportDetail = ReportListItem & {
@@ -95,10 +99,59 @@ export function resolveMediaUrl(path: string | null | undefined): string | null 
   if (!s) return null;
   if (/^(https?:|data:|blob:)/i.test(s)) return s;
   if (s.startsWith("/")) return url(s.startsWith("/api/") ? s : `/api${s}`);
+  // Storage key products/<uuid>.jpg → product image route when possible
+  const productMatch = s.match(/^products\/([0-9a-f-]{36})\.jpe?g$/i);
+  if (productMatch) return url(`/api/products/${productMatch[1]}/image`);
   return url(`/api/files/${s.replace(/^\/+/, "")}`);
 }
 
-/** Normalize report sale rows (camel or snake, optional fields from analysis worker). */
+/**
+ * Pull the sales array from whatever shape GET /api/reports/:id returns.
+ * Prefer `report.sales`; also accept nested `{ items|rows }` / top-level arrays.
+ */
+export function extractSalesArray(payload: unknown): Array<Record<string, unknown>> {
+  const asRows = (v: unknown): Array<Record<string, unknown>> | null => {
+    if (Array.isArray(v)) {
+      return v.filter((x) => x && typeof x === "object") as Array<
+        Record<string, unknown>
+      >;
+    }
+    if (v && typeof v === "object") {
+      const o = v as Record<string, unknown>;
+      if (Array.isArray(o.items)) return asRows(o.items);
+      if (Array.isArray(o.rows)) return asRows(o.rows);
+      if (Array.isArray(o.sales)) return asRows(o.sales);
+    }
+    return null;
+  };
+
+  if (!payload || typeof payload !== "object") return [];
+  const root = payload as Record<string, unknown>;
+  const report =
+    root.report && typeof root.report === "object"
+      ? (root.report as Record<string, unknown>)
+      : root;
+
+  const candidates = [
+    report.sales,
+    report.saleCandidates,
+    report.sale_candidates,
+    report.candidates,
+    report.items,
+    root.sales,
+  ];
+  for (const c of candidates) {
+    const rows = asRows(c);
+    if (rows && rows.length) return rows;
+  }
+  // Empty array is still valid (no sales) — distinguish from missing
+  for (const c of candidates) {
+    if (Array.isArray(c)) return [];
+  }
+  return [];
+}
+
+/** Normalize report sale rows (camel or snake, optional nested product_attributes). */
 export function normalizeReportSale(raw: Record<string, unknown>): ReportSale {
   const num = (v: unknown): number | null => {
     if (v == null || v === "") return null;
@@ -110,29 +163,55 @@ export function normalizeReportSale(raw: Record<string, unknown>): ReportSale {
     const s = String(v).trim();
     return s.length ? s : null;
   };
+
+  const attrsRaw =
+    raw.productAttributes ??
+    raw.product_attributes ??
+    raw.attributes ??
+    null;
+  const attrs =
+    attrsRaw && typeof attrsRaw === "object" && !Array.isArray(attrsRaw)
+      ? (attrsRaw as Record<string, unknown>)
+      : null;
+
+  const productId = str(raw.productId ?? raw.product_id);
+
   const amountCents = num(raw.amountCents ?? raw.amount_cents);
   const amountTryDirect = num(raw.amountTry ?? raw.amount_try);
   const amountTry =
     amountTryDirect ?? (amountCents != null ? amountCents / 100 : null);
-  let confidence = num(raw.confidence ?? raw.avgConfidence ?? raw.avg_confidence);
+
+  let confidence =
+    num(raw.confidence ?? raw.avgConfidence ?? raw.avg_confidence) ??
+    num(attrs?.confidence);
   if (confidence != null && confidence > 1) confidence = confidence / 100;
 
-  const thumbRaw = str(
-    raw.thumbnailUrl ??
-      raw.thumbnail_url ??
-      raw.thumbUrl ??
-      raw.thumb_url ??
-      raw.frameUrl ??
-      raw.frame_url ??
-      raw.imageUrl ??
-      raw.image_url ??
-      raw.imagePath ??
-      raw.image_path,
-  );
+  const thumbRaw =
+    str(
+      raw.thumbnailUrl ??
+        raw.thumbnail_url ??
+        raw.thumbUrl ??
+        raw.thumb_url ??
+        raw.frameUrl ??
+        raw.frame_url ??
+        raw.imageUrl ??
+        raw.image_url ??
+        raw.imagePath ??
+        raw.image_path ??
+        attrs?.imagePath ??
+        attrs?.image_path ??
+        attrs?.thumbnailUrl,
+    ) ?? (productId ? `/api/products/${productId}/image` : null);
 
   return {
     id: String(raw.id ?? ""),
+    productId,
     buyerUsername: str(raw.buyerUsername ?? raw.buyer_username),
+    spokenBuyerName: str(
+      raw.spokenBuyerName ??
+        raw.spoken_buyer_name ??
+        attrs?.spokenBuyerName,
+    ),
     amountCents,
     amountTry,
     status: String(raw.status ?? "candidate"),
@@ -141,20 +220,27 @@ export function normalizeReportSale(raw: Record<string, unknown>): ReportSale {
       raw.productDescription ??
         raw.product_description ??
         raw.description ??
-        raw.product_blurb,
+        raw.product_blurb ??
+        raw.explanationTr,
     ),
     soldAt: str(raw.soldAt ?? raw.sold_at),
     thumbnailUrl: resolveMediaUrl(thumbRaw),
     detectionMethod: str(
-      raw.detectionMethod ??
+      raw.saleMethod ??
+        raw.sale_method ??
+        raw.detectionMethod ??
         raw.detection_method ??
         raw.method ??
         raw.source ??
+        attrs?.saleMethod ??
         raw.evidenceSource ??
         raw.evidence_source,
     ),
     confidence,
-    offsetMs: num(raw.offsetMs ?? raw.offset_ms ?? raw.seekMs ?? raw.seek_ms),
+    offsetMs:
+      num(raw.offsetMs ?? raw.offset_ms ?? raw.seekMs ?? raw.seek_ms) ??
+      num(attrs?.offsetMs),
+    explanationTr: str(raw.explanationTr ?? raw.explanation_tr),
   };
 }
 
@@ -191,15 +277,18 @@ export const api = {
       };
     }>("/api/reports"),
   report: async (recordingId: string) => {
-    const d = await request<{ report: ReportDetail & { sales?: Array<Record<string, unknown>> } }>(
+    const d = await request<Record<string, unknown>>(
       `/api/reports/${recordingId}`,
     );
+    const reportObj =
+      d.report && typeof d.report === "object"
+        ? (d.report as Record<string, unknown>)
+        : d;
+    const sales = extractSalesArray(d).map((s) => normalizeReportSale(s));
     return {
       report: {
-        ...d.report,
-        sales: (d.report.sales ?? []).map((s) =>
-          normalizeReportSale(s as Record<string, unknown>),
-        ),
+        ...(reportObj as unknown as ReportDetail),
+        sales,
       } satisfies ReportDetail,
     };
   },

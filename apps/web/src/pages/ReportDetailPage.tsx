@@ -43,6 +43,9 @@ const METHOD_TR: Record<string, string> = {
   bid: "Teklif",
   auction_event: "Olay",
   manual: "Elle",
+  seller_aldim: "Satıcı «aldım»",
+  seller_sold: "Satıcı «satıldı»",
+  buyer_bid: "Alıcı teklifi",
 };
 
 function methodTr(raw: string | null | undefined): string {
@@ -327,15 +330,19 @@ export function ReportDetailPage() {
                         <td className="py-3 pr-3">
                           <button
                             type="button"
-                            className="max-w-[16rem] text-left"
+                            className="max-w-[18rem] text-left"
                             onClick={() => void openEvidencePlayer(s)}
                           >
                             <div className="font-semibold text-paper">
                               {productLabel}
                             </div>
-                            {s.productDescription &&
-                            s.productTitle &&
-                            s.productDescription !== s.productTitle ? (
+                            {s.explanationTr ? (
+                              <div className="mt-0.5 line-clamp-2 text-xs text-fog">
+                                {s.explanationTr}
+                              </div>
+                            ) : s.productDescription &&
+                              s.productTitle &&
+                              s.productDescription !== s.productTitle ? (
                               <div className="mt-0.5 line-clamp-2 text-xs text-fog">
                                 {s.productDescription}
                               </div>
@@ -352,6 +359,10 @@ export function ReportDetailPage() {
                           {s.buyerUsername ? (
                             <span className="font-semibold text-mint">
                               @{s.buyerUsername.replace(/^@/, "")}
+                            </span>
+                          ) : s.spokenBuyerName ? (
+                            <span className="text-fog" title="Konuşulan isim">
+                              {s.spokenBuyerName}
                             </span>
                           ) : (
                             <span className="text-fog">Bilinmiyor</span>
