@@ -693,12 +693,18 @@ async function startRecordingProcess(
   const startedAt = Date.now();
   const sizeTimer = setInterval(() => {
     void (async () => {
-      const bytes = await fileSize(partAbs);
-      await sql`
-        UPDATE recordings
-        SET capture_bytes = ${bytes}, file_size_bytes = ${bytes}, updated_at = now()
-        WHERE id = ${recordingId}
-      `;
+      // Prefer part while recording; never overwrite DB with 0 after rename/finalize
+      const partBytes = await fileSize(partAbs);
+      const destBytes = await fileSize(destAbs);
+      const bytes = partBytes > 0 ? partBytes : destBytes;
+      if (bytes > 0) {
+        await sql`
+          UPDATE recordings
+          SET capture_bytes = ${bytes}, file_size_bytes = ${bytes}, updated_at = now()
+          WHERE id = ${recordingId}
+            AND status IN ('recording', 'awaiting_live')
+        `;
+      }
       const overBytes = bytes >= maxBytes;
       const overTime =
         maxDurationSeconds != null &&

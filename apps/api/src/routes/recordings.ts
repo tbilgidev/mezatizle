@@ -11,6 +11,7 @@ import {
 import { safeJoinStorage } from "../lib/storage.ts";
 import { streamFileWithRanges } from "../lib/media-stream.ts";
 import { probeAvSync } from "../lib/ffmpeg.ts";
+import { enrichRecordingRow } from "../lib/recording-enrich.ts";
 
 export function recordingsRoutes(sql: Sql, env: AppEnv) {
   const app = new Hono();
@@ -26,14 +27,24 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
       ORDER BY r.uploaded_at DESC
       LIMIT 200
     `;
-    // Prefer explicit capture_error for UI; fall back to probe detail
-    const recordings = rows.map((r) => ({
-      ...r,
-      lastError:
-        (r.capture_error as string | null) ??
-        (r.last_probe_detail as string | null) ??
-        null,
-    }));
+    // Prefer explicit capture_error for UI; fall back to probe detail.
+    // Heal file_size_bytes from finalized MP4 on disk (sizeTimer can race to 0).
+    const recordings = await Promise.all(
+      rows.map(async (r) => {
+        const enriched = await enrichRecordingRow(
+          env,
+          sql,
+          r as Record<string, unknown>,
+        );
+        return {
+          ...enriched,
+          lastError:
+            (enriched.capture_error as string | null) ??
+            (enriched.last_probe_detail as string | null) ??
+            null,
+        };
+      }),
+    );
     return c.json({ recordings });
   });
 
@@ -108,7 +119,12 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
       FROM processing_jobs WHERE recording_id = ${id}
       ORDER BY priority ASC, created_at ASC
     `;
-    return c.json({ recording: rows[0], jobs });
+    const recording = await enrichRecordingRow(
+      env,
+      sql,
+      rows[0] as Record<string, unknown>,
+    );
+    return c.json({ recording, jobs });
   });
 
   app.post("/upload", async (c) => {
