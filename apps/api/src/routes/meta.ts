@@ -3,7 +3,10 @@ import type { Sql } from "@mezatizle/db";
 import { MODULES } from "@mezatizle/shared";
 import type { AppEnv } from "../lib/env.ts";
 import { totalSpendUsd } from "../lib/cost.ts";
-import { LIVE_CAPTURE_POLICY } from "../modules/live_capture.ts";
+import {
+  LIVE_CAPTURE_POLICY,
+  getLiveSupervisorHealth,
+} from "../modules/live_capture.ts";
 import {
   clearIgSession,
   getIgSessionStatus,
@@ -18,9 +21,31 @@ const CAPTURE_POLICY = LIVE_CAPTURE_POLICY;
 export function metaRoutes(sql: Sql, env: AppEnv) {
   const app = new Hono();
 
-  app.get("/health", (c) =>
-    c.json({ ok: true, service: "mezatizle-api", profile: env.profile.profile }),
-  );
+  app.get("/health", async (c) => {
+    const supervisor = getLiveSupervisorHealth();
+    const [liveCounts] = await sql<{
+      waiting: string;
+      recording: string;
+      blocked: string;
+    }[]>`
+      SELECT
+        COUNT(*) FILTER (WHERE status IN ('pending','waiting'))::text AS waiting,
+        COUNT(*) FILTER (WHERE status = 'recording')::text AS recording,
+        COUNT(*) FILTER (WHERE status = 'blocked')::text AS blocked
+      FROM live_captures
+    `;
+    return c.json({
+      ok: true,
+      service: "mezatizle-api",
+      profile: env.profile.profile,
+      liveSupervisor: supervisor,
+      liveSessions: {
+        waiting: Number(liveCounts?.waiting ?? 0),
+        recording: Number(liveCounts?.recording ?? 0),
+        blocked: Number(liveCounts?.blocked ?? 0),
+      },
+    });
+  });
 
   app.get("/settings", async (c) => {
     const spent = await totalSpendUsd(sql);

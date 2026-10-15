@@ -131,10 +131,15 @@ export async function probePublicLive(
     low.includes("consent") ||
     low.includes("http error 401") ||
     low.includes("http error 403") ||
+    low.includes("session expired") ||
+    (low.includes("cookie") &&
+      (low.includes("expired") || low.includes("invalid"))) ||
+    low.includes("please log in") ||
+    low.includes("not authorized") ||
     (low.includes("cookies") && r.code !== 0)
   ) {
     const detail = auth.length
-      ? "Instagram erişim engeli — yedek oturum/çerezler geçersiz veya yetersiz olabilir (Ayarlar → Instagram oturumu)."
+      ? "Instagram erişim engellendi — yedek oturum/çerezler geçersiz veya süresi dolmuş olabilir (Ayarlar → Instagram oturumu → cookies.txt yenileyin)."
       : "Instagram giriş veya erişim engeli — Ayarlar → Instagram oturumu altına yedek hesap çerezlerini ekleyin.";
     await setIgSessionLastError(env, detail);
     return {
@@ -235,15 +240,91 @@ export async function createLiveCapture(
     )
   `;
 
+  // Immediate first probe so UI is not stuck on silent "bekleniyor" until tick
+  const first = await probePublicLive(env, parsed.watchUrl);
+  let captureStatus: string = "bekleniyor";
+  let lastError: string | null = first.ok ? null : first.detail;
+  if (first.ok) {
+    await setIgSessionLastError(env, null);
+    await sql`
+      UPDATE live_captures
+      SET attempt_count = 1, last_probe_at = now(),
+          last_probe_detail = ${first.detail}, updated_at = now()
+      WHERE recording_id = ${id}
+    `;
+    // Kick recording ASAP (supervisor will no-op if already active)
+    void startRecordingProcess(
+      sql,
+      env,
+      id,
+      parsed.watchUrl,
+      destAbs,
+      maxBytes,
+      maxDurationMinutes,
+    );
+  } else if (first.kind === "blocked") {
+    captureStatus = "engellendi";
+    await sql`
+      UPDATE live_captures
+      SET status = 'blocked', attempt_count = 1, last_probe_at = now(),
+          last_probe_detail = ${first.detail}, updated_at = now()
+      WHERE recording_id = ${id}
+    `;
+    await sql`
+      UPDATE recordings
+      SET capture_status = 'engellendi', capture_error = ${first.detail},
+          updated_at = now()
+      WHERE id = ${id}
+    `;
+  } else {
+    await sql`
+      UPDATE live_captures
+      SET attempt_count = 1, last_probe_at = now(),
+          last_probe_detail = ${first.detail}, updated_at = now()
+      WHERE recording_id = ${id}
+    `;
+    await sql`
+      UPDATE recordings
+      SET capture_error = ${first.detail}, updated_at = now()
+      WHERE id = ${id}
+    `;
+  }
+
   return {
     recordingId: id,
     username: parsed.username,
     watchUrl: parsed.watchUrl,
-    captureStatus: "bekleniyor",
+    captureStatus,
+    lastError,
+    lastProbeDetail: first.detail,
     maxDurationMinutes,
     quality: CAPTURE_QUALITY,
     policy: LIVE_CAPTURE_POLICY,
   };
+}
+
+/** After cookies refresh: move blocked session back to waiting. */
+export async function resumeBlockedLiveCapture(sql: Sql, recordingId: string) {
+  const rows = await sql<{ status: string }[]>`
+    SELECT status FROM live_captures WHERE recording_id = ${recordingId}
+  `;
+  if (!rows[0]) throw new Error("Canlı oturum bulunamadı");
+  if (rows[0].status !== "blocked" && rows[0].status !== "not_found") {
+    throw new Error(`Oturum durumu yeniden denemeye uygun değil (${rows[0].status})`);
+  }
+  await sql`
+    UPDATE live_captures
+    SET status = 'waiting', last_probe_detail = ${"Yeniden deneniyor (çerez/oturum güncellendi)"},
+        updated_at = now()
+    WHERE recording_id = ${recordingId}
+  `;
+  await sql`
+    UPDATE recordings
+    SET status = 'awaiting_live', capture_status = 'bekleniyor',
+        capture_error = NULL, error_message = NULL, updated_at = now()
+    WHERE id = ${recordingId}
+  `;
+  return { ok: true, captureStatus: "bekleniyor" as const };
 }
 
 export async function cancelLiveCapture(sql: Sql, recordingId: string) {
@@ -359,9 +440,10 @@ async function startRecordingProcess(
 
   const resolved = await resolveStreamInput(env, watchUrl);
   if ("error" in resolved) {
+    const blocked = resolved.kind === "blocked";
     await sql`
       UPDATE live_captures
-      SET status = 'waiting',
+      SET status = ${blocked ? "blocked" : "waiting"},
           last_probe_detail = ${resolved.error},
           updated_at = now()
       WHERE recording_id = ${recordingId}
@@ -369,13 +451,14 @@ async function startRecordingProcess(
     await sql`
       UPDATE recordings
       SET status = 'awaiting_live',
-          capture_status = ${resolved.kind === "blocked" ? "engellendi" : "bekleniyor"},
+          capture_status = ${blocked ? "engellendi" : "bekleniyor"},
           capture_error = ${resolved.error},
           updated_at = now()
       WHERE id = ${recordingId}
     `;
-    if (resolved.kind === "blocked") {
+    if (blocked) {
       await setIgSessionLastError(env, resolved.error);
+      console.warn(`[live-capture] stream URL blocked ${recordingId}: ${resolved.error}`);
     }
     return;
   }
@@ -637,10 +720,15 @@ async function tickCapture(sql: Sql, env: AppEnv, row: {
         AND status IN ('awaiting_live', 'recording')
     `;
     if (probe.kind === "blocked") {
+      // Stop silent retries — surface engellendi until operator refreshes cookies
       await sql`
-        UPDATE live_captures SET status = 'waiting', updated_at = now()
+        UPDATE live_captures
+        SET status = 'blocked',
+            last_probe_detail = ${probe.detail},
+            updated_at = now()
         WHERE recording_id = ${recordingId}
       `;
+      console.warn(`[live-capture] blocked ${recordingId}: ${probe.detail}`);
     }
     return;
   }
@@ -663,9 +751,28 @@ async function tickCapture(sql: Sql, env: AppEnv, row: {
   );
 }
 
+let supervisorStartedAt: string | null = null;
+let supervisorTickCount = 0;
+let supervisorLastTickAt: string | null = null;
+let supervisorLastError: string | null = null;
+
+export function getLiveSupervisorHealth() {
+  return {
+    enabled: process.env.LIVE_CAPTURE_SUPERVISOR !== "0",
+    loopStarted,
+    startedAt: supervisorStartedAt,
+    tickCount: supervisorTickCount,
+    lastTickAt: supervisorLastTickAt,
+    lastError: supervisorLastError,
+    activeRecordings: activeProcs.size,
+    probeIntervalMs: probeIntervalMs(),
+  };
+}
+
 export async function liveCaptureLoop(sql: Sql, env: AppEnv) {
   if (loopStarted) return;
   loopStarted = true;
+  supervisorStartedAt = new Date().toISOString();
   console.log("[live-capture] supervisor started");
 
   // Resume waiting sessions after restart
@@ -682,6 +789,9 @@ export async function liveCaptureLoop(sql: Sql, env: AppEnv) {
 
   for (;;) {
     try {
+      supervisorTickCount += 1;
+      supervisorLastTickAt = new Date().toISOString();
+      supervisorLastError = null;
       const rows = await sql<{
         recording_id: string;
         watch_url: string;
@@ -702,6 +812,7 @@ export async function liveCaptureLoop(sql: Sql, env: AppEnv) {
         await tickCapture(sql, env, row);
       }
     } catch (err) {
+      supervisorLastError = err instanceof Error ? err.message : String(err);
       console.error("[live-capture] tick error", err);
     }
     await Bun.sleep(probeIntervalMs());

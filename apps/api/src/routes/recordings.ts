@@ -5,6 +5,7 @@ import { createRecordingFromUpload } from "../modules/ingestion.ts";
 import {
   cancelLiveCapture,
   createLiveCapture,
+  resumeBlockedLiveCapture,
   LIVE_CAPTURE_POLICY,
 } from "../modules/live_capture.ts";
 import { safeJoinStorage } from "../lib/storage.ts";
@@ -17,14 +18,23 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
   app.get("/", async (c) => {
     const rows = await sql`
       SELECT r.*, s.instagram_username, s.display_name,
-             lc.status AS live_status, lc.attempt_count, lc.last_probe_detail
+             lc.status AS live_status, lc.attempt_count, lc.last_probe_detail,
+             lc.last_probe_at, lc.last_probe_detail AS last_error
       FROM recordings r
       JOIN sellers s ON s.id = r.seller_id
       LEFT JOIN live_captures lc ON lc.recording_id = r.id
       ORDER BY r.uploaded_at DESC
       LIMIT 200
     `;
-    return c.json({ recordings: rows });
+    // Prefer explicit capture_error for UI; fall back to probe detail
+    const recordings = rows.map((r) => ({
+      ...r,
+      lastError:
+        (r.capture_error as string | null) ??
+        (r.last_probe_detail as string | null) ??
+        null,
+    }));
+    return c.json({ recordings });
   });
 
   app.post("/live", async (c) => {
@@ -65,6 +75,18 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
     const id = c.req.param("id");
     try {
       const result = await cancelLiveCapture(sql, id);
+      return c.json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
+  });
+
+  /** After refreshing IG cookies: blocked/not_found → waiting again. */
+  app.post("/:id/retry-live", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const result = await resumeBlockedLiveCapture(sql, id);
       return c.json(result);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
