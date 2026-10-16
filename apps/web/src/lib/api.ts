@@ -421,6 +421,30 @@ export const api = {
     request<{ ok: boolean }>(`/api/recordings/${id}/cancel-live`, {
       method: "POST",
     }),
+  /** Soft cascade delete one recording (+ derived analysis / storage). */
+  deleteRecording: (id: string) =>
+    request<{
+      ok: boolean;
+      recordingId: string;
+      deleted: boolean;
+      orphanSellersRemoved?: string[];
+    }>(`/api/recordings/${id}`, { method: "DELETE" }),
+  /** Batch delete — prefer this for multi-select. */
+  bulkDeleteRecordings: (ids: string[]) =>
+    request<{
+      ok: boolean;
+      deletedCount: number;
+      orphanSellersRemoved?: string[];
+      results?: Array<{
+        recordingId: string;
+        deleted: boolean;
+        error?: string;
+      }>;
+    }>("/api/recordings/bulk-delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }),
   igSession: () =>
     request<{
       status: string;
