@@ -12,6 +12,11 @@ import { safeJoinStorage } from "../lib/storage.ts";
 import { streamFileWithRanges } from "../lib/media-stream.ts";
 import { probeAvSync } from "../lib/ffmpeg.ts";
 import { enrichRecordingRow } from "../lib/recording-enrich.ts";
+import {
+  bulkDeleteRecordings,
+  deleteRecording,
+  deleteOrphanSellers,
+} from "../modules/recording-delete.ts";
 
 export function recordingsRoutes(sql: Sql, env: AppEnv) {
   const app = new Hono();
@@ -46,6 +51,35 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
       }),
     );
     return c.json({ recordings });
+  });
+
+  /** Bulk delete — register before /:id so path is not swallowed. */
+  app.post("/bulk-delete", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      ids?: unknown;
+    };
+    const ids = Array.isArray(body.ids)
+      ? body.ids.map((x) => String(x)).filter(Boolean)
+      : [];
+    if (!ids.length) {
+      return c.json({ error: "ids dizisi gerekli" }, 400);
+    }
+    if (ids.length > 200) {
+      return c.json({ error: "En fazla 200 kayıt silinebilir" }, 400);
+    }
+    try {
+      const result = await bulkDeleteRecordings(sql, env, ids);
+      const deletedCount = result.deleted.filter((d) => d.deleted).length;
+      return c.json({
+        ok: true,
+        deletedCount,
+        orphanSellersRemoved: result.orphanSellersRemoved,
+        results: result.deleted,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 500);
+    }
   });
 
   app.post("/live", async (c) => {
@@ -125,6 +159,25 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
       rows[0] as Record<string, unknown>,
     );
     return c.json({ recording, jobs });
+  });
+
+  app.delete("/:id", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const result = await deleteRecording(sql, env, id);
+      if (!result.deleted) {
+        return c.json({ error: "Bulunamadı", ...result }, 404);
+      }
+      const orphanSellersRemoved = await deleteOrphanSellers(sql);
+      return c.json({
+        ok: true,
+        ...result,
+        orphanSellersRemoved,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 500);
+    }
   });
 
   app.post("/upload", async (c) => {
