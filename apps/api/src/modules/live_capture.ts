@@ -545,8 +545,35 @@ export async function createLiveCapture(
     )
   `;
 
-  // Immediate first probe so UI is not stuck on silent "bekleniyor" until tick
-  const first = await probePublicLive(env, parsed.watchUrl);
+  // Immediate first probe — hard timeout so POST never hangs (supervisor continues).
+  const FIRST_PROBE_MS = 55_000;
+  let first: ProbeResult;
+  try {
+    first = await Promise.race([
+      probePublicLive(env, parsed.watchUrl),
+      new Promise<ProbeResult>((resolve) => {
+        setTimeout(
+          () =>
+            resolve({
+              ok: false,
+              kind: "error",
+              detail:
+                "İlk probe zaman aşımı — supervisor yeniden deneyecek (bekleniyor).",
+            }),
+          FIRST_PROBE_MS,
+        );
+      }),
+    ]);
+  } catch (err) {
+    first = {
+      ok: false,
+      kind: "error",
+      detail:
+        err instanceof Error
+          ? err.message.slice(0, 200)
+          : "İlk probe hatası — supervisor yeniden deneyecek.",
+    };
+  }
   let captureStatus: string = "bekleniyor";
   let lastError: string | null = first.ok ? null : first.detail;
   if (first.ok) {

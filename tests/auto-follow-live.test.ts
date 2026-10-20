@@ -76,6 +76,13 @@ describe("parseReelsTrayLives", () => {
     expect(lives.some((l) => l.username === "ended_live")).toBe(false);
   });
 
+  test("parses /live/ href paths from html", () => {
+    const html = `<a href="/afra.vintagetaki/live/">Live</a> https://www.instagram.com/other_shop/live/?broadcast_id=1`;
+    const lives = parseHtmlLiveSignals(html);
+    expect(lives.some((l) => l.username === "afra.vintagetaki")).toBe(true);
+    expect(lives.some((l) => l.username === "other_shop")).toBe(true);
+  });
+
   test("parses html live_broadcast_id pairs", () => {
     const html = `"username":"demo_shop","foo":1,"live_broadcast_id":"12345678901234567"`;
     const lives = parseHtmlLiveSignals(html);

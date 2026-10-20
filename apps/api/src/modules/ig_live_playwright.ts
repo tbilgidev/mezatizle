@@ -6,7 +6,7 @@
  */
 import { access, readFile } from "node:fs/promises";
 import type { AppEnv } from "../lib/env.ts";
-import { resolveCookiesPath } from "./ig_session.ts";
+import { resolveCookiesPath, setIgSessionCookieUsername } from "./ig_session.ts";
 
 export type LiveResolveOk = {
   ok: true;
@@ -516,6 +516,7 @@ export async function whoamiIgCookies(
       return j?.form_data?.username ?? null;
     });
     if (!username) return { ok: false, detail: "Kullanıcı adı alınamadı" };
+    await setIgSessionCookieUsername(env, username);
     return { ok: true, username };
   } catch (err) {
     return {

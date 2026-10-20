@@ -210,7 +210,28 @@ export function parseHtmlLiveSignals(text: string): FollowingLive[] {
   for (const m of text.matchAll(re2)) {
     pushLive(map, m[2], m[1]);
   }
+  // href="/user/live/" or full URL — tray HTML sometimes only exposes the path
+  const re3 =
+    /(?:instagram\.com|href=["'])\/([A-Za-z0-9._]{1,30})\/live\/?(?:\?[^"'<\s]*)?/gi;
+  for (const m of text.matchAll(re3)) {
+    pushLive(map, m[1], null);
+  }
   return [...map.values()];
+}
+
+/** Normalize operator-configured priority usernames (tray-miss fallback). */
+export function normalizePriorityUsernames(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const x of raw) {
+    if (typeof x !== "string") continue;
+    const u = x.trim().replace(/^@/, "").toLowerCase();
+    if (!/^[a-z0-9._]{1,30}$/.test(u) || seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+  }
+  return out.slice(0, 40);
 }
 
 let pollInFlight: Promise<FollowingLivesPollResult> | null = null;
@@ -220,6 +241,7 @@ let pollInFlight: Promise<FollowingLivesPollResult> | null = null;
  */
 export async function pollFollowingLives(
   env: AppEnv,
+  opts?: { priorityUsernames?: string[] },
 ): Promise<FollowingLivesPollResult> {
   if (pollInFlight) {
     try {
@@ -228,7 +250,7 @@ export async function pollFollowingLives(
       /* fall through to new poll */
     }
   }
-  const run = doPollFollowingLives(env);
+  const run = doPollFollowingLives(env, opts);
   pollInFlight = run.finally(() => {
     pollInFlight = null;
   });
@@ -237,6 +259,7 @@ export async function pollFollowingLives(
 
 async function doPollFollowingLives(
   env: AppEnv,
+  opts?: { priorityUsernames?: string[] },
 ): Promise<FollowingLivesPollResult> {
   const cookiesFile = await resolveCookiesPath(env);
   if (!cookiesFile) {
@@ -381,6 +404,61 @@ async function doPollFollowingLives(
       source = map.size && source === "reels_tray" ? "mixed" : "html_signals";
     }
 
+    // Tray often omits some followed lives. Profile-probe priority usernames
+    // (operator watchlist + recent lastLivesSeen) in the same browser session.
+    const priority = normalizePriorityUsernames(opts?.priorityUsernames);
+    const missingPriority = priority.filter((u) => !map.has(u)).slice(0, 12);
+    if (missingPriority.length) {
+      const probed = await page.evaluate(async (usernames: string[]) => {
+        const csrf =
+          document.cookie
+            .split(";")
+            .map((s) => s.trim())
+            .find((s) => s.startsWith("csrftoken="))
+            ?.split("=")[1] || "";
+        const headers: Record<string, string> = {
+          "X-IG-App-ID": "936619743392459",
+          "X-Requested-With": "XMLHttpRequest",
+          "X-CSRFToken": csrf,
+          Accept: "*/*",
+        };
+        const out: Array<{
+          username: string;
+          broadcastId: string | null;
+          status: number;
+        }> = [];
+        for (const uname of usernames) {
+          try {
+            const r = await fetch(
+              `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(uname)}`,
+              { credentials: "include", headers },
+            );
+            const j = (await r.json().catch(() => null)) as {
+              data?: { user?: { live_broadcast_id?: string | null } };
+            } | null;
+            const bid = j?.data?.user?.live_broadcast_id;
+            out.push({
+              username: uname,
+              broadcastId:
+                typeof bid === "string" && /^\d{5,}$/.test(bid) ? bid : null,
+              status: r.status,
+            });
+          } catch {
+            out.push({ username: uname, broadcastId: null, status: 0 });
+          }
+        }
+        return out;
+      }, missingPriority);
+      for (const p of probed) {
+        if (p.status === 429) rateLimited = true;
+        if (p.status === 401 || p.status === 403) blocked = true;
+        if (p.broadcastId) {
+          pushLive(map, p.username, p.broadcastId);
+          source = "mixed";
+        }
+      }
+    }
+
     if (!map.size && rateLimited) {
       return {
         ok: false,
@@ -400,6 +478,7 @@ async function doPollFollowingLives(
     const lives = [...map.values()].sort((a, b) =>
       a.username.localeCompare(b.username),
     );
+    const viaPriority = lives.filter((l) => priority.includes(l.username));
     return {
       ok: true,
       lives,
@@ -407,7 +486,10 @@ async function doPollFollowingLives(
       detail:
         lives.length === 0
           ? "Takip edilenlerde aktif canlı yok (veya tepside görünmüyor)."
-          : `${lives.length} takip canlısı: ${lives.map((l) => l.username).join(", ")}`,
+          : `${lives.length} takip canlısı: ${lives.map((l) => l.username).join(", ")}` +
+            (viaPriority.length
+              ? ` (öncelik profil: ${viaPriority.map((l) => l.username).join(", ")})`
+              : ""),
     };
   } catch (err) {
     return {

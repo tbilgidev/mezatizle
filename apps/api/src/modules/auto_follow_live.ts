@@ -18,10 +18,19 @@ import {
   pollFollowingLives,
   type FollowingLive,
 } from "./ig_following_lives.ts";
-import { extractBroadcastIdFromUrl } from "./ig_live_playwright.ts";
-import { getIgSessionStatus } from "./ig_session.ts";
+import {
+  extractBroadcastIdFromUrl,
+  whoamiIgCookies,
+} from "./ig_live_playwright.ts";
+import {
+  getIgCookieUsername,
+  getIgSessionStatus,
+} from "./ig_session.ts";
+import { normalizePriorityUsernames } from "./ig_following_lives.ts";
 
 const CONFIG_FILE = "auto-follow-live.json";
+/** Default sellers to profile-probe when reels_tray omits their live ring. */
+const DEFAULT_PRIORITY_USERNAMES = ["afra.vintagetaki"];
 
 /** Min / max / default IG poll interval (5–6 minutes). */
 export const POLL_MS_MIN = 300_000;
@@ -34,6 +43,8 @@ export type AutoFollowLiveConfig = {
   enabled: boolean;
   pollIntervalMs: number;
   updatedAt: string | null;
+  /** Extra usernames to profile-check when tray misses a live. */
+  priorityUsernames: string[];
 };
 
 export type AutoFollowWatching = {
@@ -62,6 +73,8 @@ export type AutoFollowLiveStatus = {
   labelTr: string;
   hintTr: string;
   cookiesReady: boolean;
+  /** Cookie-session watcher (@username), when known. */
+  watcherUsername: string | null;
 };
 
 type PersistState = AutoFollowLiveConfig & {
@@ -70,6 +83,7 @@ type PersistState = AutoFollowLiveConfig & {
   lastError?: string | null;
   lastDetail?: string | null;
   lastLivesSeen?: Array<{ username: string; broadcastId: string | null }>;
+  priorityUsernames?: string[];
 };
 
 function configPath(env: AppEnv) {
@@ -114,10 +128,27 @@ async function ensureConfigDir(env: AppEnv) {
   return dir;
 }
 
+function mergePriorityUsernames(
+  configured: unknown,
+  lastLivesSeen?: Array<{ username: string; broadcastId: string | null }>,
+): string[] {
+  const fromConfig = normalizePriorityUsernames(configured);
+  const fromDefault = normalizePriorityUsernames(DEFAULT_PRIORITY_USERNAMES);
+  const fromRecent = normalizePriorityUsernames(
+    (lastLivesSeen ?? []).map((l) => l.username),
+  );
+  return normalizePriorityUsernames([
+    ...fromConfig,
+    ...fromDefault,
+    ...fromRecent,
+  ]);
+}
+
 async function loadPersist(env: AppEnv): Promise<PersistState> {
   try {
     const raw = await readFile(configPath(env), "utf8");
     const j = JSON.parse(raw) as Partial<PersistState>;
+    const lastLivesSeen = Array.isArray(j.lastLivesSeen) ? j.lastLivesSeen : [];
     return {
       enabled: typeof j.enabled === "boolean" ? j.enabled : defaultEnabled(),
       pollIntervalMs:
@@ -129,7 +160,11 @@ async function loadPersist(env: AppEnv): Promise<PersistState> {
       lastPollOk: j.lastPollOk ?? null,
       lastError: j.lastError ?? null,
       lastDetail: j.lastDetail ?? null,
-      lastLivesSeen: Array.isArray(j.lastLivesSeen) ? j.lastLivesSeen : [],
+      lastLivesSeen,
+      priorityUsernames: mergePriorityUsernames(
+        j.priorityUsernames,
+        lastLivesSeen,
+      ),
     };
   } catch {
     return {
@@ -141,6 +176,7 @@ async function loadPersist(env: AppEnv): Promise<PersistState> {
       lastError: null,
       lastDetail: null,
       lastLivesSeen: [],
+      priorityUsernames: mergePriorityUsernames(null),
     };
   }
 }
@@ -250,12 +286,17 @@ export async function getAutoFollowLiveConfig(
     enabled: s.enabled,
     pollIntervalMs: s.pollIntervalMs,
     updatedAt: s.updatedAt,
+    priorityUsernames: s.priorityUsernames ?? mergePriorityUsernames(null),
   };
 }
 
 export async function setAutoFollowLiveConfig(
   env: AppEnv,
-  patch: { enabled?: boolean; pollIntervalMs?: number },
+  patch: {
+    enabled?: boolean;
+    pollIntervalMs?: number;
+    priorityUsernames?: string[];
+  },
 ): Promise<AutoFollowLiveStatus> {
   const cur = await loadPersist(env);
   if (typeof patch.enabled === "boolean") cur.enabled = patch.enabled;
@@ -264,6 +305,9 @@ export async function setAutoFollowLiveConfig(
     Number.isFinite(patch.pollIntervalMs)
   ) {
     cur.pollIntervalMs = clampPollIntervalMs(patch.pollIntervalMs);
+  }
+  if (Array.isArray(patch.priorityUsernames)) {
+    cur.priorityUsernames = mergePriorityUsernames(patch.priorityUsernames);
   }
   cur.updatedAt = new Date().toISOString();
   await savePersist(env, cur);
@@ -298,6 +342,8 @@ export async function getAutoFollowLiveStatus(
         captureStatus: a.captureStatus,
       }));
   }
+  const watcherUsername = await getIgCookieUsername(env);
+  const watcherLabel = watcherUsername ?? "nihan.dogansoy";
   const labelTr = s.enabled
     ? "Takip canlıları otomatik kaydet: açık"
     : "Takip canlıları otomatik kaydet: kapalı";
@@ -316,8 +362,9 @@ export async function getAutoFollowLiveStatus(
     startedAt,
     labelTr,
     hintTr:
-      "İzleyici hesabının (nihan.dogansoy) takip ettiği hesaplar canlıya geçince otomatik kayıt başlar. Tarama ~5–6 dk’da bir; kayıt sürerken (bekleniyor/kaydediliyor) tarama durur — aynı anda tek kayıt. Manuel «Canlı yayın ekle» çalışmaya devam eder.",
+      `İzleyici hesabının (${watcherLabel}) takip ettiği hesaplar canlıya geçince otomatik kayıt başlar. Tarama ~5–6 dk’da bir; kayıt sürerken (bekleniyor/kaydediliyor) tarama durur — aynı anda tek kayıt. Manuel «Canlı yayın ekle» çalışmaya devam eder.`,
     cookiesReady: Boolean(ig.hasCookies) || ig.status === "yuklu",
+    watcherUsername,
   };
 }
 
@@ -368,7 +415,12 @@ export async function runAutoFollowPollCycle(
     };
   }
 
-  const result = await poll(env);
+  const stateBefore = await loadPersist(env);
+  const priorityUsernames = mergePriorityUsernames(
+    stateBefore.priorityUsernames,
+    stateBefore.lastLivesSeen,
+  );
+  const result = await poll(env, { priorityUsernames });
   const state = await loadPersist(env);
 
   if (!result.ok) {
@@ -503,6 +555,7 @@ export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
   );
 
   let lastFailKind: string | null = null;
+  let lastWhoamiAt = 0;
 
   for (;;) {
     try {
@@ -516,6 +569,19 @@ export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
       }
 
       const ig = await getIgSessionStatus(env);
+      // Keep watcher label synced to cookie session (not stale credential mask).
+      if (
+        ig.hasCookies &&
+        Date.now() - lastWhoamiAt > 30 * 60_000
+      ) {
+        lastWhoamiAt = Date.now();
+        const who = await whoamiIgCookies(env).catch(() => null);
+        if (who?.ok) {
+          console.log(`[auto-follow] watcher cookies = @${who.username}`);
+        } else if (who && !who.ok) {
+          console.warn(`[auto-follow] whoami failed: ${who.detail}`);
+        }
+      }
       if (!ig.hasCookies && ig.status !== "yuklu") {
         state.lastError =
           "Çerez yok — otomatik kayıt bekliyor (Ayarlar → Instagram oturumu).";
