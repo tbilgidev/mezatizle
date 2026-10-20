@@ -1,7 +1,14 @@
 import { copyFile, mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Sql } from "@mezatizle/db";
-import { parseAuctionText } from "@mezatizle/shared";
+import {
+  explainSaleTr,
+  isSaleWorthy,
+  parseAuctionTexts,
+  reconcileMezatWindows,
+  SALE_MIN_CONFIDENCE,
+  type TimelineEvent,
+} from "@mezatizle/shared";
 
 async function attachProductImage(
   storageRoot: string,
@@ -17,7 +24,6 @@ async function attachProductImage(
       .filter((f) => f.endsWith(".jpg"))
       .sort();
     if (!files[0]) return null;
-    // Prefer frame nearest to sale offset (frame_NNNNN @ OCR_FPS, default 1fps)
     const fps = Number(process.env.OCR_FPS ?? process.env.FRAME_FPS ?? "1");
     let pick = files[0]!;
     if (offsetMs != null && Number.isFinite(offsetMs) && fps > 0) {
@@ -48,6 +54,27 @@ export async function segmentAuctionFromSignals(
   sql: Sql,
   recordingId: string,
 ) {
+  await sql`DELETE FROM auction_events WHERE recording_id = ${recordingId}`;
+
+  const [recMeta] = await sql<{
+    duration_seconds: number | null;
+    capture_started_at: Date | string | null;
+  }[]>`
+    SELECT duration_seconds, capture_started_at FROM recordings
+    WHERE id = ${recordingId}
+  `;
+  const durationMs =
+    recMeta?.duration_seconds != null &&
+    Number.isFinite(Number(recMeta.duration_seconds))
+      ? Math.round(Number(recMeta.duration_seconds) * 1000)
+      : null;
+  // Grace: comments slightly after last frame still OK; post-live poll noise is not
+  const commentMaxMs =
+    durationMs != null ? durationMs + 15_000 : Number.MAX_SAFE_INTEGER;
+  const captureStartedMs = recMeta?.capture_started_at
+    ? new Date(recMeta.capture_started_at).getTime()
+    : null;
+
   const segments = await sql<{
     id: string;
     start_ms: number;
@@ -62,53 +89,84 @@ export async function segmentAuctionFromSignals(
     offset_ms: number | null;
     body: string;
     author_username: string | null;
+    observed_at: Date | string | null;
   }[]>`
-    SELECT id, offset_ms, body, author_username FROM observed_comments
+    SELECT id, offset_ms, body, author_username, observed_at
+    FROM observed_comments
     WHERE recording_id = ${recordingId}
     ORDER BY COALESCE(offset_ms, 0) ASC
   `;
 
   let created = 0;
+
   for (const seg of segments) {
-    const signal = parseAuctionText(seg.text);
-    if (!signal) continue;
-    await sql`
-      INSERT INTO auction_events (recording_id, event_type, offset_ms, payload, confidence)
-      VALUES (
-        ${recordingId},
-        ${signal.eventType},
-        ${seg.start_ms},
-        ${sql.json({
-          source: "transcript",
-          refId: seg.id,
-          ...signal,
-        })},
-        ${signal.confidence}
-      )
-    `;
-    created++;
+    if (durationMs != null && seg.start_ms > durationMs + 5_000) continue;
+    const signals = parseAuctionTexts(seg.text, { source: "transcript" });
+    for (const signal of signals) {
+      await sql`
+        INSERT INTO auction_events (recording_id, event_type, offset_ms, payload, confidence)
+        VALUES (
+          ${recordingId},
+          ${signal.eventType},
+          ${seg.start_ms},
+          ${sql.json({
+            source: "transcript",
+            refId: seg.id,
+            ...signal,
+          })},
+          ${signal.confidence}
+        )
+      `;
+      created++;
+    }
   }
+
   for (const c of comments) {
-    const signal = parseAuctionText(c.body);
-    if (!signal) continue;
-    await sql`
-      INSERT INTO auction_events (recording_id, event_type, offset_ms, payload, confidence)
-      VALUES (
-        ${recordingId},
-        ${signal.eventType},
-        ${c.offset_ms ?? 0},
-        ${sql.json({
-          source: "comment",
-          refId: c.id,
-          author: c.author_username,
-          ...signal,
-        })},
-        ${signal.confidence}
-      )
-    `;
-    created++;
+    const offset = c.offset_ms ?? 0;
+    if (offset > commentMaxMs) continue;
+    // Pre-roll live_api comments (before capture) land at offset 0 and poison asks
+    if (
+      captureStartedMs != null &&
+      c.observed_at != null &&
+      new Date(c.observed_at).getTime() < captureStartedMs - 2_000
+    ) {
+      continue;
+    }
+    const signals = parseAuctionTexts(c.body, { source: "comment" });
+    for (let signal of signals) {
+      const author =
+        c.author_username && /^[A-Za-z0-9._]{1,30}$/.test(c.author_username)
+          ? c.author_username.toLowerCase()
+          : undefined;
+      // Never attach co-host/seller ask authors as buyers; only real bid events
+      if (
+        author &&
+        !signal.buyerHint &&
+        signal.eventType === "bid" &&
+        signal.reason !== "seller_aldim_ask"
+      ) {
+        signal = { ...signal, buyerHint: author };
+      }
+      await sql`
+        INSERT INTO auction_events (recording_id, event_type, offset_ms, payload, confidence)
+        VALUES (
+          ${recordingId},
+          ${signal.eventType},
+          ${offset},
+          ${sql.json({
+            source: "comment",
+            refId: c.id,
+            author: c.author_username,
+            ...signal,
+          })},
+          ${signal.confidence}
+        )
+      `;
+      created++;
+    }
   }
-  return { eventsCreated: created };
+
+  return { eventsCreated: created, soldEnrichedFromBids: 0 };
 }
 
 export async function reconcileSales(
@@ -116,38 +174,139 @@ export async function reconcileSales(
   recordingId: string,
   storageRoot = process.env.STORAGE_ROOT ?? "./storage",
 ) {
-  const rec = await sql<{ seller_id: string }[]>`
-    SELECT seller_id FROM recordings WHERE id = ${recordingId}
+  const rec = await sql<{ seller_id: string; recorded_at: Date | string }[]>`
+    SELECT seller_id, recorded_at FROM recordings WHERE id = ${recordingId}
   `;
   if (!rec[0]) throw new Error("recording not found");
   const sellerId = rec[0].seller_id;
+  const recordedAt = new Date(rec[0].recorded_at);
 
-  const sold = await sql<{
+  const minConf = Number(
+    process.env.SALE_MIN_CONFIDENCE ?? SALE_MIN_CONFIDENCE,
+  );
+  const gate = Number.isFinite(minConf) ? minConf : SALE_MIN_CONFIDENCE;
+
+  const oldSales = await sql<{ id: string; product_id: string | null }[]>`
+    SELECT id, product_id FROM sales WHERE recording_id = ${recordingId}
+  `;
+  if (oldSales.length) {
+    const saleIds = oldSales.map((s) => s.id);
+    await sql`DELETE FROM sale_evidence WHERE sale_id = ANY(${saleIds}::uuid[])`;
+    await sql`DELETE FROM sales WHERE recording_id = ${recordingId}`;
+    const productIds = oldSales
+      .map((s) => s.product_id)
+      .filter((id): id is string => Boolean(id));
+    if (productIds.length) {
+      await sql`DELETE FROM products WHERE id = ANY(${productIds}::uuid[])`;
+    }
+  }
+
+  const rows = await sql<{
     id: string;
     offset_ms: number | null;
+    event_type: string;
     payload: Record<string, unknown>;
     confidence: number | null;
   }[]>`
-    SELECT id, offset_ms, payload, confidence FROM auction_events
-    WHERE recording_id = ${recordingId} AND event_type = 'sold'
+    SELECT id, offset_ms, event_type, payload, confidence FROM auction_events
+    WHERE recording_id = ${recordingId}
     ORDER BY COALESCE(offset_ms, 0) ASC
   `;
 
+  const timeline: TimelineEvent[] = rows.map((r) => {
+    const p = r.payload ?? {};
+    const source =
+      p.source === "comment" ? "comment" : ("transcript" as const);
+    return {
+      id: r.id,
+      offsetMs: Number(r.offset_ms ?? 0),
+      eventType: r.event_type as TimelineEvent["eventType"],
+      source,
+      amountTry:
+        p.amountTry != null && Number.isFinite(Number(p.amountTry))
+          ? Number(p.amountTry)
+          : undefined,
+      buyerHint: typeof p.buyerHint === "string" ? p.buyerHint : undefined,
+      spokenBuyerName:
+        typeof p.spokenBuyerName === "string" ? p.spokenBuyerName : undefined,
+      reason: typeof p.reason === "string" ? p.reason : undefined,
+      matched: typeof p.matched === "string" ? p.matched : "",
+      confidence: Number(r.confidence ?? p.confidence ?? 0),
+      productHint:
+        typeof p.productHint === "string" ? p.productHint : undefined,
+    };
+  });
+
+  const candidates = reconcileMezatWindows(timeline);
+
   let salesCreated = 0;
-  for (const ev of sold) {
-    const amount = Number(ev.payload.amountTry ?? 0);
-    const buyer = (ev.payload.buyerHint as string | undefined) ?? null;
+  let skippedLowConfidence = 0;
+  let skippedNoBuyer = 0;
+  let skippedDuplicate = 0;
+  const seenKeys = new Set<string>();
+
+  for (const cand of candidates) {
+    const pseudo = { eventType: "sold" as const, confidence: cand.confidence };
+    if (!isSaleWorthy(pseudo) || cand.confidence < gate) {
+      skippedLowConfidence++;
+      continue;
+    }
+    if (!cand.buyerUsername) {
+      skippedNoBuyer++;
+      continue;
+    }
+
+    const amountCents =
+      cand.amountTry != null && cand.amountTry >= 10
+        ? Math.round(cand.amountTry * 100)
+        : null;
+    const buyer = cand.buyerUsername;
+    const offsetMs = cand.offsetMs;
+    const dedupeKey = `${buyer}:${amountCents ?? "_"}:${Math.floor(offsetMs / 8000)}`;
+    if (seenKeys.has(dedupeKey)) {
+      skippedDuplicate++;
+      continue;
+    }
+    seenKeys.add(dedupeKey);
+
+    const gaps: string[] = [];
+    if (amountCents == null) gaps.push("amount_unknown");
+
     const productHint =
-      (ev.payload.productHint as string | undefined) ??
-      `Canlı lot @ ${ev.offset_ms ?? 0}ms`;
+      cand.productHint && cand.productHint.trim().length > 2
+        ? cand.productHint.trim().slice(0, 200)
+        : `Canlı lot @ ${offsetMs}ms (inceleme)`;
+
+    const saleMethod = cand.saleMethod;
+    const explanation = explainSaleTr({
+      confidence: cand.confidence,
+      reason: cand.reason,
+      buyer,
+      amountCents,
+      gaps,
+    });
+
+    const soldAt =
+      Number.isFinite(recordedAt.getTime())
+        ? new Date(recordedAt.getTime() + offsetMs)
+        : new Date();
 
     const product = await sql<{ id: string }[]>`
       INSERT INTO products (seller_id, title, description, attributes)
       VALUES (
         ${sellerId},
-        ${productHint.slice(0, 200)},
-        ${"Otomatik aday ürün (yerel kurallar)"},
-        ${sql.json({ sourceEventId: ev.id })}
+        ${productHint},
+        ${productHint},
+        ${sql.json({
+          confidence: cand.confidence,
+          amountKnown: amountCents != null,
+          buyerKnown: true,
+          spokenBuyerName: cand.spokenBuyerName ?? null,
+          saleMethod,
+          offsetMs,
+          askAmountTry: cand.askAmountTry ?? null,
+          gaps,
+        })}
       )
       RETURNING id
     `;
@@ -155,7 +314,7 @@ export async function reconcileSales(
       storageRoot,
       recordingId,
       product[0]!.id,
-      ev.offset_ms,
+      offsetMs,
     );
     if (imagePath) {
       await sql`
@@ -175,9 +334,9 @@ export async function reconcileSales(
         ${product[0]!.id},
         ${sellerId},
         ${buyer},
-        ${Number.isFinite(amount) ? Math.round(amount * 100) : null},
+        ${amountCents},
         'TRY',
-        now(),
+        ${soldAt.toISOString()},
         'needs_review'
       )
       RETURNING id
@@ -189,11 +348,36 @@ export async function reconcileSales(
         ${sale[0]!.id},
         'auction_event',
         'auction_events',
-        ${ev.id},
-        ${"Satış olayı eşlemesi"},
-        ${sql.json({ confidence: ev.confidence })}
+        ${cand.evidenceEventIds[0] ?? sale[0]!.id},
+        ${"Mezat penceresi eşlemesi (alıcı kanıtı zorunlu)"},
+        ${sql.json({
+          confidence: cand.confidence,
+          gate,
+          reason: cand.reason,
+          saleMethod,
+          amountCents,
+          buyer,
+          spokenBuyerName: cand.spokenBuyerName ?? null,
+          gaps,
+          explanationTr: explanation,
+          offsetMs,
+          evidenceEventIds: cand.evidenceEventIds,
+        })}
       )
     `;
+    for (const eid of cand.evidenceEventIds.slice(1)) {
+      await sql`
+        INSERT INTO sale_evidence (sale_id, evidence_type, ref_table, ref_id, note, payload)
+        VALUES (
+          ${sale[0]!.id},
+          'auction_event',
+          'auction_events',
+          ${eid},
+          ${"İlgili mezat olayı"},
+          ${sql.json({ offsetMs })}
+        )
+      `;
+    }
     salesCreated++;
   }
 
@@ -201,5 +385,12 @@ export async function reconcileSales(
     UPDATE recordings SET status = 'complete', updated_at = now()
     WHERE id = ${recordingId}
   `;
-  return { salesCreated };
+  return {
+    salesCreated,
+    skippedLowConfidence,
+    skippedNoBuyer,
+    skippedDuplicate,
+    saleMinConfidence: gate,
+    candidatesConsidered: candidates.length,
+  };
 }

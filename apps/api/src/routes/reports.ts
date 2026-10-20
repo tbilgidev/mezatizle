@@ -8,6 +8,10 @@
  */
 import { Hono } from "hono";
 import type { Sql } from "@mezatizle/db";
+import {
+  summarizeOfferWindows,
+  type TimelineEvent,
+} from "@mezatizle/shared";
 
 export type ReportListItem = {
   recordingId: string;
@@ -125,36 +129,47 @@ function buildHeadline(r: ReportListItem): string {
 }
 
 /**
- * Offer KPIs from auction_events (no shared summarizeOfferWindows dependency).
- * Counts ask/intro windows and sums payload.amountTry when present.
+ * Offer KPIs from sparse product lots (packages/shared buildProductLots).
+ * productsOffered = distinct lots; totalAskTry = sum of opening asks only.
  */
 async function loadOfferKpis(
   sql: Sql,
   recordingId: string,
 ): Promise<{ productsOfferedCount: number; productsOfferedSumTry: number }> {
   const rows = await sql<{
-    n: string;
-    sum_try: string | null;
+    offset_ms: number | null;
+    event_type: string;
+    payload: Record<string, unknown>;
+    confidence: number | null;
   }[]>`
-    SELECT
-      COUNT(*)::text AS n,
-      COALESCE(
-        SUM(
-          CASE
-            WHEN (payload->>'amountTry') ~ '^-?[0-9]+(\\.[0-9]+)?$'
-            THEN (payload->>'amountTry')::float8
-            ELSE 0
-          END
-        ),
-        0
-      )::text AS sum_try
+    SELECT offset_ms, event_type, payload, confidence
     FROM auction_events
     WHERE recording_id = ${recordingId}
-      AND event_type IN ('price_mention', 'item_intro')
+      AND event_type IN ('price_mention', 'item_intro', 'pass', 'sold')
+    ORDER BY COALESCE(offset_ms, 0) ASC
   `;
+  const timeline: TimelineEvent[] = rows.map((r, i) => {
+    const p = r.payload ?? {};
+    return {
+      id: typeof p.refId === "string" ? p.refId : `kpi-${i}`,
+      offsetMs: Number(r.offset_ms ?? 0),
+      eventType: r.event_type as TimelineEvent["eventType"],
+      source: p.source === "comment" ? "comment" : "transcript",
+      amountTry:
+        p.amountTry != null && Number.isFinite(Number(p.amountTry))
+          ? Number(p.amountTry)
+          : undefined,
+      reason: typeof p.reason === "string" ? p.reason : undefined,
+      matched: typeof p.matched === "string" ? p.matched : "",
+      confidence: Number(r.confidence ?? 0),
+      productHint:
+        typeof p.productHint === "string" ? p.productHint : undefined,
+    };
+  });
+  const s = summarizeOfferWindows(timeline);
   return {
-    productsOfferedCount: Number(rows[0]?.n ?? 0),
-    productsOfferedSumTry: Number(rows[0]?.sum_try ?? 0),
+    productsOfferedCount: s.productsOffered,
+    productsOfferedSumTry: s.offeredSumTry,
   };
 }
 
