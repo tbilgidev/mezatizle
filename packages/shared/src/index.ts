@@ -92,6 +92,8 @@ export {
   parseSpokenBuyerName,
   isSellerAldimClosing,
   isSellerAldimAsk,
+  isPostedSellerAsk,
+  isSellerAcceptPhrase,
   isSaleWorthy,
   isAuctionNoise,
   enrichSoldFromBids,

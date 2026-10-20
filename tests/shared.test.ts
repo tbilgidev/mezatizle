@@ -59,6 +59,64 @@ describe("Turkish auction rules", () => {
     );
   });
 
+  test("co-host Aldım X dir / açılışımız are asks not buyer claims", () => {
+    const ask = parseAuctionText("Aldım 50.000₺ dir✅✅✅", {
+      source: "comment",
+    });
+    expect(ask?.eventType).toBe("price_mention");
+    expect(ask?.reason).toBe("seller_aldim_ask");
+    expect(ask?.amountTry).toBe(50000);
+
+    const acilis = parseAuctionText(
+      "Açılışımız 5.000₺ peylerimiz 1.000₺ katlarıdır✅✅",
+      { source: "comment" },
+    );
+    expect(acilis?.eventType).toBe("price_mention");
+    expect(acilis?.reason).toBe("acilisim_ask");
+    expect(acilis?.amountTry).toBe(5000);
+
+    const diyene = parseAuctionText("Aldım diyene 60.000 TL'dir", {
+      source: "transcript",
+    });
+    expect(diyene?.eventType).toBe("price_mention");
+    expect(diyene?.amountTry).toBe(60000);
+  });
+
+  test("lazım olur / yine olur / tamam için are not counter_accept", () => {
+    expect(
+      parseAuctionText("Eser abi bu lazım olur.", { source: "transcript" }),
+    ).toBeNull();
+    expect(
+      parseAuctionText("Diğer mezat da yine olur ikilliler.", {
+        source: "transcript",
+      }),
+    ).toBeNull();
+    expect(
+      parseAuctionText("Tamam için.", { source: "transcript" }),
+    ).toBeNull();
+    const ok = parseAuctionText("tamam olur", { source: "transcript" });
+    expect(ok?.eventType).toBe("sold");
+    expect(ok?.reason).toMatch(/counter_accept/);
+  });
+
+  test("aldım diyene N scales to bin when bare", () => {
+    const s = parseAuctionText("Bu da ilk aldım diyene 11.", {
+      source: "transcript",
+    });
+    expect(s?.eventType).toBe("price_mention");
+    expect(s?.amountTry).toBe(11000);
+  });
+
+  test("comment number bids scale low digits to bin", () => {
+    const nine = parseAuctionText("9", { source: "comment" });
+    expect(nine?.eventType).toBe("bid");
+    expect(nine?.amountTry).toBe(9000);
+    expect(nine?.reason).toBe("comment_number_bid");
+    expect(parseAuctionText("10", { source: "comment" })?.amountTry).toBe(
+      10000,
+    );
+  });
+
   test("seller transcript aldım + bin/lira is ASK not sold", () => {
     const s = parseAuctionText("Fincanı aldım on bin lira", {
       source: "transcript",
@@ -218,6 +276,30 @@ describe("mezat window reconcile", () => {
         reason: "seller_aldim_ask",
       }),
     ]);
+    expect(sales.length).toBe(0);
+  });
+
+  test("co-host ask comment then lazım-olur chatter creates no sale", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 147660,
+        eventType: "price_mention",
+        matched: "Aldım 60.000₺ dir",
+        amountTry: 60000,
+        reason: "seller_aldim_ask",
+        source: "comment",
+      }),
+      ev({
+        id: "chatter",
+        offsetMs: 250520,
+        eventType: "sold",
+        matched: "Eser abi bu lazım olur.",
+        reason: "counter_accept",
+        confidence: 0.55,
+      }),
+    ]);
+    // No buyer evidence — prefer unknown
     expect(sales.length).toBe(0);
   });
 

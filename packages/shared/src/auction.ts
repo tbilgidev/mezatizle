@@ -51,18 +51,32 @@ const CORRECTION_RE =
   /(düzeltme|duzeltme|yanl[ıi][sş]|iptal(?:\s+edildi)?|geri\s*al|özür|ozur|hata\s*oldu|yanl[ıi][sş]\s*söyled|vazgeç|vazge[cç]|işlem\s*yok|islem\s*yok)/i;
 
 const UNSOLD_RE =
-  /(sat[ıi]lmad[ıi]|kal[ıi]yor(?!\s*@)|kimse\s+almad[ıi]|al[ıi]c[ıi]\s+yok|passt|\bpas\b|geçiyoruz|geciyoruz|geçtik|gectik|bir\s+sonraki|sıradaki\s+ürüne)/i;
+  /(sat[ıi]lmad[ıi]|kal[ıi]yor(?!\s*@)|kimse\s+almad[ıi]|al[ıi]c[ıi]\s+yok|\bpasst\b|\bpass\b|geçiyoruz|geciyoruz|geçtik|gectik|bir\s+sonraki|sıradaki\s+ürüne)/i;
 
 /** Explicit seller win / sold — NOT seller «aldım» ask. */
 const SOLD_RE =
   /(sat[ıi]ld[ıi]|sold(?:\s+to)?|alan(?:[ıi])?\s+bell[iı]|satt[ıi]k|kazanan\s*[:@]|gitti\s*[@]|kapatt[ıi]k|onaylad[ıi]m\s*sat|tebrikler\s*@|['']?da\s+kald[ıi]|da\s+kald[ıi]|kazand[ıi]|ald[ıi]\s+@|@\w+\s+ald[ıi])/i;
 
-/** Seller accepts a counter-offer. */
-const ACCEPT_RE =
-  /\b(tamam|olur|kabul|senin\s*olsun|anla[sş]t[ıi]k|veriyorum\s*sana|al\s+o\s+zaman|oldu\s+bu|peki\s+olur|okey|okay)\b/i;
+/**
+ * Seller accepts a counter-offer.
+ * Bare «olur» mid-sentence («lazım olur», «yine olur») is chatter — not accept.
+ */
+const ACCEPT_STRONG_RE =
+  /(senin\s*olsun|anla[sş]t[ıi]k|veriyorum\s*sana|al\s+o\s+zaman|oldu\s+bu|peki\s+olur)/i;
+/** Lead accept only when the rest is empty / price / soft confirm — not «Tamam için». */
+const ACCEPT_LEAD_RE =
+  /^(tamam|olur|okey|okay|kabul)(?:[.!?…]*|\s+(?:olur|okey|okay|kabul|peki|edir|dir|\d|[a-zçğıöşü]*\s*bin).*|$)/i;
 
 const BID_RE =
   /(ald[ıi]m|al[ıi]yorum|ben\s+ald[ıi]m|ben\s*[-:]?\s*\d+|^\s*\+?\s*\d{2,7}\s*(tl|₺|try)?\s*$|artt[ıi]r(?:d[ıi]m)?|arttir|veriyorum|veririm|\+\s*\d{2,7}|bid|benim|üstüne|ustune)/i;
+
+/** Co-host / seller comment posting the ask («Aldım 50.000₺ dir», «Aldım diyene 11 bin»). */
+const COMMENT_SELLER_ASK_RE =
+  /ald[ıi]m(?:\s+diyene)?[\s\S]{0,40}?\d[\s\S]{0,24}?(?:dir|dır|dur|dür)\b/i;
+const ALDIM_DIYENE_ASK_RE =
+  /(?:ilk\s+)?ald[ıi]m\s+diyene/i;
+const ACILISIMIZ_RE =
+  /a[cç][ıi]l[ıi][sş]ımız|a[cç][ıi]l[ıi][sş]ım\b/i;
 
 const COUNTER_RE = /(\d{2,7}|[a-zçğıöşü\s]+bin)\s*veririm|\bveririm\b/i;
 
@@ -77,6 +91,8 @@ const IG_USER_RE = /@([A-Za-z0-9._]{1,30})/g;
 /** OCR / ASR garbage: mostly non-letters, or tiny fragments. */
 export function isAuctionNoise(text: string): boolean {
   const t = text.trim();
+  // Bare pey numbers («9», «10», «6,5») are valid comment bids
+  if (/^\d{1,7}([.,]\d{1,3})?$/.test(t)) return false;
   if (t.length < 2) return true;
   if (t.length > 280) return true;
   const letters = (t.match(/[A-Za-zÀ-ÿĞğÜüŞşİıÖöÇç]/g) || []).length;
@@ -321,17 +337,74 @@ export function isSellerAldimClosing(
   return isSellerAldimAsk(text, amountTry);
 }
 
-/** Seller listing phrase with amount (bin/lira). */
+/**
+ * «ilk aldım diyene 11» → 11_000 when seller means bin.
+ * Prefer explicit bin/currency amounts when present.
+ */
+export function normalizeAldimDiyeneAmount(
+  text: string,
+  amountTry: number | undefined,
+): number | undefined {
+  if (amountTry == null) return undefined;
+  if (!ALDIM_DIYENE_ASK_RE.test(text)) return amountTry;
+  if (hasCurrencyMarker(text) || /\bbin\b/i.test(text)) return amountTry;
+  if (amountTry > 0 && amountTry < 100) return amountTry * 1000;
+  return amountTry;
+}
+
+/** Seller listing phrase with amount (bin/lira / «… dir»). */
 export function isSellerAldimAsk(
   text: string,
   amountTry: number | undefined,
 ): boolean {
-  if (amountTry == null) return false;
+  const amt = normalizeAldimDiyeneAmount(text, amountTry);
+  if (amt == null) return false;
   if (!/ald[ıi]m/i.test(text)) return false;
   if (SOLD_RE.test(text)) return false;
+  if (ALDIM_DIYENE_ASK_RE.test(text)) return true;
+  if (COMMENT_SELLER_ASK_RE.test(text)) return true;
   const hasBin = /\bbin\b/i.test(text);
   const hasCur = hasCurrencyMarker(text);
   return hasBin || hasCur;
+}
+
+/** True when comment/transcript is a posted ask, not a follower claim. */
+export function isPostedSellerAsk(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  if (ACILISIMIZ_RE.test(t)) return true;
+  if (ALDIM_DIYENE_ASK_RE.test(t)) return true;
+  if (COMMENT_SELLER_ASK_RE.test(t)) return true;
+  return false;
+}
+
+/** Seller counter-accept — not mid-sentence «olur» / «Tamam için» chatter. */
+export function isSellerAcceptPhrase(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  if (ACCEPT_STRONG_RE.test(t)) return true;
+  if (/^(tamam|olur|okey|okay|kabul)[.!?…]*$/i.test(t)) return true;
+  // «tamam olur», «tamam 18 bin», «olur 5000»
+  if (
+    /^(tamam|olur|okey|okay|kabul)\b/i.test(t) &&
+    (/\bolur\b/i.test(t) ||
+      hasCurrencyMarker(t) ||
+      /\bbin\b/i.test(t) ||
+      /\d{2,7}/.test(t) ||
+      Boolean(parseBuyerHint(t)))
+  ) {
+    // Reject «Tamam için / tamam mı / tamam da» without price/buyer
+    if (
+      /^(tamam|olur)\s+(i[cç]in|mi|m[ıi]|da|de|ya|yani|ki)\b/i.test(t) &&
+      !hasCurrencyMarker(t) &&
+      !/\bbin\b/i.test(t) &&
+      !/\d{2,7}/.test(t)
+    ) {
+      return false;
+    }
+    return ACCEPT_LEAD_RE.test(t) || /\bolur\b/i.test(t) || /\d/.test(t);
+  }
+  return false;
 }
 
 function soldConfidence(
@@ -418,7 +491,8 @@ export function parseAuctionText(
   }
 
   const hasCurrency = hasCurrencyMarker(t);
-  const amountTry = parsePriceTry(t);
+  const amountTryRaw = parsePriceTry(t);
+  const amountTry = normalizeAldimDiyeneAmount(t, amountTryRaw) ?? amountTryRaw;
   const buyerHint = parseBuyerHint(t);
   const spokenBuyerName = parseSpokenBuyerName(t);
   const source = opts?.source;
@@ -441,8 +515,30 @@ export function parseAuctionText(
     };
   }
 
-  // Seller accept of counter («tamam 18 bin», «olur») — bare «tamam» alone is chatter
-  if (source === "transcript" && ACCEPT_RE.test(t)) {
+  // Posted ask in comments OR transcript («Aldım 50.000₺ dir», «açılışımız…»)
+  // Must run before BID_RE so co-host ask posts are never buyer claims.
+  if (isPostedSellerAsk(t) && amountTry != null) {
+    return {
+      eventType: "price_mention",
+      amountTry,
+      productHint: t.slice(0, 120),
+      confidence: hasCurrency || /\bbin\b/i.test(t) ? 0.78 : 0.7,
+      matched: t,
+      reason: ACILISIMIZ_RE.test(t) ? "acilisim_ask" : "seller_aldim_ask",
+    };
+  }
+  if (isPostedSellerAsk(t) && amountTry == null && ACILISIMIZ_RE.test(t)) {
+    return {
+      eventType: "price_mention",
+      productHint: t.slice(0, 120),
+      confidence: 0.55,
+      matched: t,
+      reason: "acilisim_ask",
+    };
+  }
+
+  // Seller accept of counter — not «lazım olur» / «yine olur» chatter
+  if (source === "transcript" && isSellerAcceptPhrase(t)) {
     const bareChatter = /^(tamam|olur|okey|okay|kabul|peki)[.!?…]*$/i.test(t);
     if (bareChatter && amountTry == null && !buyerHint) {
       return null;
@@ -470,9 +566,47 @@ export function parseAuctionText(
     };
   }
 
-  // Follower / OCR bids (incl. bare «aldım», «18 veririm»)
+  // Transcript bare «Aldım.» / «Aldım ne dedi?» / «Bu olarak aldım.» — seller talk, not claim
+  if (
+    source === "transcript" &&
+    /ald[ıi]m/i.test(t) &&
+    amountTry == null &&
+    !buyerHint &&
+    !SOLD_RE.test(t)
+  ) {
+    return null;
+  }
+
+  // Bare numeric comment bids («9», «10», «6,5») — common in pey lives
+  if (source === "comment") {
+    const bareNum = t.match(
+      /^\s*(\d{1,3}(?:[.,]\d{1,3})?|\d{4,7})\s*(bin)?\s*(tl|₺|try)?\s*$/i,
+    );
+    if (bareNum) {
+      let n = Number(String(bareNum[1]).replace(",", "."));
+      if (bareNum[2]) n *= 1000;
+      // Single/low digit without «bin» → treat as bin thousands when ≥1
+      else if (n > 0 && n < 100 && !bareNum[3]) n *= 1000;
+      const amt = clampPriceTry(n);
+      if (amt != null) {
+        return {
+          eventType: "bid",
+          amountTry: amt,
+          buyerHint,
+          confidence: 0.62,
+          matched: t,
+          reason: "comment_number_bid",
+        };
+      }
+    }
+  }
+
+  // Follower / OCR bids (incl. bare comment «aldım», «18 veririm»)
   if (BID_RE.test(t) || COUNTER_RE.test(t)) {
     const isCounter = COUNTER_RE.test(t);
+    const isAldim = /ald[ıi]m/i.test(t);
+    // Comment «aldım 500 TL» with currency/bin but no «dir» → still a claim/bid at that price
+    // (follower stating take-it); seller «… dir» already handled above.
     return {
       eventType: "bid",
       amountTry,
@@ -481,32 +615,44 @@ export function parseAuctionText(
         ? hasCurrency
           ? 0.72
           : 0.65
-        : /ald[ıi]m/i.test(t)
+        : isAldim
           ? 0.6
           : 0.55,
       matched: t,
-      reason: isCounter
-        ? "counter_offer"
-        : /ald[ıi]m/i.test(t)
-          ? "aldim_claim"
-          : "bid_phrase",
+      reason: isCounter ? "counter_offer" : isAldim ? "aldim_claim" : "bid_phrase",
     };
   }
 
+  // @user + price only when price is not just digits glued from the username
   if (
     buyerHint &&
     amountTry != null &&
     !UNSOLD_RE.test(t) &&
     !CORRECTION_RE.test(t)
   ) {
-    return {
-      eventType: "bid",
-      amountTry,
-      buyerHint,
-      confidence: hasCurrency ? 0.7 : 0.62,
-      matched: t,
-      reason: "ocr_at_user_price",
-    };
+    const stripped = t
+      .replace(new RegExp(`@${buyerHint}`, "i"), "")
+      .replace(/[^\d]/g, "");
+    const fromUser = buyerHint.replace(/[^\d]/g, "");
+    const priceLooksFromUsername =
+      fromUser.length > 0 &&
+      (stripped === fromUser ||
+        stripped.endsWith(fromUser) ||
+        fromUser.endsWith(stripped));
+    const remainder = t
+      .replace(/@\w+/gi, "")
+      .replace(/[^A-Za-zÀ-ÿĞğÜüŞşİıÖöÇç0-9]/g, "");
+    const mostlyMentionEmoji = remainder.length === 0;
+    if (!priceLooksFromUsername && !mostlyMentionEmoji) {
+      return {
+        eventType: "bid",
+        amountTry,
+        buyerHint,
+        confidence: hasCurrency ? 0.7 : 0.62,
+        matched: t,
+        reason: "ocr_at_user_price",
+      };
+    }
   }
 
   if (INTRO_RE.test(t)) {
@@ -718,11 +864,17 @@ export function reconcileMezatWindows(
       // New ask / product opens a window
       if (
         reason === "seller_aldim_ask" ||
-        reason === "seller_price_line" ||
+        reason === "acilisim_ask" ||
         reason === "price_mention" ||
         ev.eventType === "item_intro"
       ) {
         openLot(ev, ev.amountTry);
+      } else if (reason === "seller_price_line") {
+        // Weak ASR price chatter: update ask on open lot, do not start a new lot
+        if (win && !win.closed && ev.amountTry != null) {
+          win.askAmount = ev.amountTry;
+          win.openEventIds.push(ev.id);
+        }
       } else if (win && !win.closed && ev.amountTry != null) {
         win.askAmount = ev.amountTry;
         win.openEventIds.push(ev.id);
@@ -870,7 +1022,11 @@ export function reconcileMezatWindows(
  */
 export const OFFER_AMOUNT_SANITY_MAX_TRY = 100_000;
 
-/** KPI: product windows opened (asks) — not sales. */
+/**
+ * KPI: product windows opened (asks) — not sales.
+ * Only strong asks count (seller «aldım X dir», açılışımız, explicit price_mention /
+ * item_intro). Weak ASR «50 bin TL» chatter must not inflate sunulan.
+ */
 export function summarizeOfferWindows(events: TimelineEvent[]): {
   productsOffered: number;
   offeredSumTry: number;
@@ -878,32 +1034,41 @@ export function summarizeOfferWindows(events: TimelineEvent[]): {
   const sorted = [...events].sort((a, b) => a.offsetMs - b.offsetMs);
   let productsOffered = 0;
   let offeredSumTry = 0;
-  let open = false;
+  let lastAskMs = -Infinity;
+  let lastAskAmt: number | undefined;
+  // Debounce duplicate ask posts (ASR + co-host comment) for the same lot
+  const ASK_DEBOUNCE_MS = 45_000;
+  const SAME_AMT_DEBOUNCE_MS = 120_000;
   for (const ev of sorted) {
     const reason = ev.reason ?? "";
     const isAsk =
       ev.eventType === "price_mention" ||
       ev.eventType === "item_intro";
     if (!isAsk) continue;
+    const strong =
+      (reason === "seller_aldim_ask" && ev.amountTry != null) ||
+      (reason === "acilisim_ask" && ev.amountTry != null) ||
+      (reason === "price_mention" && ev.amountTry != null) ||
+      (ev.eventType === "item_intro" && ev.amountTry != null);
+    if (!strong) continue;
+    const dt = ev.offsetMs - lastAskMs;
+    const sameAmt =
+      ev.amountTry != null &&
+      lastAskAmt != null &&
+      ev.amountTry === lastAskAmt;
+    if (dt < ASK_DEBOUNCE_MS || (sameAmt && dt < SAME_AMT_DEBOUNCE_MS)) {
+      continue;
+    }
+    lastAskMs = ev.offsetMs;
+    lastAskAmt = ev.amountTry;
+    productsOffered += 1;
     if (
-      reason === "seller_aldim_ask" ||
-      reason === "seller_price_line" ||
-      reason === "price_mention" ||
-      ev.eventType === "item_intro"
+      ev.amountTry != null &&
+      Number.isFinite(ev.amountTry) &&
+      ev.amountTry > 0 &&
+      ev.amountTry <= OFFER_AMOUNT_SANITY_MAX_TRY
     ) {
-      // New window
-      productsOffered += 1;
-      if (
-        ev.amountTry != null &&
-        Number.isFinite(ev.amountTry) &&
-        ev.amountTry > 0 &&
-        ev.amountTry <= OFFER_AMOUNT_SANITY_MAX_TRY
-      ) {
-        offeredSumTry += ev.amountTry;
-      }
-      open = true;
-    } else if (open && ev.amountTry != null) {
-      // price update inside window — do not double-count product
+      offeredSumTry += ev.amountTry;
     }
   }
   return { productsOffered, offeredSumTry };

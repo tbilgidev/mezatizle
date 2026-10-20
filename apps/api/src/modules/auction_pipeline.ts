@@ -56,6 +56,25 @@ export async function segmentAuctionFromSignals(
 ) {
   await sql`DELETE FROM auction_events WHERE recording_id = ${recordingId}`;
 
+  const [recMeta] = await sql<{
+    duration_seconds: number | null;
+    capture_started_at: Date | string | null;
+  }[]>`
+    SELECT duration_seconds, capture_started_at FROM recordings
+    WHERE id = ${recordingId}
+  `;
+  const durationMs =
+    recMeta?.duration_seconds != null &&
+    Number.isFinite(Number(recMeta.duration_seconds))
+      ? Math.round(Number(recMeta.duration_seconds) * 1000)
+      : null;
+  // Grace: comments slightly after last frame still OK; post-live poll noise is not
+  const commentMaxMs =
+    durationMs != null ? durationMs + 15_000 : Number.MAX_SAFE_INTEGER;
+  const captureStartedMs = recMeta?.capture_started_at
+    ? new Date(recMeta.capture_started_at).getTime()
+    : null;
+
   const segments = await sql<{
     id: string;
     start_ms: number;
@@ -70,8 +89,10 @@ export async function segmentAuctionFromSignals(
     offset_ms: number | null;
     body: string;
     author_username: string | null;
+    observed_at: Date | string | null;
   }[]>`
-    SELECT id, offset_ms, body, author_username FROM observed_comments
+    SELECT id, offset_ms, body, author_username, observed_at
+    FROM observed_comments
     WHERE recording_id = ${recordingId}
     ORDER BY COALESCE(offset_ms, 0) ASC
   `;
@@ -79,6 +100,7 @@ export async function segmentAuctionFromSignals(
   let created = 0;
 
   for (const seg of segments) {
+    if (durationMs != null && seg.start_ms > durationMs + 5_000) continue;
     const signals = parseAuctionTexts(seg.text, { source: "transcript" });
     for (const signal of signals) {
       await sql`
@@ -100,13 +122,29 @@ export async function segmentAuctionFromSignals(
   }
 
   for (const c of comments) {
+    const offset = c.offset_ms ?? 0;
+    if (offset > commentMaxMs) continue;
+    // Pre-roll live_api comments (before capture) land at offset 0 and poison asks
+    if (
+      captureStartedMs != null &&
+      c.observed_at != null &&
+      new Date(c.observed_at).getTime() < captureStartedMs - 2_000
+    ) {
+      continue;
+    }
     const signals = parseAuctionTexts(c.body, { source: "comment" });
     for (let signal of signals) {
       const author =
         c.author_username && /^[A-Za-z0-9._]{1,30}$/.test(c.author_username)
           ? c.author_username.toLowerCase()
           : undefined;
-      if (author && !signal.buyerHint && signal.eventType === "bid") {
+      // Never attach co-host/seller ask authors as buyers; only real bid events
+      if (
+        author &&
+        !signal.buyerHint &&
+        signal.eventType === "bid" &&
+        signal.reason !== "seller_aldim_ask"
+      ) {
         signal = { ...signal, buyerHint: author };
       }
       await sql`
@@ -114,7 +152,7 @@ export async function segmentAuctionFromSignals(
         VALUES (
           ${recordingId},
           ${signal.eventType},
-          ${c.offset_ms ?? 0},
+          ${offset},
           ${sql.json({
             source: "comment",
             refId: c.id,
