@@ -18,6 +18,10 @@ import {
   setAutoFollowLiveConfig,
   runAutoFollowPollCycle,
 } from "../modules/auto_follow_live.ts";
+import {
+  mediaRetentionDaysFromEnv,
+  mediaRetentionPolicy,
+} from "../modules/media_retention.ts";
 const CAPTURE_POLICY = LIVE_CAPTURE_POLICY;
 
 export function metaRoutes(sql: Sql, env: AppEnv) {
@@ -41,6 +45,7 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
       captureQuality: CAPTURE_QUALITY,
       igSession,
       autoFollowLive,
+      mediaRetention: mediaRetentionPolicy(mediaRetentionDaysFromEnv()),
       storageRoot: env.storageRoot,
       localProviders: {
         asr: {

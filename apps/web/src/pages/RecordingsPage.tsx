@@ -27,14 +27,28 @@ function statusBadge(r: Record<string, unknown>) {
   return <Badge variant={variant as "ok" | "warn" | "danger"}>{label}</Badge>;
 }
 
+function isMediaPurgedRow(r: Record<string, unknown>): boolean {
+  if (r.mediaPurged === true) return true;
+  const at = r.media_purged_at ?? r.mediaPurgedAt;
+  return at != null && String(at).trim() !== "";
+}
+
 /** Master MP4 exists (finalized or in-progress bytes) — show Video open link. */
 function hasPlayableMedia(r: Record<string, unknown>): boolean {
+  if (isMediaPurgedRow(r)) return false;
+  if (r.mediaAvailable === false) return false;
   const capture = String(r.capture_status ?? "");
   if (capture === "bitti" || capture === "kaydediliyor") return true;
   const status = String(r.status ?? "");
   if (status === "recording") return true;
   const bytes = Number(r.capture_bytes ?? r.file_size_bytes ?? 0);
   return Number.isFinite(bytes) && bytes >= 64_000;
+}
+
+function mediaPurgedNote(r: Record<string, unknown>): string {
+  const note = r.mediaPurgedNoteTr ?? r.media_purged_note_tr;
+  if (note != null && String(note).trim()) return String(note).trim();
+  return "Video 1 hafta sonra silindi; analiz duruyor";
 }
 
 /** Prefer API lastError (TR) under waiting / not-found / blocked captures. */
@@ -632,6 +646,15 @@ export function RecordingsPage() {
                                 >
                                   Video
                                 </a>
+                              ) : isMediaPurgedRow(r) ? (
+                                <span
+                                  className="text-xs font-medium text-fog"
+                                  title={mediaPurgedNote(r)}
+                                  data-media-purged={id}
+                                  role="note"
+                                >
+                                  {mediaPurgedNote(r)}
+                                </span>
                               ) : null}
                               {String(r.source_type) === "live" &&
                               (r.status === "awaiting_live" ||

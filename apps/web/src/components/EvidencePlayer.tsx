@@ -12,6 +12,9 @@ type Props = {
   open: boolean;
   onClose?: () => void;
   title?: string;
+  /** When true, master MP4 was deleted by retention — show note, no player. */
+  mediaPurged?: boolean;
+  mediaPurgedNoteTr?: string | null;
 };
 
 export function EvidencePlayer({
@@ -20,6 +23,8 @@ export function EvidencePlayer({
   open,
   onClose,
   title = "Görüntü inceleme",
+  mediaPurged = false,
+  mediaPurgedNoteTr = null,
 }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [playing, setPlaying] = useState(false);
@@ -28,9 +33,12 @@ export function EvidencePlayer({
   const [error, setError] = useState<string | null>(null);
   const seekSec = Math.max(0, offsetMs / 1000);
   const src = api.mediaUrl(recordingId);
+  const purgedNote =
+    mediaPurgedNoteTr?.trim() ||
+    "Video 1 hafta sonra silindi; analiz duruyor";
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || mediaPurged) return;
     setError(null);
     const v = videoRef.current;
     if (!v) return;
@@ -61,9 +69,29 @@ export function EvidencePlayer({
       v.removeEventListener("pause", onPause);
       v.removeEventListener("error", onErr);
     };
-  }, [open, recordingId, seekSec]);
+  }, [open, recordingId, seekSec, mediaPurged]);
 
   if (!open) return null;
+
+  if (mediaPurged) {
+    return (
+      <Card className="mb-4 border-line" data-testid="evidence-player-purged">
+        <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0">
+          <div>
+            <CardTitle>{title}</CardTitle>
+            <p className="mt-1 text-sm text-fog" data-media-purged={recordingId}>
+              {purgedNote}
+            </p>
+          </div>
+          {onClose ? (
+            <Button type="button" size="sm" variant="secondary" onClick={onClose}>
+              Kapat
+            </Button>
+          ) : null}
+        </CardHeader>
+      </Card>
+    );
+  }
 
   function nudge(delta: number) {
     const v = videoRef.current;

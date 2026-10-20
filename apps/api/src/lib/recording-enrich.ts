@@ -5,6 +5,11 @@ import { stat } from "node:fs/promises";
 import type { Sql } from "@mezatizle/db";
 import type { AppEnv } from "./env.ts";
 import { safeJoinStorage } from "./storage.ts";
+import {
+  isMediaPurged,
+  mediaPurgedNoteTr,
+  mediaRetentionDaysFromEnv,
+} from "../modules/media_retention.ts";
 
 export type AnalysisState = "none" | "running" | "done" | "failed";
 
@@ -205,6 +210,9 @@ export async function enrichRecordingRow(
         ? "Yorum yok"
         : null;
 
+  const mediaPurged = isMediaPurged(row);
+  const retentionDays = mediaRetentionDaysFromEnv();
+
   return {
     ...row,
     file_size_bytes: fileSizeBytes,
@@ -219,5 +227,15 @@ export async function enrichRecordingRow(
     commentCount,
     commentsWarning,
     commentsMissing: Boolean(commentsWarning),
+    mediaPurged,
+    mediaAvailable: !mediaPurged && fileSizeBytes >= 64_000,
+    mediaPurgedAt: mediaPurged
+      ? row.media_purged_at != null
+        ? String(row.media_purged_at)
+        : row.mediaPurgedAt != null
+          ? String(row.mediaPurgedAt)
+          : null
+      : null,
+    mediaPurgedNoteTr: mediaPurged ? mediaPurgedNoteTr(retentionDays) : null,
   };
 }

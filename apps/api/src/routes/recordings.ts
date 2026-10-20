@@ -17,6 +17,11 @@ import {
   deleteRecording,
   deleteOrphanSellers,
 } from "../modules/recording-delete.ts";
+import {
+  isMediaPurged,
+  mediaPurgedNoteTr,
+  mediaRetentionDaysFromEnv,
+} from "../modules/media_retention.ts";
 
 export function recordingsRoutes(sql: Sql, env: AppEnv) {
   const app = new Hono();
@@ -238,10 +243,24 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
   /** Master MP4 — byte-range friendly for Kanıt / Raporlar seek (read-only). */
   app.on(["GET", "HEAD"], "/:id/media", async (c) => {
     const id = c.req.param("id");
-    const rows = await sql<{ storage_path: string }[]>`
-      SELECT storage_path FROM recordings WHERE id = ${id}
+    const rows = await sql<
+      { storage_path: string; media_purged_at: Date | string | null }[]
+    >`
+      SELECT storage_path, media_purged_at FROM recordings WHERE id = ${id}
     `;
     if (!rows[0]) return c.json({ error: "Bulunamadı" }, 404);
+    if (isMediaPurged(rows[0])) {
+      const note = mediaPurgedNoteTr(mediaRetentionDaysFromEnv());
+      return c.json(
+        {
+          error: "media_purged",
+          mediaPurged: true,
+          message: note,
+          noteTr: note,
+        },
+        410,
+      );
+    }
     try {
       const abs = safeJoinStorage(env.storageRoot, rows[0].storage_path);
       return streamFileWithRanges(abs, c.req.raw, "video/mp4");

@@ -26,6 +26,10 @@ export function EvidencePage() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [playerOpen, setPlayerOpen] = useState(false);
+  const [mediaPurged, setMediaPurged] = useState(false);
+  const [mediaPurgedNoteTr, setMediaPurgedNoteTr] = useState<string | null>(
+    null,
+  );
 
   useEffect(() => {
     api
@@ -69,6 +73,36 @@ export function EvidencePage() {
 
   const recordingId =
     sale?.recording_id != null ? String(sale.recording_id) : null;
+
+  useEffect(() => {
+    if (!recordingId) {
+      setMediaPurged(false);
+      setMediaPurgedNoteTr(null);
+      return;
+    }
+    let alive = true;
+    api
+      .recording(recordingId)
+      .then((d) => {
+        if (!alive) return;
+        const r = (d?.recording ?? {}) as Record<string, unknown>;
+        const purged =
+          r.mediaPurged === true ||
+          (r.media_purged_at != null && String(r.media_purged_at).trim() !== "");
+        setMediaPurged(purged);
+        setMediaPurgedNoteTr(
+          r.mediaPurgedNoteTr != null ? String(r.mediaPurgedNoteTr) : null,
+        );
+      })
+      .catch(() => {
+        if (!alive) return;
+        setMediaPurged(false);
+        setMediaPurgedNoteTr(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [recordingId]);
 
   async function review(status: string) {
     if (!selected) return;
@@ -194,6 +228,8 @@ export function EvidencePage() {
               open={playerOpen}
               onClose={() => setPlayerOpen(false)}
               title="Kanıt videosu"
+              mediaPurged={mediaPurged}
+              mediaPurgedNoteTr={mediaPurgedNoteTr}
             />
           )}
 

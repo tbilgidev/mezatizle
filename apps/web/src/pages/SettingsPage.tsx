@@ -591,6 +591,48 @@ export function SettingsPage() {
             </CardContent>
           </Card>
 
+          <Card className="mb-4" id="video-retention">
+            <CardHeader>
+              <CardTitle>Video saklama</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {(() => {
+                const mr = (settings?.mediaRetention ?? {}) as Record<
+                  string,
+                  unknown
+                >;
+                const days = Number(mr.retentionDays ?? 7);
+                return (
+                  <>
+                    <p className="mb-2">
+                      <Badge variant="ok">
+                        {String(mr.labelTr ?? `Video saklama: ${days} gün`)}
+                      </Badge>
+                    </p>
+                    <p className="mb-2 text-sm text-fog">
+                      {String(
+                        mr.hintTr ??
+                          `Analiz tamamlandıktan ${days} gün sonra kayıt videosu silinir; satışlar, rapor KPI’ları, yorumlar, transkript ve ürün küçük resimleri kalır.`,
+                      )}
+                    </p>
+                    <p className="mb-2 text-sm text-fog">
+                      Silinen video için arayüz notu:{" "}
+                      <em>
+                        {String(
+                          mr.noteTr ??
+                            "Video 1 hafta sonra silindi; analiz duruyor",
+                        )}
+                      </em>
+                    </p>
+                    {mr.knownGapTr ? (
+                      <p className="text-xs text-fog">{String(mr.knownGapTr)}</p>
+                    ) : null}
+                  </>
+                );
+              })()}
+            </CardContent>
+          </Card>
+
           <Card className="mb-4">
             <CardHeader>
               <CardTitle>Yakalama (Modül H)</CardTitle>

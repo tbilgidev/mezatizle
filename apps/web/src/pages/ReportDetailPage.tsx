@@ -381,6 +381,16 @@ export function ReportDetailPage() {
           open
           onClose={() => setPlayer(null)}
           title="Kanıt videosu"
+          mediaPurged={
+            recordingMeta?.mediaPurged === true ||
+            (recordingMeta?.media_purged_at != null &&
+              String(recordingMeta.media_purged_at).trim() !== "")
+          }
+          mediaPurgedNoteTr={
+            recordingMeta?.mediaPurgedNoteTr != null
+              ? String(recordingMeta.mediaPurgedNoteTr)
+              : null
+          }
         />
       )}
 
