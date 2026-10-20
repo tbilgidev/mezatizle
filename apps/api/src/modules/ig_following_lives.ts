@@ -4,9 +4,9 @@
  * Uses operator cookies + Playwright same-origin web calls (reels_tray /
  * homepage signals). No private API kits, no credential stuffing.
  *
- * Politeness: one browser session per poll; default interval 60–120s;
- * on HTTP 429 back off harder (caller). Prefer reels_tray (single request)
- * over probing every followed profile.
+ * Politeness: one browser session per poll; default interval ~5–6 min
+ * (caller jitter); on HTTP 429 back off harder (caller). Prefer reels_tray
+ * (single request) over probing every followed profile.
  */
 import { readFile } from "node:fs/promises";
 import type { AppEnv } from "../lib/env.ts";

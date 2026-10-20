@@ -521,6 +521,7 @@ export const api = {
         broadcastId: string | null;
         captureStatus: string | null;
       }>;
+      scanPaused: boolean;
       tickCount: number;
       startedAt: string | null;
       labelTr: string;

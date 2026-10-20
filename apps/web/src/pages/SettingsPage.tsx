@@ -32,10 +32,19 @@ type AutoFollowStatus = {
     broadcastId: string | null;
     captureStatus: string | null;
   }>;
+  scanPaused?: boolean;
   labelTr: string;
   hintTr: string;
   cookiesReady: boolean;
 };
+
+function formatPollInterval(ms: number | undefined): string {
+  const n = ms ?? 330_000;
+  const min = n / 60_000;
+  const label =
+    Number.isInteger(min) ? `${min} dk` : `≈${min.toFixed(1).replace(/\.0$/, "")} dk`;
+  return `${label} (5–6 dk aralığında jitter)`;
+}
 
 function formatWhen(iso: string | null | undefined): string {
   if (!iso) return "—";
@@ -243,6 +252,11 @@ export function SettingsPage() {
                       ? "Takip canlıları otomatik kaydet: açık"
                       : "Takip canlıları otomatik kaydet: kapalı")}
                 </Badge>
+                {autoFollow?.scanPaused ? (
+                  <Badge variant="warn" className="ml-2">
+                    Kayıt sürerken tarama duraklatıldı
+                  </Badge>
+                ) : null}
                 {!autoFollow?.cookiesReady ? (
                   <Badge variant="danger" className="ml-2">
                     Çerez gerekli
@@ -259,8 +273,7 @@ export function SettingsPage() {
                       : ""}
                 </li>
                 <li>
-                  Tarama aralığı:{" "}
-                  {Math.round((autoFollow?.pollIntervalMs ?? 90_000) / 1000)} sn
+                  Tarama aralığı: {formatPollInterval(autoFollow?.pollIntervalMs)}
                 </li>
                 <li>
                   Son ayrıntı: {autoFollow?.lastDetail ?? autoFollow?.lastError ?? "—"}

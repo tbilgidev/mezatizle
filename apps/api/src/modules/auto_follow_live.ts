@@ -3,10 +3,14 @@
  *
  * When enabled: poll following-lives → createLiveCapture (same supervisor
  * pipeline) → live ends → finalize MP4 → analysis. Manual "Canlı yayın ekle"
- * remains available. Dedupes by username / broadcast_id while kaydediliyor.
+ * remains available.
+ *
+ * Politeness: poll every ~5–6 minutes (jitter). While any capture is
+ * bekleniyor/kaydediliyor (or live_captures in-flight), pause the IG scan
+ * entirely and never start a second concurrent recording.
  */
 import { mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import type { Sql } from "@mezatizle/db";
 import type { AppEnv } from "../lib/env.ts";
 import { createLiveCapture } from "./live_capture.ts";
@@ -18,6 +22,13 @@ import { extractBroadcastIdFromUrl } from "./ig_live_playwright.ts";
 import { getIgSessionStatus } from "./ig_session.ts";
 
 const CONFIG_FILE = "auto-follow-live.json";
+
+/** Min / max / default IG poll interval (5–6 minutes). */
+export const POLL_MS_MIN = 300_000;
+export const POLL_MS_MAX = 360_000;
+export const POLL_MS_DEFAULT = 330_000;
+/** While a recording is active, re-check DB this often (no IG hit). */
+export const PAUSE_RECHECK_MS = 30_000;
 
 export type AutoFollowLiveConfig = {
   enabled: boolean;
@@ -45,6 +56,7 @@ export type AutoFollowLiveStatus = {
     broadcastId: string | null;
   }>;
   currentlyWatching: AutoFollowWatching[];
+  scanPaused: boolean;
   tickCount: number;
   startedAt: string | null;
   labelTr: string;
@@ -68,10 +80,32 @@ function defaultEnabled(): boolean {
   return process.env.AUTO_FOLLOW_LIVE !== "0";
 }
 
+export function clampPollIntervalMs(n: number): number {
+  if (!Number.isFinite(n)) return POLL_MS_DEFAULT;
+  return Math.min(POLL_MS_MAX, Math.max(POLL_MS_MIN, Math.floor(n)));
+}
+
 function defaultPollMs(): number {
-  const n = Number(process.env.AUTO_FOLLOW_LIVE_POLL_MS ?? "90000");
-  if (!Number.isFinite(n)) return 90_000;
-  return Math.min(180_000, Math.max(60_000, Math.floor(n)));
+  const n = Number(process.env.AUTO_FOLLOW_LIVE_POLL_MS ?? String(POLL_MS_DEFAULT));
+  return clampPollIntervalMs(Number.isFinite(n) ? n : POLL_MS_DEFAULT);
+}
+
+/**
+ * Sleep until next IG poll: random jitter in [5, 6] minutes around the
+ * configured base. On rate-limit, sleep ≥ 12 minutes.
+ */
+export function nextPollSleepMs(
+  baseMs: number,
+  opts?: { rateLimited?: boolean; random?: () => number },
+): number {
+  const rnd = opts?.random ?? Math.random;
+  if (opts?.rateLimited) {
+    return Math.floor(POLL_MS_MAX * 2 + rnd() * 60_000);
+  }
+  const base = clampPollIntervalMs(baseMs);
+  // ±30s around base, clamped to 5–6 min
+  const jittered = base + (rnd() - 0.5) * 60_000;
+  return Math.floor(Math.min(POLL_MS_MAX, Math.max(POLL_MS_MIN, jittered)));
 }
 
 async function ensureConfigDir(env: AppEnv) {
@@ -88,7 +122,7 @@ async function loadPersist(env: AppEnv): Promise<PersistState> {
       enabled: typeof j.enabled === "boolean" ? j.enabled : defaultEnabled(),
       pollIntervalMs:
         typeof j.pollIntervalMs === "number" && Number.isFinite(j.pollIntervalMs)
-          ? Math.min(180_000, Math.max(60_000, Math.floor(j.pollIntervalMs)))
+          ? clampPollIntervalMs(j.pollIntervalMs)
           : defaultPollMs(),
       updatedAt: j.updatedAt ?? null,
       lastPollAt: j.lastPollAt ?? null,
@@ -131,6 +165,22 @@ export type ActiveCaptureRef = {
   status: string;
   captureStatus: string | null;
 };
+
+/**
+ * True when any in-flight capture should pause the follow-live IG scan
+ * and block starting another recording.
+ */
+export function hasBlockingActiveCapture(active: ActiveCaptureRef[]): boolean {
+  return active.some(
+    (a) =>
+      a.captureStatus === "kaydediliyor" ||
+      a.captureStatus === "bekleniyor" ||
+      a.status === "recording" ||
+      a.status === "waiting" ||
+      a.status === "pending" ||
+      a.status === "finalizing",
+  );
+}
 
 /**
  * Pure dedup: skip if same username or same broadcast already in-flight.
@@ -213,10 +263,7 @@ export async function setAutoFollowLiveConfig(
     typeof patch.pollIntervalMs === "number" &&
     Number.isFinite(patch.pollIntervalMs)
   ) {
-    cur.pollIntervalMs = Math.min(
-      180_000,
-      Math.max(60_000, Math.floor(patch.pollIntervalMs)),
-    );
+    cur.pollIntervalMs = clampPollIntervalMs(patch.pollIntervalMs);
   }
   cur.updatedAt = new Date().toISOString();
   await savePersist(env, cur);
@@ -232,8 +279,10 @@ export async function getAutoFollowLiveStatus(
   memoryStatus = s;
   const ig = await getIgSessionStatus(env);
   let currentlyWatching: AutoFollowWatching[] = [];
+  let scanPaused = false;
   if (sql) {
     const active = await listActiveLiveCaptures(sql);
+    scanPaused = hasBlockingActiveCapture(active);
     currentlyWatching = active
       .filter(
         (a) =>
@@ -262,11 +311,12 @@ export async function getAutoFollowLiveStatus(
     lastDetail: s.lastDetail ?? null,
     lastLivesSeen: s.lastLivesSeen ?? [],
     currentlyWatching,
+    scanPaused,
     tickCount,
     startedAt,
     labelTr,
     hintTr:
-      "İzleyici hesabının (nihan.dogansoy) takip ettiği hesaplar canlıya geçince otomatik kayıt başlar. Manuel «Canlı yayın ekle» çalışmaya devam eder.",
+      "İzleyici hesabının (nihan.dogansoy) takip ettiği hesaplar canlıya geçince otomatik kayıt başlar. Tarama ~5–6 dk’da bir; kayıt sürerken (bekleniyor/kaydediliyor) tarama durur — aynı anda tek kayıt. Manuel «Canlı yayın ekle» çalışmaya devam eder.",
     cookiesReady: Boolean(ig.hasCookies) || ig.status === "yuklu",
   };
 }
@@ -275,6 +325,8 @@ export type EnqueueFn = typeof createLiveCapture;
 
 /**
  * One poll → enqueue cycle (injectable for tests / dry-run).
+ * When a capture is already active and dryRun is false, skips the IG scan
+ * entirely and does not enqueue.
  */
 export async function runAutoFollowPollCycle(
   sql: Sql,
@@ -286,6 +338,7 @@ export async function runAutoFollowPollCycle(
   },
 ): Promise<{
   polled: boolean;
+  paused: boolean;
   discovered: FollowingLive[];
   enqueued: Array<{ username: string; recordingId: string | null; skipped?: string }>;
   detail: string;
@@ -293,6 +346,27 @@ export async function runAutoFollowPollCycle(
   const poll = opts?.poll ?? pollFollowingLives;
   const enqueue = opts?.enqueue ?? createLiveCapture;
   const dryRun = Boolean(opts?.dryRun);
+
+  const activeBefore = await listActiveLiveCaptures(sql);
+  if (!dryRun && hasBlockingActiveCapture(activeBefore)) {
+    const who =
+      activeBefore
+        .map((a) => `@${a.username}${a.captureStatus ? ` (${a.captureStatus})` : ""}`)
+        .join(", ") || "kayıt";
+    const detail = `Kayıt sürüyor (${who}) — takip taraması duraklatıldı.`;
+    const state = await loadPersist(env);
+    state.lastDetail = detail;
+    state.lastError = null;
+    await savePersist(env, state);
+    memoryStatus = state;
+    return {
+      polled: false,
+      paused: true,
+      discovered: [],
+      enqueued: [],
+      detail,
+    };
+  }
 
   const result = await poll(env);
   const state = await loadPersist(env);
@@ -306,6 +380,7 @@ export async function runAutoFollowPollCycle(
     memoryStatus = state;
     return {
       polled: true,
+      paused: false,
       discovered: [],
       enqueued: [],
       detail: result.detail,
@@ -324,6 +399,26 @@ export async function runAutoFollowPollCycle(
   memoryStatus = state;
 
   const active = await listActiveLiveCaptures(sql);
+  if (!dryRun && hasBlockingActiveCapture(active)) {
+    const detail =
+      "Tarama sonrası kayıt bulundu — yeni otomatik kayıt başlatılmadı (tek eşzamanlı kayıt).";
+    state.lastDetail = detail;
+    await savePersist(env, state);
+    memoryStatus = state;
+    return {
+      polled: true,
+      paused: true,
+      discovered: result.lives,
+      enqueued: result.lives.map((l) => ({
+        username: l.username,
+        recordingId:
+          active.find((a) => a.username === l.username)?.recordingId ?? null,
+        skipped: "recording_active",
+      })),
+      detail,
+    };
+  }
+
   const needed = filterLivesNeedingCapture(result.lives, active);
   const enqueued: Array<{
     username: string;
@@ -331,7 +426,10 @@ export async function runAutoFollowPollCycle(
     skipped?: string;
   }> = [];
 
-  for (const live of needed) {
+  // At most one new capture per cycle (never concurrent auto recordings).
+  const toStart = dryRun ? needed : needed.slice(0, 1);
+
+  for (const live of toStart) {
     if (dryRun) {
       enqueued.push({
         username: live.username,
@@ -368,6 +466,14 @@ export async function runAutoFollowPollCycle(
     }
   }
 
+  for (const live of needed.slice(toStart.length)) {
+    enqueued.push({
+      username: live.username,
+      recordingId: null,
+      skipped: "max_one_concurrent",
+    });
+  }
+
   // Also report already-active skips for clarity
   for (const live of result.lives) {
     if (needed.some((n) => n.username === live.username)) continue;
@@ -381,24 +487,20 @@ export async function runAutoFollowPollCycle(
 
   return {
     polled: true,
+    paused: false,
     discovered: result.lives,
     enqueued,
     detail: result.detail,
   };
 }
 
-function sleepMsFor(state: PersistState, lastFailKind?: string | null): number {
-  if (lastFailKind === "rate_limited") {
-    return Math.max(state.pollIntervalMs, 180_000);
-  }
-  return state.pollIntervalMs;
-}
-
 export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
   if (loopStarted) return;
   loopStarted = true;
   startedAt = new Date().toISOString();
-  console.log("[auto-follow] supervisor started");
+  console.log(
+    `[auto-follow] supervisor started (poll ${POLL_MS_MIN / 1000}–${POLL_MS_MAX / 1000}s jitter)`,
+  );
 
   let lastFailKind: string | null = null;
 
@@ -409,7 +511,7 @@ export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
       memoryStatus = state;
 
       if (!state.enabled) {
-        await Bun.sleep(state.pollIntervalMs);
+        await Bun.sleep(nextPollSleepMs(state.pollIntervalMs));
         continue;
       }
 
@@ -420,20 +522,42 @@ export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
         state.lastDetail = state.lastError;
         await savePersist(env, state);
         memoryStatus = state;
-        await Bun.sleep(state.pollIntervalMs);
+        await Bun.sleep(nextPollSleepMs(state.pollIntervalMs));
+        continue;
+      }
+
+      // Pause IG scan entirely while any recording is in progress.
+      const active = await listActiveLiveCaptures(sql);
+      if (hasBlockingActiveCapture(active)) {
+        const who =
+          active
+            .map(
+              (a) =>
+                `@${a.username}${a.captureStatus ? ` (${a.captureStatus})` : ""}`,
+            )
+            .join(", ") || "kayıt";
+        state.lastDetail = `Kayıt sürüyor (${who}) — takip taraması duraklatıldı.`;
+        state.lastError = null;
+        await savePersist(env, state);
+        memoryStatus = state;
+        await Bun.sleep(PAUSE_RECHECK_MS);
         continue;
       }
 
       const cycle = await runAutoFollowPollCycle(sql, env);
-      lastFailKind = cycle.discovered.length === 0 && !cycle.detail.includes("aktif canlı yok")
-        ? null
-        : lastFailKind;
-      // Detect rate limit from detail
+      if (cycle.paused) {
+        await Bun.sleep(PAUSE_RECHECK_MS);
+        continue;
+      }
+
       if (/429|rate-limit/i.test(cycle.detail)) lastFailKind = "rate_limited";
-      else if (cycle.enqueued.some((e) => e.recordingId)) lastFailKind = null;
       else lastFailKind = null;
 
-      await Bun.sleep(sleepMsFor(state, lastFailKind));
+      await Bun.sleep(
+        nextPollSleepMs(state.pollIntervalMs, {
+          rateLimited: lastFailKind === "rate_limited",
+        }),
+      );
     } catch (err) {
       console.error("[auto-follow] tick error", err);
       const state = await loadPersist(env);
@@ -442,7 +566,7 @@ export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
       state.lastPollAt = new Date().toISOString();
       await savePersist(env, state);
       memoryStatus = state;
-      await Bun.sleep(defaultPollMs());
+      await Bun.sleep(nextPollSleepMs(defaultPollMs()));
     }
   }
 }
