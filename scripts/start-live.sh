@@ -16,6 +16,12 @@ export WHISPER_MODEL="${WHISPER_MODEL:-base}"
 export OCR_ENGINE="${OCR_ENGINE:-tesseract}"
 export OCR_FPS="${OCR_FPS:-1}"
 export FRAME_INTERVAL_SECONDS="${FRAME_INTERVAL_SECONDS:-1}"
+# Watchable live masters — size via resolution/CRF, never low-FPS frame skip
+export LIVE_MAX_HEIGHT="${LIVE_MAX_HEIGHT:-720}"
+export LIVE_FPS="${LIVE_FPS:-30}"
+export LIVE_CRF="${LIVE_CRF:-26}"
+export LIVE_MAXRATE_K="${LIVE_MAXRATE_K:-2500}"
+export LIVE_AUDIO_K="${LIVE_AUDIO_K:-96}"
 
 mkdir -p storage/recordings storage/audio storage/frames storage/products storage/secrets logs
 
@@ -41,6 +47,11 @@ nohup env -u FORCE_MOCK_ASR -u FORCE_MOCK_OCR \
   PROCESSING_PROFILE="$PROCESSING_PROFILE" \
   EMBEDDED_WORKER=1 \
   LIVE_CAPTURE_SUPERVISOR=1 \
+  LIVE_MAX_HEIGHT="$LIVE_MAX_HEIGHT" \
+  LIVE_FPS="$LIVE_FPS" \
+  LIVE_CRF="$LIVE_CRF" \
+  LIVE_MAXRATE_K="$LIVE_MAXRATE_K" \
+  LIVE_AUDIO_K="$LIVE_AUDIO_K" \
   DATABASE_URL="$DATABASE_URL" \
   PYTHON_BIN="$PYTHON_BIN" \
   WHISPER_MODEL="$WHISPER_MODEL" \

@@ -15,19 +15,23 @@ https://tolga-mini.tailf479ba.ts.net/mezatizle/settings#ig-oturum
 
 Use **your own backup account** (watch/record only). No private API / anti-bot kits. Consent & platform rules are the operator’s responsibility. Secrets are not logged.
 
-## Default quality (disk vs analysis)
+## Default quality (watchable + analyzable)
 
 | Setting | Default | Why |
 |---------|---------|-----|
-| Max height | **720p** | Enough for comment/product OCR; not 1080p bloat |
-| FPS | **20** | Speech + overlays; long lives stay smaller |
-| Video | H.264 **CRF 28**, maxrate ~**1800 kbps**, `veryfast` | Analyzable, compact |
-| Audio | AAC **80 kbps** mono | Enough for Turkish ASR |
+| Max height | **720p** | Size via resolution; never upscale |
+| FPS | **30** CFR | Watchable; **do not** drop to 15–20 for size |
+| Video | H.264 **CRF 26**, maxrate ~**2500 kbps**, `veryfast` | Size via CRF/bitrate |
+| Audio | AAC **96 kbps** mono + `aresample=async=1` | ASR + A/V sync |
+| Capture MP4 | `frag_keyframe+empty_moov+default_base_moof` | Forced stop still readable |
+| Finalize | remux `-c copy +faststart` | Progressive moov for players |
 | yt-dlp `-f` | `best[height<=720]/…` | Prefer ≤720 before ffmpeg |
 
-Pipeline: resolve stream with yt-dlp (`-g`) → **ffmpeg** live encode to `storage/recordings/<id>.mp4`.
+Pipeline: Playwright/yt-dlp resolve → **ffmpeg** encode (fragmented part) → remux master → analysis.
 
 Override via env: `LIVE_MAX_HEIGHT`, `LIVE_FPS`, `LIVE_CRF`, `LIVE_MAXRATE_K`, `LIVE_AUDIO_K`, `LIVE_YTDLP_FORMAT`.
+
+**Comment time:** `offset_ms = comment_wall_ms − capture_started_at` → seek video at `offset_ms/1000` s. Live API poll ~5s; OCR secondary.
 
 ## Analysis (LOCAL, no mocks)
 

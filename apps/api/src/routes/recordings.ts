@@ -5,8 +5,18 @@ import { createRecordingFromUpload } from "../modules/ingestion.ts";
 import {
   cancelLiveCapture,
   createLiveCapture,
+  resumeBlockedLiveCapture,
   LIVE_CAPTURE_POLICY,
 } from "../modules/live_capture.ts";
+import { safeJoinStorage } from "../lib/storage.ts";
+import { streamFileWithRanges } from "../lib/media-stream.ts";
+import { probeAvSync } from "../lib/ffmpeg.ts";
+import { enrichRecordingRow } from "../lib/recording-enrich.ts";
+import {
+  bulkDeleteRecordings,
+  deleteRecording,
+  deleteOrphanSellers,
+} from "../modules/recording-delete.ts";
 
 export function recordingsRoutes(sql: Sql, env: AppEnv) {
   const app = new Hono();
@@ -14,14 +24,62 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
   app.get("/", async (c) => {
     const rows = await sql`
       SELECT r.*, s.instagram_username, s.display_name,
-             lc.status AS live_status, lc.attempt_count, lc.last_probe_detail
+             lc.status AS live_status, lc.attempt_count, lc.last_probe_detail,
+             lc.last_probe_at, lc.last_probe_detail AS last_error
       FROM recordings r
       JOIN sellers s ON s.id = r.seller_id
       LEFT JOIN live_captures lc ON lc.recording_id = r.id
       ORDER BY r.uploaded_at DESC
       LIMIT 200
     `;
-    return c.json({ recordings: rows });
+    // Prefer explicit capture_error for UI; fall back to probe detail.
+    // Heal file_size_bytes from finalized MP4 on disk (sizeTimer can race to 0).
+    const recordings = await Promise.all(
+      rows.map(async (r) => {
+        const enriched = await enrichRecordingRow(
+          env,
+          sql,
+          r as Record<string, unknown>,
+        );
+        return {
+          ...enriched,
+          lastError:
+            (enriched.capture_error as string | null) ??
+            (enriched.last_probe_detail as string | null) ??
+            null,
+        };
+      }),
+    );
+    return c.json({ recordings });
+  });
+
+  /** Bulk delete — register before /:id so path is not swallowed. */
+  app.post("/bulk-delete", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      ids?: unknown;
+    };
+    const ids = Array.isArray(body.ids)
+      ? body.ids.map((x) => String(x)).filter(Boolean)
+      : [];
+    if (!ids.length) {
+      return c.json({ error: "ids dizisi gerekli" }, 400);
+    }
+    if (ids.length > 200) {
+      return c.json({ error: "En fazla 200 kayıt silinebilir" }, 400);
+    }
+    try {
+      const result = await bulkDeleteRecordings(sql, env, ids);
+      const deletedCount = result.deleted.filter((d) => d.deleted).length;
+      return c.json({
+        ok: true,
+        deletedCount,
+        orphanSellersRemoved: result.orphanSellersRemoved,
+        results: result.deleted,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 500);
+    }
   });
 
   app.post("/live", async (c) => {
@@ -69,6 +127,18 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
     }
   });
 
+  /** After refreshing IG cookies: blocked/not_found → waiting again. */
+  app.post("/:id/retry-live", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const result = await resumeBlockedLiveCapture(sql, id);
+      return c.json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
+  });
+
   app.get("/:id", async (c) => {
     const id = c.req.param("id");
     const rows = await sql`
@@ -83,7 +153,31 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
       FROM processing_jobs WHERE recording_id = ${id}
       ORDER BY priority ASC, created_at ASC
     `;
-    return c.json({ recording: rows[0], jobs });
+    const recording = await enrichRecordingRow(
+      env,
+      sql,
+      rows[0] as Record<string, unknown>,
+    );
+    return c.json({ recording, jobs });
+  });
+
+  app.delete("/:id", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const result = await deleteRecording(sql, env, id);
+      if (!result.deleted) {
+        return c.json({ error: "Bulunamadı", ...result }, 404);
+      }
+      const orphanSellersRemoved = await deleteOrphanSellers(sql);
+      return c.json({
+        ok: true,
+        ...result,
+        orphanSellersRemoved,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 500);
+    }
   });
 
   app.post("/upload", async (c) => {
@@ -134,6 +228,39 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
       ORDER BY priority ASC
     `;
     return c.json({ jobs: rows });
+  });
+
+  /** Master MP4 — byte-range friendly for Kanıt / Raporlar seek (read-only). */
+  app.on(["GET", "HEAD"], "/:id/media", async (c) => {
+    const id = c.req.param("id");
+    const rows = await sql<{ storage_path: string }[]>`
+      SELECT storage_path FROM recordings WHERE id = ${id}
+    `;
+    if (!rows[0]) return c.json({ error: "Bulunamadı" }, 404);
+    try {
+      const abs = safeJoinStorage(env.storageRoot, rows[0].storage_path);
+      return streamFileWithRanges(abs, c.req.raw, "video/mp4");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
+  });
+
+  /** A/V sync diagnostic on master timeline. */
+  app.get("/:id/av-sync", async (c) => {
+    const id = c.req.param("id");
+    const rows = await sql<{ storage_path: string }[]>`
+      SELECT storage_path FROM recordings WHERE id = ${id}
+    `;
+    if (!rows[0]) return c.json({ error: "Bulunamadı" }, 404);
+    try {
+      const abs = safeJoinStorage(env.storageRoot, rows[0].storage_path);
+      const sync = await probeAvSync(env.ffprobePath, abs);
+      return c.json({ recordingId: id, sync });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
   });
 
   return app;
