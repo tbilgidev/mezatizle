@@ -27,6 +27,7 @@ import {
 import { probeAvSync } from "../lib/ffmpeg.ts";
 import {
   extractBroadcastIdFromUrl,
+  ensureLiveViewerPresence,
   getLiveViewerPresenceHealth,
   resolveLiveStreamWithPlaywright,
   startLiveViewerPresence,
@@ -34,12 +35,74 @@ import {
   usernameFromWatchUrl,
   type LiveCommentHit,
 } from "./ig_live_playwright.ts";
+import {
+  appendCommentAssCue,
+  burnCommentsIntoMaster,
+  commentsAssPath,
+  COMMENT_DROUGHT_MINUTES,
+} from "./comment_burnin.ts";
 import { access } from "node:fs/promises";
 import { resolve } from "node:path";
+
+function attachViewerPresence(
+  sql: Sql,
+  env: AppEnv,
+  opts: {
+    recordingId: string;
+    watchUrl: string;
+    username?: string;
+    broadcastId?: string | null;
+    /** First start may force fresh; watchdog uses ensure. */
+    mode: "start" | "ensure";
+  },
+) {
+  const onComments = (hits: LiveCommentHit[]) =>
+    persistLiveComments(sql, env, opts.recordingId, hits);
+  const run =
+    opts.mode === "ensure"
+      ? ensureLiveViewerPresence(env, {
+          recordingId: opts.recordingId,
+          watchUrl: opts.watchUrl,
+          username: opts.username,
+          broadcastId: opts.broadcastId,
+          onComments,
+        })
+      : startLiveViewerPresence(env, {
+          recordingId: opts.recordingId,
+          watchUrl: opts.watchUrl,
+          username: opts.username,
+          broadcastId: opts.broadcastId,
+          onComments,
+        }).then((r) =>
+          r.ok
+            ? { ok: true as const, presence: r.presence, reused: false }
+            : r,
+        );
+  void run
+    .then((r) => {
+      if (!r.ok) {
+        console.error(
+          `[live-viewer] ${opts.recordingId} FAILED: ${r.detail}`,
+        );
+        return;
+      }
+      if (r.reused) return;
+      console.log(
+        `[live-viewer] ${opts.recordingId} presence ready (comments=on)`,
+      );
+    })
+    .catch((err) => {
+      console.error(
+        `[live-viewer] ${opts.recordingId} unhandled:`,
+        err instanceof Error ? err.message : err,
+      );
+    });
+}
 
 /** Persist live API comments (DASH video has no comment overlay for OCR). */
 export async function persistLiveComments(
   sql: Sql,
+  env: AppEnv,
   recordingId: string,
   hits: LiveCommentHit[],
 ): Promise<number> {
@@ -50,6 +113,9 @@ export async function persistLiveComments(
   const startMs = rec?.capture_started_at
     ? new Date(rec.capture_started_at).getTime()
     : null;
+  const assPath = commentsAssPath(
+    safeJoinStorage(env.storageRoot, "recordings", `${recordingId}.mp4`),
+  );
   let inserted = 0;
   for (const h of hits) {
     const body = h.text.trim();
@@ -95,8 +161,32 @@ export async function persistLiveComments(
       )
     `;
     inserted += 1;
+    // Sidecar ASS for finalize burn-in (human QC in Video player)
+    try {
+      await appendCommentAssCue(assPath, {
+        offsetMs: offsetMs ?? 0,
+        username: author,
+        text: body,
+      });
+    } catch (err) {
+      console.warn(
+        `[live-comments] ${recordingId} ASS append:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
   if (inserted) {
+    // Clear drought warning once comments flow
+    try {
+      await sql`
+        UPDATE live_captures
+        SET comments_warning = NULL, updated_at = now()
+        WHERE recording_id = ${recordingId}
+          AND comments_warning IS NOT NULL
+      `;
+    } catch {
+      /* column may not exist until migrate */
+    }
     console.log(
       `[live-comments] ${recordingId} +${inserted}/${hits.length} (authors=${hits.filter((x) => x.username).length})`,
     );
@@ -769,17 +859,13 @@ async function startRecordingProcess(
   `;
 
   // Keep spare-account browser session "watching" so IG can list them as a viewer.
-  // Also polls get_comment → observed_comments (DASH has no comment UI for OCR).
-  void startLiveViewerPresence(env, {
+  // Also polls get_comment → observed_comments + ASS sidecar (DASH has no comment UI).
+  attachViewerPresence(sql, env, {
     recordingId,
     watchUrl: watchUrlPinned,
     username: usernameFromWatchUrl(watchUrlPinned) ?? undefined,
     broadcastId,
-    onComments: (hits) => persistLiveComments(sql, recordingId, hits),
-  }).then((r) => {
-    if (!r.ok) {
-      console.warn(`[live-viewer] ${recordingId}: ${r.detail}`);
-    }
+    mode: "start",
   });
 
   let stderr = "";
@@ -1144,6 +1230,24 @@ async function finalizeRecording(
     return;
   }
 
+  // Burn polled comments into the master (HUD) — best-effort, never blocks A/V finalize
+  let burnDetail = "burn_skipped";
+  try {
+    const burned = await burnCommentsIntoMaster({
+      ffmpegPath: env.ffmpegPath,
+      masterAbs: destAbs,
+    });
+    burnDetail = burned.detail;
+    if (burned.burned) {
+      console.log(`[live-comments] ${recordingId} ${burnDetail}`);
+    } else if (!burned.ok) {
+      console.warn(`[live-comments] ${recordingId} burn failed: ${burnDetail}`);
+    }
+  } catch (err) {
+    burnDetail = err instanceof Error ? err.message : String(err);
+    console.warn(`[live-comments] ${recordingId} burn error: ${burnDetail}`);
+  }
+
   const finalBytes = await fileSize(destAbs);
   let syncDetail = "A/V sync check skipped";
   try {
@@ -1155,10 +1259,24 @@ async function finalizeRecording(
   } catch (err) {
     syncDetail = err instanceof Error ? err.message : String(err);
   }
+  const [cCount] = await sql<{ n: string }[]>`
+    SELECT COUNT(*)::text AS n FROM observed_comments
+    WHERE recording_id = ${recordingId} AND source = 'live_api'
+  `;
+  const liveApiN = Number(cCount?.n ?? 0);
+  const commentsWarning =
+    liveApiN === 0 ? "Yorum yok" : null;
+  if (liveApiN === 0) {
+    console.error(
+      `[live-comments] ${recordingId} finalized with 0 live_api comments — cannot backfill after live ends`,
+    );
+  }
+  const probeDetail = `${syncDetail} · comments=${liveApiN} · ${burnDetail}`;
   await sql`
     UPDATE live_captures
     SET status = 'completed',
-        last_probe_detail = ${syncDetail},
+        last_probe_detail = ${probeDetail},
+        comments_warning = ${commentsWarning},
         updated_at = now()
     WHERE recording_id = ${recordingId}
   `;
@@ -1175,7 +1293,7 @@ async function finalizeRecording(
   `;
   await enqueueAnalysisPipeline(sql, recordingId);
   console.log(
-    `[live-capture] finalized ${recordingId} bytes=${finalBytes} exit=${code}`,
+    `[live-capture] finalized ${recordingId} bytes=${finalBytes} exit=${code} comments=${liveApiN}`,
   );
 }
 
@@ -1344,6 +1462,46 @@ export async function liveCaptureLoop(sql: Sql, env: AppEnv) {
   }
 }
 
+/**
+ * Loud warning when kaydediliyor for N+ minutes with 0 live_api comments.
+ * Sets live_captures.comments_warning for UI "Yorum yok" badge.
+ */
+export async function warnCommentDroughtIfNeeded(
+  sql: Sql,
+  recordingId: string,
+  captureStartedAt: Date | string | null | undefined,
+): Promise<boolean> {
+  if (!captureStartedAt) return false;
+  const startedMs = new Date(captureStartedAt).getTime();
+  if (!Number.isFinite(startedMs)) return false;
+  const elapsedMin = (Date.now() - startedMs) / 60_000;
+  if (elapsedMin < COMMENT_DROUGHT_MINUTES) return false;
+  const [row] = await sql<{ n: string }[]>`
+    SELECT COUNT(*)::text AS n FROM observed_comments
+    WHERE recording_id = ${recordingId} AND source = 'live_api'
+  `;
+  const n = Number(row?.n ?? 0);
+  if (n > 0) return false;
+  const msg = `Yorum yok — ${Math.floor(elapsedMin)}dk kaydediliyor, live_api=0 (viewer/poll kontrol et)`;
+  console.error(`[live-comments] DROUGHT ${recordingId}: ${msg}`);
+  try {
+    await sql`
+      UPDATE live_captures
+      SET comments_warning = ${"Yorum yok"},
+          last_probe_detail = ${msg},
+          updated_at = now()
+      WHERE recording_id = ${recordingId}
+        AND status IN ('recording', 'finalizing')
+    `;
+  } catch (err) {
+    console.warn(
+      `[live-comments] drought update failed:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+  return true;
+}
+
 async function tickRecordingWatchdogs(sql: Sql, env: AppEnv) {
   const rows = await sql<{
     recording_id: string;
@@ -1368,18 +1526,15 @@ async function tickRecordingWatchdogs(sql: Sql, env: AppEnv) {
       activeProcs.has(row.recording_id) ||
       pidAlive(row.process_pid != null ? Number(row.process_pid) : null);
     if (alive) {
-      // ffmpeg still running after API restart — ensure viewer presence
-      void startLiveViewerPresence(env, {
+      // ffmpeg still running — ensure viewer+comment poll WITHOUT killing a healthy session
+      attachViewerPresence(sql, env, {
         recordingId: row.recording_id,
         watchUrl: row.watch_url,
         username: usernameFromWatchUrl(row.watch_url) ?? undefined,
         broadcastId: extractBroadcastIdFromUrl(row.watch_url),
-        onComments: (hits) => persistLiveComments(sql, row.recording_id, hits),
-      }).then((r) => {
-        if (!r.ok) {
-          console.warn(`[live-viewer] resume ${row.recording_id}: ${r.detail}`);
-        }
+        mode: "ensure",
       });
+      await warnCommentDroughtIfNeeded(sql, row.recording_id, row.capture_started_at);
     } else {
       // Dead with no usable media — leave waiting only if still flagged recording
       const st = await sql<{ status: string }[]>`

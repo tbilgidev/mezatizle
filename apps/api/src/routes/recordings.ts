@@ -25,7 +25,12 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
     const rows = await sql`
       SELECT r.*, s.instagram_username, s.display_name,
              lc.status AS live_status, lc.attempt_count, lc.last_probe_detail,
-             lc.last_probe_at, lc.last_probe_detail AS last_error
+             lc.last_probe_at, lc.last_probe_detail AS last_error,
+             lc.comments_warning,
+             (SELECT COUNT(*)::int FROM observed_comments oc
+               WHERE oc.recording_id = r.id AND oc.source = 'live_api') AS live_comment_count,
+             (SELECT COUNT(*)::int FROM observed_comments oc
+               WHERE oc.recording_id = r.id) AS comment_count
       FROM recordings r
       JOIN sellers s ON s.id = r.seller_id
       LEFT JOIN live_captures lc ON lc.recording_id = r.id

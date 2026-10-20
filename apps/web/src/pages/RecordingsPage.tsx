@@ -555,7 +555,31 @@ export function RecordingsPage() {
                             );
                           })()}
                         </TD>
-                        <TD>{statusBadge(r)}</TD>
+                        <TD>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {statusBadge(r)}
+                            {r.commentsMissing || r.commentsWarning || r.comments_warning ? (
+                              <Badge
+                                variant="danger"
+                                title={String(
+                                  r.commentsWarning ??
+                                    r.comments_warning ??
+                                    "Canlı API yorumu yok — analiz/QC için yorum şart",
+                                )}
+                              >
+                                Yorum yok
+                              </Badge>
+                            ) : Number(r.liveCommentCount ?? r.live_comment_count ?? 0) >
+                              0 ? (
+                              <Badge
+                                variant="ok"
+                                title={`live_api yorum: ${Number(r.liveCommentCount ?? r.live_comment_count)}`}
+                              >
+                                {Number(r.liveCommentCount ?? r.live_comment_count)} yorum
+                              </Badge>
+                            ) : null}
+                          </div>
+                        </TD>
                         <TD>
                           {r.capture_bytes != null && Number(r.capture_bytes) > 0
                             ? `${(Number(r.capture_bytes) / (1024 * 1024)).toFixed(1)} MB`

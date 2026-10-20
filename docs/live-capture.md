@@ -31,7 +31,7 @@ Pipeline: Playwright/yt-dlp resolve → **ffmpeg** encode (fragmented part) → 
 
 Override via env: `LIVE_MAX_HEIGHT`, `LIVE_FPS`, `LIVE_CRF`, `LIVE_MAXRATE_K`, `LIVE_AUDIO_K`, `LIVE_YTDLP_FORMAT`.
 
-**Comment time:** `offset_ms = comment_wall_ms − capture_started_at` → seek video at `offset_ms/1000` s. Live API poll ~5s; OCR secondary.
+**Comments (required):** Playwright viewer polls `get_comment` ~5s for the full capture → `observed_comments` (`live_api`), `offset_ms = comment_wall_ms − capture_started_at`. Same cues → ASS sidecar → finalize **burn-in HUD** on the master MP4 (Video open). If 0 comments after ~2 min kaydediliyor → log + UI **Yorum yok**. Ended lives cannot be backfilled. Watchdog must **not** restart a healthy viewer (that bug zeroed Yeşilköy comments).
 
 ## Analysis (LOCAL, no mocks)
 

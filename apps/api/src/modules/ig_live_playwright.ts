@@ -533,12 +533,23 @@ export async function whoamiIgCookies(
   }
 }
 
+export type LiveViewerPresenceHealth = {
+  lastHeartbeatOk: boolean;
+  lastHeartbeatDetail: string;
+  lastHeartbeatAt: number;
+  lastCommentPollAt: number;
+  lastCommentPollDetail: string;
+  commentHitTotal: number;
+  commentPollCount: number;
+};
+
 export type LiveViewerPresence = {
   recordingId: string;
   broadcastId: string;
   username: string;
   cookieUsername: string | null;
   startedAt: string;
+  getHealth: () => LiveViewerPresenceHealth;
   stop: () => Promise<void>;
 };
 
@@ -546,14 +557,51 @@ const viewerSessions = new Map<string, LiveViewerPresence>();
 
 export function getLiveViewerPresenceHealth() {
   return {
-    active: [...viewerSessions.values()].map((s) => ({
-      recordingId: s.recordingId,
-      broadcastId: s.broadcastId,
-      seller: s.username,
-      cookieUsername: s.cookieUsername,
-      startedAt: s.startedAt,
-    })),
+    active: [...viewerSessions.values()].map((s) => {
+      const h = s.getHealth();
+      return {
+        recordingId: s.recordingId,
+        broadcastId: s.broadcastId,
+        seller: s.username,
+        cookieUsername: s.cookieUsername,
+        startedAt: s.startedAt,
+        commentHitTotal: h.commentHitTotal,
+        commentPollCount: h.commentPollCount,
+        lastCommentPollDetail: h.lastCommentPollDetail,
+        lastHeartbeatOk: h.lastHeartbeatOk,
+      };
+    }),
   };
+}
+
+export function getLiveViewerSession(
+  recordingId: string,
+): LiveViewerPresence | undefined {
+  return viewerSessions.get(recordingId);
+}
+
+/**
+ * Healthy = session exists, heartbeat recent OR last ok, and comment poll
+ * (when enabled) has ticked within ~60s without a hard browser-closed failure.
+ */
+export function isLiveViewerPresenceHealthy(
+  recordingId: string,
+  opts?: { requireComments?: boolean },
+): boolean {
+  const s = viewerSessions.get(recordingId);
+  if (!s) return false;
+  const h = s.getHealth();
+  const now = Date.now();
+  const hbFresh = now - h.lastHeartbeatAt < 45_000;
+  if (!hbFresh && !h.lastHeartbeatOk) return false;
+  if (opts?.requireComments !== false) {
+    if (h.commentPollCount < 1) return false;
+    if (now - h.lastCommentPollAt > 60_000) return false;
+    if (/Target page|browser has been closed|launch/i.test(h.lastCommentPollDetail)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -574,6 +622,42 @@ export type LiveCommentHit = {
   createdAtMs: number | null;
   pk: string | null;
 };
+
+/**
+ * Start or keep the Playwright viewer+comment poll for a recording.
+ * CRITICAL: do NOT tear down a healthy session on every supervisor tick —
+ * that was killing get_comment polls (Yeşilköy 8dcb0555 class: 0 comments).
+ */
+export async function ensureLiveViewerPresence(
+  env: AppEnv,
+  opts: {
+    recordingId: string;
+    watchUrl: string;
+    username?: string;
+    broadcastId?: string | null;
+    onComments?: (hits: LiveCommentHit[]) => void | Promise<void>;
+  },
+): Promise<
+  | { ok: true; presence: LiveViewerPresence; reused: boolean }
+  | { ok: false; detail: string }
+> {
+  if (isLiveViewerPresenceHealthy(opts.recordingId, { requireComments: true })) {
+    return {
+      ok: true,
+      presence: viewerSessions.get(opts.recordingId)!,
+      reused: true,
+    };
+  }
+  if (viewerSessions.has(opts.recordingId)) {
+    const h = viewerSessions.get(opts.recordingId)!.getHealth();
+    console.warn(
+      `[live-viewer] restart unhealthy ${opts.recordingId} polls=${h.commentPollCount} hits=${h.commentHitTotal} detail=${h.lastCommentPollDetail}`,
+    );
+  }
+  const started = await startLiveViewerPresence(env, opts);
+  if (!started.ok) return started;
+  return { ok: true, presence: started.presence, reused: false };
+}
 
 export async function startLiveViewerPresence(
   env: AppEnv,
@@ -636,7 +720,16 @@ export async function startLiveViewerPresence(
     return { ok: false, detail: "Playwright yüklü değil" };
   }
 
-  const browser = await chromium.launch({ headless: true });
+  let browser: Awaited<ReturnType<typeof chromium.launch>>;
+  try {
+    browser = await chromium.launch({ headless: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message.slice(0, 160) : String(err);
+    console.error(
+      `[live-viewer] ${opts.recordingId} chromium.launch failed: ${msg}`,
+    );
+    return { ok: false, detail: `Playwright launch: ${msg}` };
+  }
   const context = await browser.newContext({
     userAgent:
       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -654,15 +747,18 @@ export async function startLiveViewerPresence(
   let commentTimer: ReturnType<typeof setInterval> | null = null;
   let lastHeartbeatOk = false;
   let lastHeartbeatDetail = "starting";
+  let lastHeartbeatAt = Date.now();
   let lastCommentTs = 0;
   const seenCommentPks = new Set<string>();
   let commentPollCount = 0;
   let commentHitTotal = 0;
   let lastCommentPollDetail = "not_started";
+  let lastCommentPollAt = 0;
 
   const pollCommentsOnce = async () => {
     if (stopped || !opts.onComments) return;
     commentPollCount += 1;
+    lastCommentPollAt = Date.now();
     try {
       const r = await page.evaluate(
         async ({ broadcastId, lastCommentTs }) => {
@@ -819,11 +915,13 @@ export async function startLiveViewerPresence(
         { broadcastId: broadcastId!, username },
       );
       lastHeartbeatOk = r.status === 200;
+      lastHeartbeatAt = Date.now();
       lastHeartbeatDetail = lastHeartbeatOk
         ? `heartbeat_ok viewers=${r.viewer_count ?? "?"} status=${r.broadcast_status ?? "?"}`
         : `heartbeat_http_${r.status}`;
     } catch (err) {
       lastHeartbeatOk = false;
+      lastHeartbeatAt = Date.now();
       lastHeartbeatDetail =
         err instanceof Error ? err.message.slice(0, 120) : String(err);
     }
@@ -915,6 +1013,15 @@ export async function startLiveViewerPresence(
     username,
     cookieUsername,
     startedAt: new Date().toISOString(),
+    getHealth: () => ({
+      lastHeartbeatOk,
+      lastHeartbeatDetail,
+      lastHeartbeatAt,
+      lastCommentPollAt,
+      lastCommentPollDetail,
+      commentHitTotal,
+      commentPollCount,
+    }),
     stop: async () => {
       if (stopped) return;
       stopped = true;
@@ -929,7 +1036,7 @@ export async function startLiveViewerPresence(
         /* ignore */
       }
       console.log(
-        `[live-viewer] stopped ${opts.recordingId} last=${lastHeartbeatDetail}`,
+        `[live-viewer] stopped ${opts.recordingId} last=${lastHeartbeatDetail} comments=${commentHitTotal}`,
       );
     },
   };

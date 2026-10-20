@@ -193,6 +193,18 @@ export async function enrichRecordingRow(
   );
   const { analysisProgress, analysisStage } = deriveAnalysisProgress(jobs);
 
+  const liveCommentCount = Number(row.live_comment_count ?? 0);
+  const commentCount = Number(row.comment_count ?? liveCommentCount);
+  const captureStatus = String(row.capture_status ?? "");
+  const isLive = String(row.source_type) === "live";
+  // Prefer DB drought flag; for finished lives with 0 comments always surface.
+  const commentsWarning =
+    row.comments_warning != null && String(row.comments_warning).trim()
+      ? String(row.comments_warning).trim()
+      : isLive && captureStatus === "bitti" && liveCommentCount === 0
+        ? "Yorum yok"
+        : null;
+
   return {
     ...row,
     file_size_bytes: fileSizeBytes,
@@ -203,5 +215,9 @@ export async function enrichRecordingRow(
     analysisState,
     analysisProgress,
     analysisStage,
+    liveCommentCount,
+    commentCount,
+    commentsWarning,
+    commentsMissing: Boolean(commentsWarning),
   };
 }
