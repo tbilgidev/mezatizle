@@ -11,6 +11,7 @@ import { reportsRoutes } from "./routes/reports.ts";
 import { productsRoutes } from "./routes/products.ts";
 import { workerLoop } from "./worker.ts";
 import { liveCaptureLoop } from "./modules/live_capture.ts";
+import { autoFollowLiveLoop } from "./modules/auto_follow_live.ts";
 
 const env = loadEnv();
 await ensureStorageDirs(env.storageRoot);
@@ -51,6 +52,9 @@ if (embeddedWorker) {
 }
 if (process.env.LIVE_CAPTURE_SUPERVISOR !== "0") {
   liveCaptureLoop(sql, env).catch((e) => console.error("[live-capture]", e));
+}
+if (process.env.AUTO_FOLLOW_LIVE !== "0") {
+  autoFollowLiveLoop(sql, env).catch((e) => console.error("[auto-follow]", e));
 }
 
 console.log(

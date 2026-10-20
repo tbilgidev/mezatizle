@@ -505,6 +505,40 @@ export const api = {
     }
     return data as Record<string, unknown>;
   },
+  autoFollowLive: () =>
+    request<{
+      enabled: boolean;
+      pollIntervalMs: number;
+      loopStarted: boolean;
+      lastPollAt: string | null;
+      lastPollOk: boolean | null;
+      lastError: string | null;
+      lastDetail: string | null;
+      lastLivesSeen: Array<{ username: string; broadcastId: string | null }>;
+      currentlyWatching: Array<{
+        username: string;
+        recordingId: string;
+        broadcastId: string | null;
+        captureStatus: string | null;
+      }>;
+      tickCount: number;
+      startedAt: string | null;
+      labelTr: string;
+      hintTr: string;
+      cookiesReady: boolean;
+    }>("/api/settings/auto-follow-live"),
+  setAutoFollowLive: (body: { enabled?: boolean; pollIntervalMs?: number }) =>
+    request<Record<string, unknown>>("/api/settings/auto-follow-live", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  pollAutoFollowLiveNow: (body?: { dryRun?: boolean }) =>
+    request<Record<string, unknown>>("/api/settings/auto-follow-live/poll-now", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body ?? { dryRun: true }),
+    }),
   csvUrl: () => url("/api/sales/export.csv"),
   reportCsvUrl: (recordingId: string) =>
     url(`/api/reports/${recordingId}/export.csv`),

@@ -50,6 +50,10 @@ See also: `docs/ready-for-10min-test.md` (operator checklist + smoke timings).
 - e.g. `10`, `180` = hard-stop after N minutes (`ffmpeg -t`) even if live continues
 - Whichever comes first (live end **or** duration) → finalize MP4 → enqueue ASR/OCR/sales pipeline
 
+## Auto-follow lives (watcher following list)
+
+When **Ayarlar → Takip canlıları otomatik kaydet** is açık, the API polls the watcher IG following tray (~90s) and starts the same live pipeline for any followed account that goes live — no manual **Canlı yayın ekle** for those. See Funnel settings `#auto-follow-live` and project store doc `auto-follow-live.md`. Env: `AUTO_FOLLOW_LIVE`, `AUTO_FOLLOW_LIVE_POLL_MS`.
+
 ## Screenshots
 
 - `media/ig-settings-live.png` — Instagram oturumu / Playwright

@@ -53,10 +53,17 @@ export function parseLiveSourceInput(raw: string): ParsedLiveSource {
     const live = url.href.match(LIVE_URL_RE);
     if (live) {
       const username = requireUsername(live[2]!);
+      const bid =
+        url.searchParams.get("broadcast_id") ||
+        url.searchParams.get("broadcastId");
+      const watchUrl =
+        bid && /^\d{5,}$/.test(bid)
+          ? `https://www.instagram.com/${username}/live/?broadcast_id=${bid}`
+          : `https://www.instagram.com/${username}/live/`;
       return {
         kind: "live_url",
         username,
-        watchUrl: `https://www.instagram.com/${username}/live/`,
+        watchUrl,
         inputRaw,
       };
     }

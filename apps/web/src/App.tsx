@@ -30,6 +30,8 @@ type FootStatus = {
   hasCookies: boolean;
   profileLabel: string;
   allowPaidApis: boolean;
+  autoFollowLabel: string;
+  watching: string;
 };
 
 function SidebarFoot() {
@@ -40,16 +42,25 @@ function SidebarFoot() {
     let cancelled = false;
     (async () => {
       try {
-        const [ig, settings] = await Promise.all([
+        const [ig, settings, af] = await Promise.all([
           api.igSession(),
           api.settings(),
+          api.autoFollowLive(),
         ]);
         if (cancelled) return;
         const profile = (settings.profile ?? {}) as Record<string, unknown>;
+        const watching =
+          af.currentlyWatching?.length > 0
+            ? af.currentlyWatching.map((w) => `@${w.username}`).join(", ")
+            : "izlenen yok";
         setFoot({
           hasCookies: Boolean(ig.hasCookies) || ig.status === "yuklu",
           profileLabel: String(profile.profile ?? "LOCAL"),
           allowPaidApis: Boolean(profile.allowPaidApis),
+          autoFollowLabel: af.enabled
+            ? "Takip canlı: açık"
+            : "Takip canlı: kapalı",
+          watching,
         });
       } catch {
         if (!cancelled) setFoot(null);
@@ -63,6 +74,8 @@ function SidebarFoot() {
   const paid = foot?.allowPaidApis ? "Ücretli API açık" : "Ücretli API yok";
   const ig = foot?.hasCookies ? "IG oturum yüklü" : "Instagram girişi yok";
   const profile = `${foot?.profileLabel ?? "LOCAL"} profil`;
+  const af = foot?.autoFollowLabel ?? "Takip canlı: —";
+  const watching = foot?.watching ?? "izlenen yok";
 
   return (
     <div
@@ -73,7 +86,12 @@ function SidebarFoot() {
         <ClipboardList className="h-3.5 w-3.5" aria-hidden />
         <span className="font-semibold text-paper/90">Durum</span>
       </div>
-      {paid} · {ig} · {profile}
+      <div>
+        {paid} · {ig} · {profile}
+      </div>
+      <div className="mt-1.5 text-paper/80">
+        {af} · {watching}
+      </div>
     </div>
   );
 }

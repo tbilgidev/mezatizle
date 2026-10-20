@@ -1,0 +1,16 @@
+{
+  "tray": [
+    {
+      "user": { "username": "yesilkoyantika_", "pk": "1" },
+      "broadcast": {
+        "id": "18093629261179067",
+        "broadcast_status": "active",
+        "viewer_count": 120
+      }
+    },
+    {
+      "user": { "username": "story_only_shop" },
+      "items": [{ "id": "media1" }]
+    }
+  ]
+}

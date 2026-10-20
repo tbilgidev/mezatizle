@@ -17,10 +17,50 @@ type IgSession = {
   hintTr: string;
 };
 
+type AutoFollowStatus = {
+  enabled: boolean;
+  pollIntervalMs: number;
+  loopStarted: boolean;
+  lastPollAt: string | null;
+  lastPollOk: boolean | null;
+  lastError: string | null;
+  lastDetail: string | null;
+  lastLivesSeen: Array<{ username: string; broadcastId: string | null }>;
+  currentlyWatching: Array<{
+    username: string;
+    recordingId: string;
+    broadcastId: string | null;
+    captureStatus: string | null;
+  }>;
+  labelTr: string;
+  hintTr: string;
+  cookiesReady: boolean;
+};
+
+function formatWhen(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleString("tr-TR", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+  } catch {
+    return iso;
+  }
+}
+
 export function SettingsPage() {
   const [settings, setSettings] = useState<Record<string, unknown> | null>(null);
   const [metrics, setMetrics] = useState<Record<string, unknown> | null>(null);
   const [ig, setIg] = useState<IgSession | null>(null);
+  const [autoFollow, setAutoFollow] = useState<AutoFollowStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -28,16 +68,19 @@ export function SettingsPage() {
   const [pwBusy, setPwBusy] = useState(false);
   const [pwMsg, setPwMsg] = useState<string | null>(null);
   const [pwErr, setPwErr] = useState<string | null>(null);
+  const [afBusy, setAfBusy] = useState(false);
 
   async function refresh() {
-    const [s, m, session] = await Promise.all([
+    const [s, m, session, af] = await Promise.all([
       api.settings(),
       api.metrics(),
       api.igSession(),
+      api.autoFollowLive(),
     ]);
     setSettings(s);
     setMetrics(m);
     setIg(session);
+    setAutoFollow(af as AutoFollowStatus);
   }
 
   useEffect(() => {
@@ -183,6 +226,127 @@ export function SettingsPage() {
 
       {!loading && settings && (
         <>
+          <Card className="mb-4" id="auto-follow-live">
+            <CardHeader>
+              <CardTitle>Takip canlıları otomatik kaydet</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="mb-3 text-sm text-fog">
+                {autoFollow?.hintTr ||
+                  "İzleyici hesabının takip ettiği mezat hesapları canlıya geçince otomatik kayıt başlar."}
+              </p>
+              <p className="mb-3 text-sm">
+                Durum:{" "}
+                <Badge variant={autoFollow?.enabled ? "ok" : "warn"}>
+                  {autoFollow?.labelTr ??
+                    (autoFollow?.enabled
+                      ? "Takip canlıları otomatik kaydet: açık"
+                      : "Takip canlıları otomatik kaydet: kapalı")}
+                </Badge>
+                {!autoFollow?.cookiesReady ? (
+                  <Badge variant="danger" className="ml-2">
+                    Çerez gerekli
+                  </Badge>
+                ) : null}
+              </p>
+              <ul className="mb-4 space-y-1 text-sm text-fog">
+                <li>
+                  Son tarama: {formatWhen(autoFollow?.lastPollAt)}
+                  {autoFollow?.lastPollOk === true
+                    ? " · başarılı"
+                    : autoFollow?.lastPollOk === false
+                      ? " · hata"
+                      : ""}
+                </li>
+                <li>
+                  Tarama aralığı:{" "}
+                  {Math.round((autoFollow?.pollIntervalMs ?? 90_000) / 1000)} sn
+                </li>
+                <li>
+                  Son ayrıntı: {autoFollow?.lastDetail ?? autoFollow?.lastError ?? "—"}
+                </li>
+                <li>
+                  Şu an izlenen:{" "}
+                  {autoFollow?.currentlyWatching?.length
+                    ? autoFollow.currentlyWatching
+                        .map(
+                          (w) =>
+                            `@${w.username}${w.captureStatus ? ` (${w.captureStatus})` : ""}`,
+                        )
+                        .join(", ")
+                    : "yok"}
+                </li>
+                <li>
+                  Son görülen canlılar:{" "}
+                  {autoFollow?.lastLivesSeen?.length
+                    ? autoFollow.lastLivesSeen
+                        .map((l) => `@${l.username}`)
+                        .join(", ")
+                    : "—"}
+                </li>
+              </ul>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  disabled={afBusy || busy}
+                  onClick={() => {
+                    void (async () => {
+                      setAfBusy(true);
+                      setError(null);
+                      setOk(null);
+                      try {
+                        const st = (await api.setAutoFollowLive({
+                          enabled: !autoFollow?.enabled,
+                        })) as unknown as AutoFollowStatus;
+                        setAutoFollow(st);
+                        setOk(st.labelTr);
+                      } catch (err) {
+                        setError(
+                          err instanceof Error ? err.message : String(err),
+                        );
+                      } finally {
+                        setAfBusy(false);
+                      }
+                    })();
+                  }}
+                >
+                  {autoFollow?.enabled ? "Kapat" : "Aç"}
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={afBusy || busy}
+                  onClick={() => {
+                    void (async () => {
+                      setAfBusy(true);
+                      setError(null);
+                      setOk(null);
+                      try {
+                        const st = (await api.pollAutoFollowLiveNow({
+                          dryRun: true,
+                        })) as unknown as AutoFollowStatus & {
+                          cycle?: { detail?: string; discovered?: unknown[] };
+                        };
+                        setAutoFollow(st);
+                        setOk(
+                          `Kuru tarama: ${st.cycle?.detail ?? st.lastDetail ?? "tamam"}`,
+                        );
+                      } catch (err) {
+                        setError(
+                          err instanceof Error ? err.message : String(err),
+                        );
+                      } finally {
+                        setAfBusy(false);
+                      }
+                    })();
+                  }}
+                >
+                  Şimdi tara (kuru)
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+
           <Card className="mb-4" id="ig-oturum">
             <CardHeader>
               <CardTitle>Instagram oturumu (yedek hesap)</CardTitle>
