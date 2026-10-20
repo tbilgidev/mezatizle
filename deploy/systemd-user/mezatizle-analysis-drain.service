@@ -1,0 +1,34 @@
+[Unit]
+Description=mezatizle analysis drain worker (secondary, no boot-reclaim)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tolga/projects/mezatizle
+Environment=HOME=/home/tolga
+Environment=PATH=/home/tolga/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=DATABASE_URL=postgres://mezatizle:mezatizle@127.0.0.1:5433/mezatizle
+Environment=PYTHON_BIN=/home/tolga/projects/mezatizle/.venv/bin/python3
+Environment=PROCESSING_PROFILE=LOCAL
+Environment=SKIP_BOOT_RECLAIM=1
+Environment=WORKER_ID=analysis-drain-1
+Environment=WORKER_POLL_INTERVAL_MS=1500
+Environment=JOB_STALE_MINUTES=12
+Environment=WHISPER_MODEL=small
+Environment=OCR_ENGINE=tesseract
+Environment=TESSERACT_LANG=tur+eng
+Environment=TESSERACT_CONFIG=--psm 6 --oem 1
+Environment=OCR_CROP_FRAC=0.02,0.48,0.62,0.94
+Environment=OCR_FPS=1
+Environment=OCR_FRAME_STRIDE=4
+Environment=OCR_MAX_FRAMES=120
+Environment=OCR_MAX_WIDTH=400
+Environment=STORAGE_ROOT=/home/tolga/projects/mezatizle/storage
+ExecStart=/home/tolga/.bun/bin/bun run apps/api/src/worker.ts
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/tolga/projects/mezatizle/logs/analysis-drain.log
+StandardError=append:/home/tolga/projects/mezatizle/logs/analysis-drain.log
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,26 @@
+[Unit]
+Description=mezatizle finalize worker (segment+reconcile only)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tolga/projects/mezatizle
+Environment=HOME=/home/tolga
+Environment=PATH=/home/tolga/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=DATABASE_URL=postgres://mezatizle:mezatizle@127.0.0.1:5433/mezatizle
+Environment=PYTHON_BIN=/home/tolga/projects/mezatizle/.venv/bin/python3
+Environment=PROCESSING_PROFILE=LOCAL
+Environment=SKIP_BOOT_RECLAIM=1
+Environment=WORKER_ID=analysis-finalize-1
+Environment=WORKER_JOB_TYPES=segment_auction,reconcile_sales
+Environment=WORKER_POLL_INTERVAL_MS=1000
+Environment=JOB_STALE_MINUTES=12
+Environment=STORAGE_ROOT=/home/tolga/projects/mezatizle/storage
+ExecStart=/home/tolga/.bun/bin/bun run apps/api/src/worker.ts
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/tolga/projects/mezatizle/logs/analysis-finalize.log
+StandardError=append:/home/tolga/projects/mezatizle/logs/analysis-finalize.log
+
+[Install]
+WantedBy=default.target

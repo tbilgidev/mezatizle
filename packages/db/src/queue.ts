@@ -150,7 +150,27 @@ export async function reclaimStaleRunningJobs(
         available_at = now(),
         updated_at = now()
     WHERE status = 'running'
-      AND COALESCE(locked_at, updated_at, started_at) < now() - make_interval(mins => ${mins})
+      AND GREATEST(locked_at, updated_at, started_at) < now() - make_interval(mins => ${mins})
+    RETURNING id
+  `;
+  return rows.length;
+}
+
+/**
+ * On worker/API boot the previous process is dead — requeue every "running" job
+ * immediately so orphans are not stuck until JOB_STALE_MINUTES elapses.
+ */
+export async function reclaimAllRunningJobs(sql: Sql): Promise<number> {
+  const rows = await sql<{ id: string }[]>`
+    UPDATE processing_jobs
+    SET status = 'queued',
+        locked_by = NULL,
+        locked_at = NULL,
+        stage = 'reclaimed_boot',
+        error_message = COALESCE(error_message, ${"reclaimed: worker boot"}),
+        available_at = now(),
+        updated_at = now()
+    WHERE status = 'running'
     RETURNING id
   `;
   return rows.length;

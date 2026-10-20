@@ -1,0 +1,20 @@
+[Unit]
+Description=mezatizle analysis job watchdog (oneshot reclaim + drain)
+After=network.target
+
+[Service]
+Type=oneshot
+# Do not kill background children started by the script (legacy path).
+KillMode=process
+WorkingDirectory=/home/tolga/projects/mezatizle
+Environment=HOME=/home/tolga
+Environment=PATH=/home/tolga/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=DATABASE_URL=postgres://mezatizle:mezatizle@127.0.0.1:5433/mezatizle
+Environment=PYTHON_BIN=/home/tolga/projects/mezatizle/.venv/bin/python3
+Environment=OCR_MAX_FRAMES=120
+Environment=OCR_FRAME_STRIDE=4
+Environment=ANALYSIS_JOB_STALE_MINUTES=12
+ExecStart=/home/tolga/projects/mezatizle/scripts/analysis-watchdog.sh
+
+[Install]
+WantedBy=default.target

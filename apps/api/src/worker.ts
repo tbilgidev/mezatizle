@@ -5,6 +5,7 @@ import {
   completeJob,
   failJob,
   reclaimStaleRunningJobs,
+  reclaimAllRunningJobs,
 } from "@mezatizle/db";
 import { loadEnv } from "./lib/env.ts";
 import { runProbeJob, runExtractJob } from "./modules/ingestion.ts";
@@ -24,13 +25,94 @@ const sql = createSql(env.databaseUrl);
 const workerId = process.env.WORKER_ID ?? `ts-worker-${process.pid}`;
 const pollMs = Number(process.env.WORKER_POLL_INTERVAL_MS ?? "1500");
 let lastStaleReclaimAt = 0;
+let bootReclaimDone = false;
+
+/** Keep lock fresh while long Python ASR/OCR runs so stale reclaim does not steal it. */
+async function withJobHeartbeat<T>(
+  jobId: string,
+  progressPercent: number,
+  stage: string,
+  work: () => Promise<T>,
+): Promise<T> {
+  const touch = () =>
+    updateJobProgress(sql, jobId, progressPercent, stage).catch((err) =>
+      console.warn(`[worker] heartbeat failed job=${jobId}`, err),
+    );
+  const hb = setInterval(() => {
+    void touch();
+  }, 60_000);
+  try {
+    return await work();
+  } finally {
+    clearInterval(hb);
+  }
+}
+
+const jobTypeFilter = (process.env.WORKER_JOB_TYPES ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+/** Pipeline prerequisites — prevent segment/reconcile from racing ahead of ASR/OCR. */
+async function prerequisitesMet(
+  recordingId: string,
+  jobType: string,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const need: Record<string, string[]> = {
+    extract_audio_frames: ["probe_media"],
+    transcribe: ["extract_audio_frames"],
+    ocr_frames: ["extract_audio_frames"],
+    segment_auction: ["transcribe"],
+    reconcile_sales: ["segment_auction"],
+  };
+  const deps = need[jobType];
+  if (!deps?.length) return { ok: true };
+  for (const dep of deps) {
+    const rows = await sql<{ status: string }[]>`
+      SELECT status FROM processing_jobs
+      WHERE recording_id = ${recordingId} AND job_type = ${dep}
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+    const st = rows[0]?.status;
+    if (st !== "succeeded" && st !== "cancelled") {
+      return {
+        ok: false,
+        reason: `prerequisite ${dep} not succeeded (status=${st ?? "missing"})`,
+      };
+    }
+  }
+  return { ok: true };
+}
 
 async function processJob() {
   await assertUnderSpendLimit(sql, env.hardSpendLimitUsd);
-  const job = await claimNextJob(sql, workerId);
+  const job = await claimNextJob(
+    sql,
+    workerId,
+    jobTypeFilter.length ? jobTypeFilter : undefined,
+  );
   if (!job) return false;
 
   try {
+    const prereq = await prerequisitesMet(job.recording_id, job.job_type);
+    if (!prereq.ok) {
+      // Put back on queue without burning an attempt budget forever.
+      await sql`
+        UPDATE processing_jobs
+        SET status = 'queued',
+            locked_by = NULL,
+            locked_at = NULL,
+            stage = 'waiting_prereq',
+            attempts = GREATEST(attempts - 1, 0),
+            available_at = now() + interval '20 seconds',
+            error_message = ${prereq.reason},
+            updated_at = now()
+        WHERE id = ${job.id}
+      `;
+      return true;
+    }
+
     await updateJobProgress(sql, job.id, 5, "started");
     let result: Record<string, unknown> = {};
 
@@ -59,7 +141,9 @@ async function processJob() {
         if (process.env.FORCE_MOCK_ASR === "1") {
           result = await transcribeMock(sql, env, job.recording_id);
         } else {
-          const py = await tryPythonWorker("transcribe", job.recording_id, env);
+          const py = await withJobHeartbeat(job.id, 30, "asr", () =>
+            tryPythonWorker("transcribe", job.recording_id, env),
+          );
           if (!py.ok) {
             throw new Error(`ASR failed (faster-whisper): ${py.detail}`);
           }
@@ -88,7 +172,9 @@ async function processJob() {
         if (process.env.FORCE_MOCK_OCR === "1") {
           result = await ocrFramesMock(sql, env, job.recording_id);
         } else {
-          const py = await tryPythonWorker("ocr", job.recording_id, env);
+          const py = await withJobHeartbeat(job.id, 40, "ocr", () =>
+            tryPythonWorker("ocr", job.recording_id, env),
+          );
           if (!py.ok) {
             throw new Error(`OCR failed: ${py.detail}`);
           }
@@ -180,16 +266,40 @@ async function maybeReclaimStale() {
 
 export async function workerLoop(maxIdleRounds = Infinity) {
   let idle = 0;
-  await maybeReclaimStale();
-  while (idle < maxIdleRounds) {
-    await maybeReclaimStale();
-    const did = await processJob();
-    if (!did) {
-      idle++;
-      await Bun.sleep(pollMs);
+  // Secondary drain workers must not steal healthy in-flight ASR/OCR locks.
+  if (!bootReclaimDone) {
+    bootReclaimDone = true;
+    if (process.env.SKIP_BOOT_RECLAIM === "1") {
+      console.warn(`[worker] ${workerId} skip boot reclaim (SKIP_BOOT_RECLAIM=1)`);
     } else {
-      idle = 0;
+      try {
+        const n = await reclaimAllRunningJobs(sql);
+        if (n > 0) {
+          console.warn(`[worker] boot-reclaimed ${n} running job(s)`);
+        }
+      } catch (err) {
+        console.error("[worker] boot reclaim failed", err);
+      }
     }
+  }
+  await maybeReclaimStale();
+  // Stale reclaim must run even while processJob awaits long Python work.
+  const reclaimTimer = setInterval(() => {
+    void maybeReclaimStale();
+  }, 120_000);
+  try {
+    while (idle < maxIdleRounds) {
+      await maybeReclaimStale();
+      const did = await processJob();
+      if (!did) {
+        idle++;
+        await Bun.sleep(pollMs);
+      } else {
+        idle = 0;
+      }
+    }
+  } finally {
+    clearInterval(reclaimTimer);
   }
 }
 
