@@ -114,6 +114,7 @@ def try_faster_whisper(recording_id: str, storage_root: str) -> dict:
                 """
                 UPDATE recordings SET status = 'transcribing', updated_at = now()
                 WHERE id = %s
+                  AND status NOT IN ('complete', 'analyzing', 'failed', 'cancelled')
                 """,
                 (recording_id,),
             )

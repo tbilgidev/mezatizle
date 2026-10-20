@@ -7,6 +7,8 @@ import { recordingsRoutes } from "./routes/recordings.ts";
 import { salesRoutes } from "./routes/sales.ts";
 import { commentsRoutes } from "./routes/comments.ts";
 import { metaRoutes } from "./routes/meta.ts";
+import { reportsRoutes } from "./routes/reports.ts";
+import { productsRoutes } from "./routes/products.ts";
 import { workerLoop } from "./worker.ts";
 import { liveCaptureLoop } from "./modules/live_capture.ts";
 
@@ -32,6 +34,8 @@ app.route("/api", metaRoutes(sql, env));
 app.route("/api/recordings", recordingsRoutes(sql, env));
 app.route("/api/sales", salesRoutes(sql));
 app.route("/api/comments", commentsRoutes(sql));
+app.route("/api/reports", reportsRoutes(sql));
+app.route("/api/products", productsRoutes(sql, env));
 
 app.get("/", (c) =>
   c.json({

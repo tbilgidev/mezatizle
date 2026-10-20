@@ -23,12 +23,64 @@ const sql = createSql(env.databaseUrl);
 const workerId = process.env.WORKER_ID ?? `ts-worker-${process.pid}`;
 const pollMs = Number(process.env.WORKER_POLL_INTERVAL_MS ?? "1500");
 
+/**
+ * Pipeline prerequisites — prevent segment/reconcile from racing ahead of ASR
+ * (which produced empty reports when reconcile finished before transcript).
+ */
+async function prerequisitesMet(
+  recordingId: string,
+  jobType: string,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const need: Record<string, string[]> = {
+    extract_audio_frames: ["probe_media"],
+    transcribe: ["extract_audio_frames"],
+    ocr_frames: ["extract_audio_frames"],
+    segment_auction: ["transcribe"],
+    reconcile_sales: ["segment_auction"],
+  };
+  const deps = need[jobType];
+  if (!deps?.length) return { ok: true };
+  for (const dep of deps) {
+    const rows = await sql<{ status: string }[]>`
+      SELECT status FROM processing_jobs
+      WHERE recording_id = ${recordingId} AND job_type = ${dep}
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+    const st = rows[0]?.status;
+    if (st !== "succeeded" && st !== "cancelled") {
+      return {
+        ok: false,
+        reason: `prerequisite ${dep} not succeeded (status=${st ?? "missing"})`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
 async function processJob() {
   await assertUnderSpendLimit(sql, env.hardSpendLimitUsd);
   const job = await claimNextJob(sql, workerId);
   if (!job) return false;
 
   try {
+    const prereq = await prerequisitesMet(job.recording_id, job.job_type);
+    if (!prereq.ok) {
+      await sql`
+        UPDATE processing_jobs
+        SET status = 'queued',
+            locked_by = NULL,
+            locked_at = NULL,
+            stage = 'waiting_prereq',
+            attempts = GREATEST(attempts - 1, 0),
+            available_at = now() + interval '20 seconds',
+            error_message = ${prereq.reason},
+            updated_at = now()
+        WHERE id = ${job.id}
+      `;
+      return true;
+    }
+
     await updateJobProgress(sql, job.id, 5, "started");
     let result: Record<string, unknown> = {};
 
@@ -53,6 +105,11 @@ async function processJob() {
         break;
       }
       case "transcribe": {
+        await sql`
+          UPDATE recordings SET status = 'transcribing', updated_at = now()
+          WHERE id = ${job.recording_id}
+            AND status NOT IN ('complete', 'analyzing', 'failed', 'cancelled')
+        `;
         await updateJobProgress(sql, job.id, 30, "asr");
         if (process.env.FORCE_MOCK_ASR === "1") {
           result = await transcribeMock(sql, env, job.recording_id);
@@ -115,6 +172,7 @@ async function processJob() {
         await sql`
           UPDATE recordings SET status = 'analyzing', updated_at = now()
           WHERE id = ${job.recording_id}
+            AND status NOT IN ('complete', 'failed', 'cancelled')
         `;
         result = await segmentAuctionFromSignals(sql, job.recording_id);
         await recordMetric(sql, {

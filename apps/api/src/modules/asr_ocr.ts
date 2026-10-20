@@ -55,6 +55,7 @@ export async function transcribeMock(
   await sql`
     UPDATE recordings SET status = 'transcribing', updated_at = now()
     WHERE id = ${recordingId}
+      AND status NOT IN ('complete', 'analyzing', 'failed', 'cancelled')
   `;
   return { segments: lines.length, backend: "mock" };
 }
