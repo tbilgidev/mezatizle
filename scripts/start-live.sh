@@ -43,6 +43,11 @@ for f in logs/api.pid logs/web.pid; do
   fi
 done
 sleep 1
+# Free stale API listener (zombie parent can ignore TERM + keep :43127)
+if command -v fuser >/dev/null 2>&1; then
+  fuser -k 43127/tcp 2>/dev/null || true
+  sleep 1
+fi
 
 # Explicitly clear mocks in the child env
 nohup env -u FORCE_MOCK_ASR -u FORCE_MOCK_OCR \

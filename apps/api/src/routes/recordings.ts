@@ -6,6 +6,7 @@ import {
   cancelLiveCapture,
   createLiveCapture,
   resumeBlockedLiveCapture,
+  runCaptureStallWatchdogTick,
   LIVE_CAPTURE_POLICY,
 } from "../modules/live_capture.ts";
 import { safeJoinStorage } from "../lib/storage.ts";
@@ -89,6 +90,18 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return c.json({ error: msg }, 500);
+    }
+  });
+
+  /** Durable stall watchdog nudge (systemd timer → this route). */
+  app.post("/stall-watchdog-tick", async (c) => {
+    try {
+      // In-API: may finalize part1 and start part2 under this process.
+      await runCaptureStallWatchdogTick(sql, env, { allowPart2: true });
+      return c.json({ ok: true, ran: true }, 200);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ ok: false, error: msg }, 500);
     }
   });
 

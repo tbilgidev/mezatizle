@@ -6,6 +6,7 @@
  * no anti-bot kits — only the session the operator provides.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdir, stat, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { Sql } from "@mezatizle/db";
@@ -221,6 +222,10 @@ const activeProcs = new Map<string, ChildProcessWithoutNullStreams>();
  */
 const CAPTURE_STALE_BYTES_MS = Number(
   process.env.LIVE_CAPTURE_STALE_BYTES_MS ?? String(3 * 60_000),
+);
+/** If finalize stays in `finalizing` this long, force-complete (burn hang). */
+const FINALIZE_STUCK_MS = Number(
+  process.env.LIVE_FINALIZE_STUCK_MS ?? String(5 * 60_000),
 );
 let loopStarted = false;
 
@@ -832,13 +837,34 @@ async function resolveStreamInput(
   };
 }
 
-function pidAlive(pid: number | null | undefined): boolean {
+/**
+ * True only for a running process. Zombies (stat Z) count as dead — kill(0)
+ * still succeeds on them, which previously left kaydediliyor forever (glam).
+ */
+export function pidAlive(pid: number | null | undefined): boolean {
   if (pid == null || !Number.isFinite(pid) || pid <= 1) return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
+  }
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const close = raw.lastIndexOf(")");
+    const state = close >= 0 ? raw.slice(close + 1).trim().split(/\s+/)[0] : "";
+    if (state === "Z") return false;
+  } catch {
+    /* non-linux / race — treat kill(0) success as alive */
+  }
+  return true;
+}
+
+function dropDeadActiveProc(recordingId: string) {
+  const child = activeProcs.get(recordingId);
+  if (!child) return;
+  const childPid = typeof child.pid === "number" ? child.pid : null;
+  if (!pidAlive(childPid)) {
+    activeProcs.delete(recordingId);
   }
 }
 
@@ -1050,23 +1076,129 @@ async function killCapturePid(pid: number | null | undefined) {
  * Critical after API restart: orphaned ffmpeg may exit (e.g. -t) without our
  * close handler — without this, UI stays kaydediliyor forever.
  */
+async function forceCompleteStuckFinalize(
+  sql: Sql,
+  env: AppEnv,
+  recordingId: string,
+  destAbs: string,
+  why: string,
+): Promise<void> {
+  const finalBytes = await fileSize(destAbs);
+  if (finalBytes < 64_000) return;
+  let syncDetail = "A/V sync check skipped";
+  try {
+    const sync = await probeAvSync(env.ffprobePath, destAbs);
+    syncDetail = sync.detailTr;
+  } catch (err) {
+    syncDetail = err instanceof Error ? err.message : String(err);
+  }
+  const [cCount] = await sql<{ n: string }[]>`
+    SELECT COUNT(*)::text AS n FROM observed_comments
+    WHERE recording_id = ${recordingId} AND source = 'live_api'
+  `;
+  const liveApiN = Number(cCount?.n ?? 0);
+  const probeDetail = `${syncDetail} · comments=${liveApiN} · ${why}`;
+  await sql`
+    UPDATE live_captures
+    SET status = 'completed',
+        last_probe_detail = ${probeDetail},
+        process_pid = NULL,
+        updated_at = now()
+    WHERE recording_id = ${recordingId}
+      AND status IN ('finalizing', 'recording')
+  `;
+  await sql`
+    UPDATE recordings
+    SET status = 'uploaded',
+        capture_status = 'bitti',
+        capture_ended_at = COALESCE(capture_ended_at, now()),
+        capture_bytes = ${finalBytes},
+        file_size_bytes = ${finalBytes},
+        capture_error = NULL,
+        notes = COALESCE(notes || E'\n', '') || ${why},
+        updated_at = now()
+    WHERE id = ${recordingId}
+  `;
+  await enqueueAnalysisPipeline(sql, recordingId);
+  console.warn(
+    `[live-capture] force-completed stuck finalize ${recordingId} bytes=${finalBytes}`,
+  );
+}
+
+async function maybeStartPart2AfterStall(
+  sql: Sql,
+  env: AppEnv,
+  row: { recording_id: string; watch_url: string | null },
+  allowPart2: boolean,
+): Promise<string | null> {
+  if (!allowPart2) {
+    console.warn(
+      `[live-capture] stall part2 deferred (out-of-process tick) after ${row.recording_id} — API supervisor will rotate`,
+    );
+    return null;
+  }
+  const watchUrl = row.watch_url?.trim();
+  if (!watchUrl) return null;
+  // Confirm live still on before opening segment B
+  const probe = await probePublicLive(env, watchUrl);
+  if (!probe.ok) {
+    console.warn(
+      `[live-capture] stall part2 skip ${row.recording_id}: live not active (${probe.detail})`,
+    );
+    return null;
+  }
+  console.warn(
+    `[live-capture] stall → part2 after ${row.recording_id} (${probe.detail})`,
+  );
+  try {
+    const result = await createLiveCapture(sql, env, {
+      input: watchUrl,
+      notes: `Part 2 / segment B — continuation after stall of ${row.recording_id}; same broadcast; comments continue on new recording`,
+    });
+    const part2Id = result.recordingId;
+    const note = `Part 2 recording_id=${part2Id} (stall rotate)`;
+    await sql`
+      UPDATE recordings
+      SET notes = COALESCE(notes || E'\n', '') || ${note},
+          updated_at = now()
+      WHERE id = ${row.recording_id}
+    `;
+    await sql`
+      UPDATE live_captures
+      SET last_probe_detail = COALESCE(last_probe_detail || ' · ', '') || ${note},
+          updated_at = now()
+      WHERE recording_id = ${row.recording_id}
+    `;
+    return part2Id;
+  } catch (err) {
+    console.error(
+      `[live-capture] part2 start failed after ${row.recording_id}:`,
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+}
+
 async function enforceRecordingWatchdog(
   sql: Sql,
   env: AppEnv,
   row: {
     recording_id: string;
+    watch_url?: string | null;
     process_pid: number | null;
     max_duration_minutes: number | null;
     capture_started_at: Date | string | null;
     max_bytes: number | string | null;
     capture_bytes?: number | string | null;
     updated_at?: Date | string | null;
+    lc_status?: string | null;
+    lc_updated_at?: Date | string | null;
   },
-): Promise<"ok" | "finalized" | "killed_waiting_finalize"> {
+  opts?: { allowPart2?: boolean },
+): Promise<"ok" | "finalized" | "killed_waiting_finalize" | "part2"> {
+  const allowPart2 = opts?.allowPart2 !== false;
   const recordingId = row.recording_id;
-  if (activeProcs.has(recordingId)) {
-    // In-process timer also runs; still enforce wall-clock from DB start
-  }
+  dropDeadActiveProc(recordingId);
 
   const destAbs = safeJoinStorage(
     env.storageRoot,
@@ -1078,6 +1210,45 @@ async function enforceRecordingWatchdog(
   const finalBytes = await fileSize(destAbs);
   const pid = row.process_pid != null ? Number(row.process_pid) : null;
   const alive = pidAlive(pid) || activeProcs.has(recordingId);
+
+  // Hung finalize (burn / remux) must not leave Funnel on kaydediliyor forever.
+  const lcStatus = row.lc_status;
+  const lcUpdatedMs = row.lc_updated_at
+    ? new Date(row.lc_updated_at).getTime()
+    : NaN;
+  if (
+    lcStatus === "finalizing" &&
+    Number.isFinite(lcUpdatedMs) &&
+    Date.now() - lcUpdatedMs >= FINALIZE_STUCK_MS &&
+    Math.max(partBytes, finalBytes) >= 64_000
+  ) {
+    dropDeadActiveProc(recordingId);
+    await stopLiveViewerPresence(recordingId);
+    if (partBytes >= 64_000) {
+      await finalizeRecording(
+        sql,
+        env,
+        recordingId,
+        destAbs,
+        partAbs,
+        0,
+        `finalize stuck >${Math.round(FINALIZE_STUCK_MS / 60_000)}dk — reclaim`,
+      );
+    } else {
+      await forceCompleteStuckFinalize(
+        sql,
+        env,
+        recordingId,
+        destAbs,
+        `finalize stuck >${Math.round(FINALIZE_STUCK_MS / 60_000)}dk — force bitti (burn skipped)`,
+      );
+    }
+    return "finalized";
+  }
+  if (lcStatus === "finalizing") {
+    // In-flight finalize — do not re-attach viewer / start part2 yet.
+    return "ok";
+  }
 
   const startedAt = row.capture_started_at
     ? new Date(row.capture_started_at).getTime()
@@ -1133,11 +1304,15 @@ async function enforceRecordingWatchdog(
       }
     }
     await killCapturePid(pid);
+    dropDeadActiveProc(recordingId);
     await stopLiveViewerPresence(recordingId);
     // If close handler will finalize via activeProcs, give it a moment
     if (activeProcs.has(recordingId)) {
       await Bun.sleep(2000);
-      if (!activeProcs.has(recordingId)) return "finalized";
+      dropDeadActiveProc(recordingId);
+      if (!activeProcs.has(recordingId)) {
+        // close handler may still be finalizing; fall through only if still recording
+      }
     }
     if (partBytes >= 64_000 || finalBytes >= 64_000) {
       await finalizeRecording(
@@ -1149,6 +1324,19 @@ async function enforceRecordingWatchdog(
         pastMax || broadcastEnded || stalePart ? 0 : null,
         why,
       );
+      // Bytes stalled but IG still on → open part 2 (same user/broadcast).
+      if (stalePart && !broadcastEnded && !pastMax && !overBytes) {
+        const part2 = await maybeStartPart2AfterStall(
+          sql,
+          env,
+          {
+            recording_id: recordingId,
+            watch_url: row.watch_url ?? null,
+          },
+          allowPart2,
+        );
+        if (part2) return "part2";
+      }
       return "finalized";
     }
   }
@@ -1692,7 +1880,11 @@ export async function warnCommentDroughtIfNeeded(
   return true;
 }
 
-async function tickRecordingWatchdogs(sql: Sql, env: AppEnv) {
+async function tickRecordingWatchdogs(
+  sql: Sql,
+  env: AppEnv,
+  opts?: { allowPart2?: boolean },
+) {
   const rows = await sql<{
     recording_id: string;
     watch_url: string;
@@ -1700,17 +1892,21 @@ async function tickRecordingWatchdogs(sql: Sql, env: AppEnv) {
     max_duration_minutes: number | null;
     max_bytes: number | null;
     capture_started_at: Date | null;
+    lc_status: string;
+    lc_updated_at: Date;
   }[]>`
     SELECT lc.recording_id, lc.watch_url, lc.process_pid, lc.max_duration_minutes,
-           lc.max_bytes, r.capture_started_at
+           lc.max_bytes, r.capture_started_at,
+           lc.status AS lc_status, lc.updated_at AS lc_updated_at
     FROM live_captures lc
     JOIN recordings r ON r.id = lc.recording_id
     WHERE lc.status IN ('recording', 'finalizing')
        OR r.capture_status = 'kaydediliyor'
   `;
   for (const row of rows) {
-    const result = await enforceRecordingWatchdog(sql, env, row);
-    if (result === "finalized") continue;
+    dropDeadActiveProc(row.recording_id);
+    const result = await enforceRecordingWatchdog(sql, env, row, opts);
+    if (result === "finalized" || result === "part2") continue;
 
     const alive =
       activeProcs.has(row.recording_id) ||
@@ -1730,7 +1926,7 @@ async function tickRecordingWatchdogs(sql: Sql, env: AppEnv) {
       const st = await sql<{ status: string }[]>`
         SELECT status FROM live_captures WHERE recording_id = ${row.recording_id}
       `;
-      if (st[0]?.status === "recording" || st[0]?.status === "finalizing") {
+      if (st[0]?.status === "recording") {
         await sql`
           UPDATE live_captures
           SET status = 'waiting', process_pid = NULL,
@@ -1747,4 +1943,16 @@ async function tickRecordingWatchdogs(sql: Sql, env: AppEnv) {
       }
     }
   }
+}
+
+/** External / oneshot stall tick (systemd capture-stall-watchdog). */
+export async function runCaptureStallWatchdogTick(
+  sql: Sql,
+  env: AppEnv,
+  opts?: { allowPart2?: boolean },
+) {
+  // Out-of-process: finalize/reclaim only — part2 must be owned by the API process.
+  await tickRecordingWatchdogs(sql, env, {
+    allowPart2: opts?.allowPart2 ?? false,
+  });
 }

@@ -143,18 +143,23 @@ export function ffmpegBurnCommentsArgs(opts: {
     `${q.maxrateKbps * 2}k`,
     "-c:a",
     "copy",
-    "-movflags",
-    q.finalizeMovflags,
+    // No +faststart here — second-pass moov shift has hung finalize (glam burn.tmp).
     "-avoid_negative_ts",
     "make_zero",
     opts.outputPath,
   ];
 }
 
+/** Soft cap so a hung burn never blocks the live supervisor tick (glam/8e6f class). */
+export const BURN_TIMEOUT_MS = Number(
+  process.env.LIVE_BURN_TIMEOUT_MS ?? String(8 * 60_000),
+);
+
 export async function burnCommentsIntoMaster(opts: {
   ffmpegPath: string;
   masterAbs: string;
   assPath?: string;
+  timeoutMs?: number;
 }): Promise<{ ok: boolean; burned: boolean; detail: string }> {
   const assPath = opts.assPath ?? commentsAssPath(opts.masterAbs);
   if (!(await assHasCues(assPath))) {
@@ -167,16 +172,45 @@ export async function burnCommentsIntoMaster(opts: {
     assPath,
     outputPath: tmpAbs,
   });
+  const timeoutMs = opts.timeoutMs ?? BURN_TIMEOUT_MS;
+  let proc: ReturnType<typeof Bun.spawn> | null = null;
   try {
-    const proc = Bun.spawn(args, {
+    proc = Bun.spawn(args, {
       stdout: "pipe",
       stderr: "pipe",
       env: { ...process.env },
     });
-    const [stderrText, exitCode] = await Promise.all([
-      new Response(proc.stderr).text(),
-      proc.exited,
+    const stderrPromise = new Response(proc.stderr).text();
+    const exitPromise = proc.exited;
+    let timedOut = false;
+    const timeoutPromise = new Promise<number>((resolve) => {
+      setTimeout(() => {
+        timedOut = true;
+        try {
+          proc?.kill();
+        } catch {
+          /* ignore */
+        }
+        resolve(-1);
+      }, Math.max(5_000, timeoutMs));
+    });
+    const exitCode = await Promise.race([exitPromise, timeoutPromise]);
+    const stderrText = await Promise.race([
+      stderrPromise,
+      Bun.sleep(2_000).then(() => ""),
     ]);
+    if (timedOut || exitCode === -1) {
+      try {
+        await unlink(tmpAbs);
+      } catch {
+        /* ignore */
+      }
+      return {
+        ok: false,
+        burned: false,
+        detail: `burn_timeout_${Math.round(timeoutMs / 1000)}s`,
+      };
+    }
     if (exitCode !== 0) {
       try {
         await unlink(tmpAbs);
@@ -192,6 +226,11 @@ export async function burnCommentsIntoMaster(opts: {
     await rename(tmpAbs, opts.masterAbs);
     return { ok: true, burned: true, detail: "burned_ass_hud" };
   } catch (err) {
+    try {
+      proc?.kill();
+    } catch {
+      /* ignore */
+    }
     try {
       await unlink(tmpAbs);
     } catch {
