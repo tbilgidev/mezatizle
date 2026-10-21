@@ -152,9 +152,15 @@ export function ffmpegFinalizeRemuxArgs(opts: {
   ffmpegPath: string;
   inputPath: string;
   outputPath: string;
+  /** Override movflags (e.g. omit +faststart after a corrupt rewrite). */
+  movflags?: string | null;
 }): string[] {
   const q = CAPTURE_QUALITY;
-  return [
+  const mov =
+    opts.movflags === null
+      ? null
+      : (opts.movflags ?? q.finalizeMovflags);
+  const args = [
     opts.ffmpegPath,
     "-y",
     "-hide_banner",
@@ -164,8 +170,10 @@ export function ffmpegFinalizeRemuxArgs(opts: {
     opts.inputPath,
     "-c",
     "copy",
-    "-movflags",
-    q.finalizeMovflags,
-    opts.outputPath,
   ];
+  if (mov) {
+    args.push("-movflags", mov);
+  }
+  args.push(opts.outputPath);
+  return args;
 }

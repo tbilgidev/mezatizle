@@ -29,6 +29,7 @@ import {
   extractBroadcastIdFromUrl,
   ensureLiveViewerPresence,
   getLiveViewerPresenceHealth,
+  getLiveViewerSession,
   resolveLiveStreamWithPlaywright,
   startLiveViewerPresence,
   stopLiveViewerPresence,
@@ -212,6 +213,15 @@ export const LIVE_CAPTURE_POLICY = {
 };
 
 const activeProcs = new Map<string, ChildProcessWithoutNullStreams>();
+
+/**
+ * ffmpeg uses -reconnect on the DASH URL. When IG live ends, CDN often keeps
+ * serving a static leftover MPD — ffmpeg spins forever and the .part stops growing.
+ * Finalize after this much no-growth (wall clock).
+ */
+const CAPTURE_STALE_BYTES_MS = Number(
+  process.env.LIVE_CAPTURE_STALE_BYTES_MS ?? String(3 * 60_000),
+);
 let loopStarted = false;
 
 /** Prefer project venv yt-dlp (current) over stale distro package. */
@@ -902,12 +912,18 @@ async function startRecordingProcess(
   });
 
   const startedAt = Date.now();
+  let lastBytes = 0;
+  let lastGrowthAt = Date.now();
   const sizeTimer = setInterval(() => {
     void (async () => {
       // Prefer part while recording; never overwrite DB with 0 after rename/finalize
       const partBytes = await fileSize(partAbs);
       const destBytes = await fileSize(destAbs);
       const bytes = partBytes > 0 ? partBytes : destBytes;
+      if (bytes > lastBytes) {
+        lastBytes = bytes;
+        lastGrowthAt = Date.now();
+      }
       if (bytes > 0) {
         await sql`
           UPDATE recordings
@@ -920,7 +936,18 @@ async function startRecordingProcess(
       const overTime =
         maxDurationSeconds != null &&
         Date.now() - startedAt >= maxDurationSeconds * 1000 + 5000;
-      if (overBytes || overTime) {
+      const viewer = getLiveViewerSession(recordingId)?.getHealth();
+      const broadcastEnded = Boolean(viewer?.broadcastEnded);
+      const staleBytes =
+        bytes >= 64_000 &&
+        Date.now() - lastGrowthAt >= CAPTURE_STALE_BYTES_MS &&
+        Date.now() - startedAt >= CAPTURE_STALE_BYTES_MS;
+      if (overBytes || overTime || broadcastEnded || staleBytes) {
+        if (broadcastEnded || staleBytes) {
+          console.warn(
+            `[live-capture] ${recordingId} stop: ended=${broadcastEnded} stale=${staleBytes} bytes=${bytes} hb=${viewer?.lastHeartbeatDetail ?? "-"}`,
+          );
+        }
         try {
           child.kill("SIGTERM");
         } catch {
@@ -970,6 +997,8 @@ async function enforceRecordingWatchdog(
     max_duration_minutes: number | null;
     capture_started_at: Date | string | null;
     max_bytes: number | string | null;
+    capture_bytes?: number | string | null;
+    updated_at?: Date | string | null;
   },
 ): Promise<"ok" | "finalized" | "killed_waiting_finalize"> {
   const recordingId = row.recording_id;
@@ -1004,10 +1033,34 @@ async function enforceRecordingWatchdog(
   const overBytes =
     maxBytes > 0 && Math.max(partBytes, finalBytes) >= maxBytes;
 
-  if (pastMax || overBytes) {
+  const viewerHealth = getLiveViewerSession(recordingId)?.getHealth();
+  const broadcastEnded = Boolean(viewerHealth?.broadcastEnded);
+
+  // Part mtime / size vs last observed growth — covers orphan ffmpeg after API
+  // restart (sizeTimer gone) and reconnect-zombie after live ends.
+  let stalePart = false;
+  if (Math.max(partBytes, finalBytes) >= 64_000) {
+    try {
+      const st = await stat(partBytes >= 64_000 ? partAbs : destAbs);
+      const mtimeMs = st.mtimeMs;
+      const ageMs = Date.now() - mtimeMs;
+      stalePart =
+        ageMs >= CAPTURE_STALE_BYTES_MS &&
+        Number.isFinite(startedAt) &&
+        Date.now() - startedAt >= CAPTURE_STALE_BYTES_MS;
+    } catch {
+      stalePart = false;
+    }
+  }
+
+  if (pastMax || overBytes || broadcastEnded || stalePart) {
     const why = pastMax
       ? `max_duration ${maxMin}dk aşıldı — zorla durduruluyor`
-      : `max_bytes aşıldı — zorla durduruluyor`;
+      : overBytes
+        ? `max_bytes aşıldı — zorla durduruluyor`
+        : broadcastEnded
+          ? `IG canlı bitti (heartbeat status=${viewerHealth?.broadcastStatus ?? "?"}) — finalize`
+          : `kayıt dosyası ${Math.round(CAPTURE_STALE_BYTES_MS / 60_000)}dk büyümüyor (ffmpeg zombie/CDN static) — finalize`;
     console.warn(`[live-capture] watchdog ${recordingId}: ${why}`);
     const proc = activeProcs.get(recordingId);
     if (proc && !proc.killed) {
@@ -1031,7 +1084,7 @@ async function enforceRecordingWatchdog(
         recordingId,
         destAbs,
         partAbs,
-        pastMax ? 0 : null,
+        pastMax || broadcastEnded || stalePart ? 0 : null,
         why,
       );
       return "finalized";
@@ -1068,16 +1121,17 @@ async function enforceRecordingWatchdog(
  * Copy-remux fragmented/in-progress MP4 → progressive master with moov atom.
  * Returns ok=false if ffmpeg fails (caller may rename as last resort).
  */
-async function remuxCaptureToMaster(
+async function remuxOnce(
   env: AppEnv,
   partAbs: string,
-  destAbs: string,
+  tmpAbs: string,
+  movflags: string | null,
 ): Promise<{ ok: boolean; error?: string }> {
-  const tmpAbs = `${destAbs}.remux.tmp.mp4`;
   const args = ffmpegFinalizeRemuxArgs({
     ffmpegPath: env.ffmpegPath,
     inputPath: partAbs,
     outputPath: tmpAbs,
+    movflags,
   });
   try {
     const proc = Bun.spawn(args, {
@@ -1108,12 +1162,34 @@ async function remuxCaptureToMaster(
       }
       return { ok: false, error: "remux produced tiny file" };
     }
+    // +faststart on long fragmented captures can rewrite a corrupt mvhd
+    // (nb_streams=0). Never promote until video stream is readable.
     try {
-      await unlink(destAbs);
-    } catch {
-      /* dest may not exist yet */
+      const sync = await probeAvSync(env.ffprobePath, tmpAbs);
+      if (!sync.hasVideo) {
+        try {
+          await unlink(tmpAbs);
+        } catch {
+          /* ignore */
+        }
+        return {
+          ok: false,
+          error: `remux unreadable (no video stream): ${sync.detailTr}`,
+        };
+      }
+    } catch (err) {
+      try {
+        await unlink(tmpAbs);
+      } catch {
+        /* ignore */
+      }
+      return {
+        ok: false,
+        error: `remux probe failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      };
     }
-    await rename(tmpAbs, destAbs);
     return { ok: true };
   } catch (err) {
     try {
@@ -1126,6 +1202,31 @@ async function remuxCaptureToMaster(
       error: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+async function remuxCaptureToMaster(
+  env: AppEnv,
+  partAbs: string,
+  destAbs: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const tmpAbs = `${destAbs}.remux.tmp.mp4`;
+  // Prefer +faststart; if probe fails, retry without movflags (still progressive
+  // enough for players; avoids afra/69765459-class corrupt mvhd).
+  let result = await remuxOnce(env, partAbs, tmpAbs, CAPTURE_QUALITY.finalizeMovflags);
+  if (!result.ok) {
+    console.warn(
+      `[live-capture] remux+faststart failed (${result.error}); retry without movflags`,
+    );
+    result = await remuxOnce(env, partAbs, tmpAbs, null);
+  }
+  if (!result.ok) return result;
+  try {
+    await unlink(destAbs);
+  } catch {
+    /* dest may not exist yet */
+  }
+  await rename(tmpAbs, destAbs);
+  return { ok: true };
 }
 
 async function finalizeRecording(

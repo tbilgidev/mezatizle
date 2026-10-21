@@ -542,7 +542,36 @@ export type LiveViewerPresenceHealth = {
   lastCommentPollDetail: string;
   commentHitTotal: number;
   commentPollCount: number;
+  /**
+   * True when IG heartbeat says the broadcast is no longer active
+   * (or returns 400/404). Capture supervisor should finalize promptly.
+   */
+  broadcastEnded: boolean;
+  broadcastStatus: string | null;
 };
+
+/** IG live heartbeat statuses that mean "still on air". */
+const LIVE_ACTIVE_STATUSES = new Set([
+  "active",
+  "running",
+  "started",
+  "connecting",
+  "joined",
+  "live",
+]);
+
+export function isBroadcastStatusEnded(
+  status: string | null | undefined,
+): boolean {
+  if (!status) return false;
+  const s = status.trim().toLowerCase();
+  if (!s) return false;
+  if (LIVE_ACTIVE_STATUSES.has(s)) return false;
+  // Known ended tokens only — unknown strings fall through to stale-bytes watchdog.
+  return /stop|end|interrupt|finish|post_?live|unavailable|deleted|not.?live|offline/.test(
+    s,
+  );
+}
 
 export type LiveViewerPresence = {
   recordingId: string;
@@ -866,6 +895,10 @@ export async function startLiveViewerPresence(
     }
   };
 
+  let broadcastEnded = false;
+  let broadcastStatus: string | null = null;
+  let endedStreak = 0;
+
   const heartbeatOnce = async () => {
     if (stopped) return;
     try {
@@ -917,9 +950,26 @@ export async function startLiveViewerPresence(
       );
       lastHeartbeatOk = r.status === 200;
       lastHeartbeatAt = Date.now();
+      broadcastStatus = r.broadcast_status ?? null;
       lastHeartbeatDetail = lastHeartbeatOk
         ? `heartbeat_ok viewers=${r.viewer_count ?? "?"} status=${r.broadcast_status ?? "?"}`
         : `heartbeat_http_${r.status}`;
+
+      // End-of-live: HTTP 400/404 (media gone) OR explicit non-active status.
+      // Require 2 consecutive signals to avoid one flaky heartbeat killing a long mezat.
+      const httpGone = r.status === 400 || r.status === 404;
+      const statusGone = isBroadcastStatusEnded(r.broadcast_status);
+      if (httpGone || statusGone) {
+        endedStreak += 1;
+        if (endedStreak >= 2 && !broadcastEnded) {
+          broadcastEnded = true;
+          console.warn(
+            `[live-viewer] ${opts.recordingId} broadcast ended (http=${r.status} status=${r.broadcast_status ?? "?"} streak=${endedStreak})`,
+          );
+        }
+      } else if (r.status === 200) {
+        endedStreak = 0;
+      }
     } catch (err) {
       lastHeartbeatOk = false;
       lastHeartbeatAt = Date.now();
@@ -1022,6 +1072,8 @@ export async function startLiveViewerPresence(
       lastCommentPollDetail,
       commentHitTotal,
       commentPollCount,
+      broadcastEnded,
+      broadcastStatus,
     }),
     stop: async () => {
       if (stopped) return;
