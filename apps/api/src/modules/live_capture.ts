@@ -214,6 +214,8 @@ export const LIVE_CAPTURE_POLICY = {
 };
 
 const activeProcs = new Map<string, ChildProcessWithoutNullStreams>();
+/** Single-flight finalize per recording — close-handler + stall watchdog must not remux the same .part concurrently (glam part2 lost ~877MB). */
+const finalizeInFlight = new Map<string, Promise<void>>();
 
 /**
  * ffmpeg uses -reconnect on the DASH URL. When IG live ends, CDN often keeps
@@ -1306,12 +1308,26 @@ async function enforceRecordingWatchdog(
     await killCapturePid(pid);
     dropDeadActiveProc(recordingId);
     await stopLiveViewerPresence(recordingId);
-    // If close handler will finalize via activeProcs, give it a moment
-    if (activeProcs.has(recordingId)) {
-      await Bun.sleep(2000);
+    // Prefer close-handler finalize (single-flight). Wait briefly for it before reclaiming.
+    if (activeProcs.has(recordingId) || finalizeInFlight.has(recordingId)) {
+      await Bun.sleep(2500);
       dropDeadActiveProc(recordingId);
-      if (!activeProcs.has(recordingId)) {
-        // close handler may still be finalizing; fall through only if still recording
+      const inflight = finalizeInFlight.get(recordingId);
+      if (inflight) {
+        await inflight;
+        if (stalePart && !broadcastEnded && !pastMax && !overBytes) {
+          const part2 = await maybeStartPart2AfterStall(
+            sql,
+            env,
+            {
+              recording_id: recordingId,
+              watch_url: row.watch_url ?? null,
+            },
+            allowPart2,
+          );
+          if (part2) return "part2";
+        }
+        return "finalized";
       }
     }
     if (partBytes >= 64_000 || finalBytes >= 64_000) {
@@ -1459,7 +1475,8 @@ async function remuxCaptureToMaster(
   partAbs: string,
   destAbs: string,
 ): Promise<{ ok: boolean; error?: string }> {
-  const tmpAbs = `${destAbs}.remux.tmp.mp4`;
+  // Unique tmp per attempt — concurrent finalize must never clobber the same path.
+  const tmpAbs = `${destAbs}.remux.${process.pid}.${Date.now()}.tmp.mp4`;
   // Prefer +faststart; if probe fails, retry without movflags (still progressive
   // enough for players; avoids afra/69765459-class corrupt mvhd).
   let result = await remuxOnce(env, partAbs, tmpAbs, CAPTURE_QUALITY.finalizeMovflags);
@@ -1470,16 +1487,67 @@ async function remuxCaptureToMaster(
     result = await remuxOnce(env, partAbs, tmpAbs, null);
   }
   if (!result.ok) return result;
-  try {
-    await unlink(destAbs);
-  } catch {
-    /* dest may not exist yet */
+  const tmpBytes = await fileSize(tmpAbs);
+  if (tmpBytes < 64_000) {
+    try {
+      await unlink(tmpAbs);
+    } catch {
+      /* ignore */
+    }
+    return { ok: false, error: "remux tmp missing/empty after reported success" };
   }
-  await rename(tmpAbs, destAbs);
+  // Atomic replace on same filesystem. Do NOT unlink(dest) first — that window
+  // + a failed rename deleted glam part2's only copy after a concurrent remux.
+  try {
+    await rename(tmpAbs, destAbs);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[live-capture] remux rename failed (tmp kept): ${tmpAbs} → ${destAbs}: ${msg}`,
+    );
+    return {
+      ok: false,
+      error: `remux rename failed: ${msg} (tmp kept at ${tmpAbs})`,
+    };
+  }
+  if ((await fileSize(destAbs)) < 64_000) {
+    return { ok: false, error: "remux dest empty after rename" };
+  }
   return { ok: true };
 }
 
 async function finalizeRecording(
+  sql: Sql,
+  env: AppEnv,
+  recordingId: string,
+  destAbs: string,
+  partAbs: string,
+  code: number | null,
+  stderr: string,
+) {
+  const existing = finalizeInFlight.get(recordingId);
+  if (existing) {
+    await existing;
+    return;
+  }
+  const run = finalizeRecordingUnlocked(
+    sql,
+    env,
+    recordingId,
+    destAbs,
+    partAbs,
+    code,
+    stderr,
+  ).finally(() => {
+    if (finalizeInFlight.get(recordingId) === run) {
+      finalizeInFlight.delete(recordingId);
+    }
+  });
+  finalizeInFlight.set(recordingId, run);
+  await run;
+}
+
+async function finalizeRecordingUnlocked(
   sql: Sql,
   env: AppEnv,
   recordingId: string,
@@ -1493,11 +1561,18 @@ async function finalizeRecording(
   `;
   if (!rows[0] || rows[0].status === "cancelled") return;
   if (rows[0].status === "completed") return;
+  // Single-flight map already serializes callers. `finalizing` is allowed so the
+  // stuck-finalize watchdog can reclaim after FINALIZE_STUCK_MS (prior crash).
 
   await sql`
     UPDATE live_captures SET status = 'finalizing', updated_at = now(), process_pid = NULL
     WHERE recording_id = ${recordingId}
+      AND status NOT IN ('completed', 'cancelled', 'failed', 'not_found', 'blocked')
   `;
+  const claimed = await sql<{ status: string }[]>`
+    SELECT status FROM live_captures WHERE recording_id = ${recordingId}
+  `;
+  if (!claimed[0] || claimed[0].status !== "finalizing") return;
 
   // Prefer part; if already renamed, treat dest as done
   let bytes = await fileSize(partAbs);
@@ -1559,11 +1634,23 @@ async function finalizeRecording(
     return;
   }
 
+  const hadBytes = bytes;
   const partExists = (await fileSize(partAbs)) > 0;
   if (partExists) {
     // Fragmented capture (empty_moov) → progressive +faststart so players seek
     // and max-duration kills never leave an unreadable MP4 (yagmur_xeme class).
-    const remuxed = await remuxCaptureToMaster(env, partAbs, destAbs);
+    let remuxed: { ok: boolean; error?: string };
+    try {
+      remuxed = await remuxCaptureToMaster(env, partAbs, destAbs);
+    } catch (err) {
+      remuxed = {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+      console.error(
+        `[live-capture] remux threw ${recordingId}: ${remuxed.error}`,
+      );
+    }
     if (!remuxed.ok) {
       try {
         await rename(partAbs, destAbs);
@@ -1572,6 +1659,7 @@ async function finalizeRecording(
           const msg =
             remuxed.error ||
             (err instanceof Error ? err.message : String(err));
+          // Keep .part on disk if rename failed — never delete the only copy.
           await sql`
             UPDATE live_captures SET status = 'failed', last_probe_detail = ${msg}, updated_at = now()
             WHERE recording_id = ${recordingId}
@@ -1579,30 +1667,44 @@ async function finalizeRecording(
           await sql`
             UPDATE recordings
             SET status = 'failed', capture_status = 'hata', capture_error = ${msg},
-                error_message = ${msg}, capture_ended_at = now(), updated_at = now()
+                error_message = ${msg}, capture_ended_at = now(),
+                capture_bytes = ${hadBytes},
+                file_size_bytes = ${hadBytes},
+                updated_at = now()
             WHERE id = ${recordingId}
           `;
           return;
         }
       }
     } else {
-      try {
-        await unlink(partAbs);
-      } catch {
-        /* part may already be gone */
+      // Only drop .part after dest is verified non-empty.
+      if ((await fileSize(destAbs)) >= 64_000) {
+        try {
+          await unlink(partAbs);
+        } catch {
+          /* part may already be gone */
+        }
+      } else {
+        console.error(
+          `[live-capture] remux ok but dest empty — keeping part ${partAbs}`,
+        );
       }
     }
   } else if ((await fileSize(destAbs)) < 64_000) {
+    const msg = "Finalize: ne part ne final dosya yok";
     await sql`
       UPDATE live_captures SET status = 'failed',
-        last_probe_detail = ${"Finalize: ne part ne final dosya yok"}, updated_at = now()
+        last_probe_detail = ${msg}, updated_at = now()
       WHERE recording_id = ${recordingId}
     `;
     await sql`
       UPDATE recordings
       SET status = 'failed', capture_status = 'hata',
           capture_error = ${"Kayıt dosyası bulunamadı"},
-          capture_ended_at = now(), updated_at = now()
+          capture_ended_at = now(),
+          capture_bytes = ${hadBytes},
+          file_size_bytes = ${hadBytes},
+          updated_at = now()
       WHERE id = ${recordingId}
     `;
     return;
@@ -1610,23 +1712,49 @@ async function finalizeRecording(
 
   // Burn polled comments into the master (HUD) — best-effort, never blocks A/V finalize
   let burnDetail = "burn_skipped";
-  try {
-    const burned = await burnCommentsIntoMaster({
-      ffmpegPath: env.ffmpegPath,
-      masterAbs: destAbs,
-    });
-    burnDetail = burned.detail;
-    if (burned.burned) {
-      console.log(`[live-comments] ${recordingId} ${burnDetail}`);
-    } else if (!burned.ok) {
-      console.warn(`[live-comments] ${recordingId} burn failed: ${burnDetail}`);
+  if ((await fileSize(destAbs)) >= 64_000) {
+    try {
+      const burned = await burnCommentsIntoMaster({
+        ffmpegPath: env.ffmpegPath,
+        masterAbs: destAbs,
+      });
+      burnDetail = burned.detail;
+      if (burned.burned) {
+        console.log(`[live-comments] ${recordingId} ${burnDetail}`);
+      } else if (!burned.ok) {
+        console.warn(`[live-comments] ${recordingId} burn failed: ${burnDetail}`);
+      }
+    } catch (err) {
+      burnDetail = err instanceof Error ? err.message : String(err);
+      console.warn(`[live-comments] ${recordingId} burn error: ${burnDetail}`);
     }
-  } catch (err) {
-    burnDetail = err instanceof Error ? err.message : String(err);
-    console.warn(`[live-comments] ${recordingId} burn error: ${burnDetail}`);
   }
 
   const finalBytes = await fileSize(destAbs);
+  // Never mark bitti/enqueue analysis with a missing master after we had capture bytes.
+  if (finalBytes < 64_000) {
+    const msg = `Finalize master missing/empty (had ${hadBytes} bytes on part) · ${burnDetail}`;
+    console.error(`[live-capture] ${recordingId} ${msg}`);
+    await sql`
+      UPDATE live_captures
+      SET status = 'failed', last_probe_detail = ${msg}, updated_at = now()
+      WHERE recording_id = ${recordingId}
+    `;
+    await sql`
+      UPDATE recordings
+      SET status = 'failed',
+          capture_status = 'hata',
+          capture_error = ${msg},
+          error_message = ${msg},
+          capture_ended_at = now(),
+          capture_bytes = ${hadBytes},
+          file_size_bytes = ${hadBytes},
+          updated_at = now()
+      WHERE id = ${recordingId}
+    `;
+    return;
+  }
+
   let syncDetail = "A/V sync check skipped";
   try {
     const sync = await probeAvSync(env.ffprobePath, destAbs);

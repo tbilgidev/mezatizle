@@ -43,6 +43,21 @@ describe("deriveAnalysisState — cancelled ≠ done", () => {
     ];
     expect(deriveAnalysisState("extracting", jobs)).toBe("running");
   });
+
+  test("failed probe + waiting_prereq queue is failed not %0 running (glam part2)", () => {
+    const jobs = [
+      { job_type: "probe_media", status: "failed", stage: "failed" },
+      {
+        job_type: "extract_audio_frames",
+        status: "queued",
+        stage: "waiting_prereq",
+      },
+      { job_type: "transcribe", status: "queued", stage: "waiting_prereq" },
+    ];
+    expect(deriveAnalysisState("failed", jobs)).toBe("failed");
+    const prog = deriveAnalysisProgress(jobs);
+    expect(prog.analysisStage).toBe("Analiz başarısız");
+  });
 });
 
 describe("analysisFrameFps", () => {

@@ -32,13 +32,22 @@ export type JobRow = {
 
 export function deriveAnalysisState(
   recordingStatus: string | null | undefined,
-  jobs: Array<{ job_type?: string; status: string }>,
+  jobs: Array<{ job_type?: string; status: string; stage?: string | null }>,
 ): AnalysisState {
-  // Prefer active work over stale failures (re-queue / ordered pipeline).
-  if (jobs.some((j) => j.status === "running" || j.status === "queued")) {
-    return "running";
+  // Real worker activity wins.
+  if (jobs.some((j) => j.status === "running")) return "running";
+  // Failed prerequisite + eternal waiting_prereq queue must not look like "%0 running"
+  // (glam part2 after missing master / probe_media failed).
+  const anyFailed = jobs.some((j) => j.status === "failed");
+  const queued = jobs.filter((j) => j.status === "queued");
+  const queuedOnlyWaitingPrereq =
+    queued.length > 0 &&
+    queued.every((j) => String(j.stage ?? "").includes("waiting_prereq"));
+  if (anyFailed && (queued.length === 0 || queuedOnlyWaitingPrereq)) {
+    return "failed";
   }
-  if (jobs.some((j) => j.status === "failed")) return "failed";
+  if (queued.length > 0) return "running";
+  if (anyFailed) return "failed";
   // Cancelled = superseded/abandoned — never treat as analysis complete
   // (afra false "done" + 0/0 after remux-repair cancel wave).
   const byType = new Map(
@@ -111,7 +120,15 @@ export function deriveAnalysisProgress(jobs: JobRow[]): {
   }
 
   const anyFailed = jobs.some((j) => j.status === "failed");
-  if (anyFailed && !jobs.some((j) => j.status === "running" || j.status === "queued")) {
+  const queued = jobs.filter((j) => j.status === "queued");
+  const queuedOnlyWaitingPrereq =
+    queued.length > 0 &&
+    queued.every((j) => String(j.stage ?? "").includes("waiting_prereq"));
+  if (
+    anyFailed &&
+    !jobs.some((j) => j.status === "running") &&
+    (queued.length === 0 || queuedOnlyWaitingPrereq)
+  ) {
     return {
       analysisProgress: Math.round(Math.min(99, Math.max(0, score))),
       analysisStage: "Analiz başarısız",
