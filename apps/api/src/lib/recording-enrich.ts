@@ -32,19 +32,24 @@ export type JobRow = {
 
 export function deriveAnalysisState(
   recordingStatus: string | null | undefined,
-  jobs: Array<{ status: string }>,
+  jobs: Array<{ job_type?: string; status: string }>,
 ): AnalysisState {
   // Prefer active work over stale failures (re-queue / ordered pipeline).
   if (jobs.some((j) => j.status === "running" || j.status === "queued")) {
     return "running";
   }
   if (jobs.some((j) => j.status === "failed")) return "failed";
-  if (
-    jobs.length > 0 &&
-    jobs.every((j) => j.status === "succeeded" || j.status === "cancelled")
-  ) {
-    return "done";
-  }
+  // Cancelled = superseded/abandoned — never treat as analysis complete
+  // (afra false "done" + 0/0 after remux-repair cancel wave).
+  const byType = new Map(
+    jobs
+      .filter((j) => j.job_type)
+      .map((j) => [String(j.job_type), j.status] as const),
+  );
+  const pipelineDone = ANALYSIS_STAGE_WEIGHTS.every(
+    (s) => byType.get(s.jobType) === "succeeded",
+  );
+  if (pipelineDone) return "done";
   const st = String(recordingStatus ?? "");
   if (st === "complete") return "done";
   if (
@@ -76,8 +81,13 @@ export function deriveAnalysisProgress(jobs: JobRow[]): {
   for (const stage of ANALYSIS_STAGE_WEIGHTS) {
     const j = byType.get(stage.jobType);
     if (!j) continue;
-    if (j.status === "succeeded" || j.status === "cancelled") {
+    if (j.status === "succeeded") {
       score += stage.weight;
+      continue;
+    }
+    if (j.status === "cancelled") {
+      // Superseded — no credit (must re-run for a real complete).
+      if (!activeLabel) activeLabel = stage.labelTr;
       continue;
     }
     if (j.status === "running") {
@@ -94,7 +104,7 @@ export function deriveAnalysisProgress(jobs: JobRow[]): {
 
   const allDone = ANALYSIS_STAGE_WEIGHTS.every((s) => {
     const j = byType.get(s.jobType);
-    return j && (j.status === "succeeded" || j.status === "cancelled");
+    return j && j.status === "succeeded";
   });
   if (allDone) {
     return { analysisProgress: 100, analysisStage: "Tamamlandı" };
@@ -188,9 +198,12 @@ export async function enrichRecordingRow(
     { persist: true },
   );
 
+  // Latest row per stage — ignore superseded cancel waves from remux repair.
   const jobs = await sql<JobRow[]>`
-    SELECT job_type, status, progress_percent, stage
-    FROM processing_jobs WHERE recording_id = ${id}
+    SELECT DISTINCT ON (job_type) job_type, status, progress_percent, stage
+    FROM processing_jobs
+    WHERE recording_id = ${id}
+    ORDER BY job_type, created_at DESC
   `;
   const analysisState = deriveAnalysisState(
     row.status as string | null,

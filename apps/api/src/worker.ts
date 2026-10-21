@@ -26,8 +26,10 @@ const pollMs = Number(process.env.WORKER_POLL_INTERVAL_MS ?? "1500");
 /**
  * Pipeline prerequisites — prevent segment/reconcile from racing ahead of ASR
  * (which produced empty reports when reconcile finished before transcript).
+ * Cancelled ≠ succeeded (afra: cancel wave must not unlock empty reconcile).
  */
-async function prerequisitesMet(
+export async function prerequisitesMet(
+  sql: ReturnType<typeof createSql>,
   recordingId: string,
   jobType: string,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
@@ -48,7 +50,7 @@ async function prerequisitesMet(
       LIMIT 1
     `;
     const st = rows[0]?.status;
-    if (st !== "succeeded" && st !== "cancelled") {
+    if (st !== "succeeded") {
       return {
         ok: false,
         reason: `prerequisite ${dep} not succeeded (status=${st ?? "missing"})`,
@@ -64,7 +66,7 @@ async function processJob() {
   if (!job) return false;
 
   try {
-    const prereq = await prerequisitesMet(job.recording_id, job.job_type);
+    const prereq = await prerequisitesMet(sql, job.recording_id, job.job_type);
     if (!prereq.ok) {
       await sql`
         UPDATE processing_jobs
@@ -111,25 +113,49 @@ async function processJob() {
             AND status NOT IN ('complete', 'analyzing', 'failed', 'cancelled')
         `;
         await updateJobProgress(sql, job.id, 30, "asr");
+        const heartbeat = async () => {
+          await sql`
+            UPDATE processing_jobs
+            SET updated_at = now(), locked_at = now(), stage = 'asr'
+            WHERE id = ${job.id} AND status = 'running'
+          `;
+        };
         if (process.env.FORCE_MOCK_ASR === "1") {
           result = await transcribeMock(sql, env, job.recording_id);
         } else {
-          const py = await tryPythonWorker("transcribe", job.recording_id, env);
+          const py = await tryPythonWorker(
+            "transcribe",
+            job.recording_id,
+            env,
+            heartbeat,
+          );
           if (!py.ok) {
             throw new Error(`ASR failed (faster-whisper): ${py.detail}`);
+          }
+          const segs = Number(py.segments ?? 0);
+          if (segs <= 0) {
+            const [meta] = await sql<{ duration_seconds: number | null }[]>`
+              SELECT duration_seconds FROM recordings WHERE id = ${job.recording_id}
+            `;
+            const dur = Number(meta?.duration_seconds ?? 0);
+            if (dur >= 600) {
+              throw new Error(
+                `ASR produced 0 segments on ${Math.round(dur)}s recording — refusing empty transcript (would yield false 0/0 KPIs)`,
+              );
+            }
           }
           result = py as Record<string, unknown>;
           await recordApiUsage(sql, {
             provider: "local",
             operation: "asr_faster_whisper",
-            units: Number(py.segments ?? 0),
+            units: segs,
             unitCostUsd: 0,
             recordingId: job.recording_id,
             meta: { backend: py.backend, model: py.model ?? null },
           });
           await recordMetric(sql, {
             name: "asr_segments",
-            value: Number(py.segments ?? 0),
+            value: segs,
             unit: "count",
             recordingId: job.recording_id,
             jobId: job.id,
@@ -140,10 +166,22 @@ async function processJob() {
       }
       case "ocr_frames": {
         await updateJobProgress(sql, job.id, 40, "ocr");
+        const heartbeat = async () => {
+          await sql`
+            UPDATE processing_jobs
+            SET updated_at = now(), locked_at = now(), stage = 'ocr'
+            WHERE id = ${job.id} AND status = 'running'
+          `;
+        };
         if (process.env.FORCE_MOCK_OCR === "1") {
           result = await ocrFramesMock(sql, env, job.recording_id);
         } else {
-          const py = await tryPythonWorker("ocr", job.recording_id, env);
+          const py = await tryPythonWorker(
+            "ocr",
+            job.recording_id,
+            env,
+            heartbeat,
+          );
           if (!py.ok) {
             throw new Error(`OCR failed: ${py.detail}`);
           }

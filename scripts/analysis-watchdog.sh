@@ -39,9 +39,12 @@ kill_orphan_tools() {
 
 reclaim_stale_jobs() {
   local out n
+  # Long extract/ASR/OCR: stale window scales with recording duration (3h mezat
+  # must not be reclaimed at 12m). Heartbeats normally refresh updated_at; this
+  # is a backstop when a child is still alive but heartbeat missed a beat.
   out="$(
     PGPASSWORD="${PGPASSWORD:-mezatizle}" psql -h 127.0.0.1 -p 5433 -U mezatizle -d mezatizle -v ON_ERROR_STOP=1 -At -q <<SQL
-UPDATE processing_jobs
+UPDATE processing_jobs pj
 SET status = 'queued',
     locked_by = NULL,
     locked_at = NULL,
@@ -49,9 +52,28 @@ SET status = 'queued',
     error_message = COALESCE(error_message, 'reclaimed: analysis watchdog stale lock'),
     available_at = now(),
     updated_at = now()
-WHERE status = 'running'
-  AND GREATEST(locked_at, updated_at, started_at) < now() - make_interval(mins => ${STALE_MINUTES})
-RETURNING id::text || ' type=' || job_type || ' rec=' || left(recording_id::text, 8);
+WHERE pj.status = 'running'
+  AND GREATEST(pj.locked_at, pj.updated_at, pj.started_at) < now() - make_interval(
+    mins => CASE
+      WHEN pj.job_type IN ('extract_audio_frames', 'transcribe', 'ocr_frames') THEN
+        GREATEST(
+          ${STALE_MINUTES},
+          LEAST(
+            720,
+            COALESCE(
+              (
+                SELECT CEIL(GREATEST(COALESCE(r.duration_seconds, 0), 600) / 60.0 * 2.5)::int
+                FROM recordings r
+                WHERE r.id = pj.recording_id
+              ),
+              ${STALE_MINUTES}
+            )
+          )
+        )
+      ELSE ${STALE_MINUTES}
+    END
+  )
+RETURNING pj.id::text || ' type=' || pj.job_type || ' rec=' || left(pj.recording_id::text, 8);
 SQL
   )" || {
     log "ERROR reclaim psql failed"
