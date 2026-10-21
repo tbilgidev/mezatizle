@@ -194,6 +194,16 @@ describe("Turkish auction rules", () => {
     expect(isSaleWorthy(s!)).toBe(false);
   });
 
+  test("Turkish soldan (from the left) is NOT English sold", () => {
+    expect(parseAuctionText("Soldan")).toBeNull();
+    expect(parseAuctionText("soldan")).toBeNull();
+    expect(
+      parseAuctionText("şimdi önce soldan 1.", { source: "transcript" }),
+    ).toBeNull();
+    expect(parseAuctionText("sold to @ayse")).not.toBeNull();
+    expect(parseAuctionText("sold")).not.toBeNull();
+  });
+
   test("OCR noise ignored", () => {
     expect(parseAuctionText("###")).toBeNull();
     expect(isAuctionNoise("@@@!!!")).toBe(true);

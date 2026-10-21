@@ -67,9 +67,12 @@ const CORRECTION_RE =
 const UNSOLD_RE =
   /(sat[ıi]lmad[ıi]|kal[ıi]yor(?!\s*@)|kimse\s+almad[ıi]|al[ıi]c[ıi]\s+yok|\bpasst\b|\bpass\b|geçiyoruz|geciyoruz|geçtik|gectik|bir\s+sonraki|sıradaki\s+ürüne)/i;
 
-/** Explicit seller win / sold — NOT seller «aldım» ask. */
+/**
+ * Explicit seller win / sold — NOT seller «aldım» ask.
+ * `\bsold\b` (not bare `sold`) — Turkish «soldan» / «şimdi soldan» must NOT match.
+ */
 const SOLD_RE =
-  /(sat[ıi]ld[ıi]|sold(?:\s+to)?|alan(?:[ıi])?\s+bell[iı]|satt[ıi]k|kazanan\s*[:@]|gitti\s*[@]|kapatt[ıi]k|onaylad[ıi]m\s*sat|tebrikler\s*@|['']?da\s+kald[ıi]|da\s+kald[ıi]|kazand[ıi]|ald[ıi]\s+@|@\w+\s+ald[ıi])/i;
+  /(sat[ıi]ld[ıi]|\bsold(?:\s+to)?\b|alan(?:[ıi])?\s+bell[iı]|satt[ıi]k|kazanan\s*[:@]|gitti\s*[@]|kapatt[ıi]k|onaylad[ıi]m\s*sat|tebrikler\s*@|['']?da\s+kald[ıi]|da\s+kald[ıi]|kazand[ıi]|ald[ıi]\s+@|@\w+\s+ald[ıi])/i;
 
 /** Honorific after a spoken first name in verbal win phrases. */
 const HONORIFIC =
