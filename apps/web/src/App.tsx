@@ -32,6 +32,8 @@ type FootStatus = {
   allowPaidApis: boolean;
   autoFollowLabel: string;
   watching: string;
+  healthOk: boolean;
+  healthAlertTr: string | null;
 };
 
 function SidebarFoot() {
@@ -53,6 +55,9 @@ function SidebarFoot() {
           af.currentlyWatching?.length > 0
             ? af.currentlyWatching.map((w) => `@${w.username}`).join(", ")
             : "izlenen yok";
+        const healthAlertTr =
+          typeof af.healthAlertTr === "string" ? af.healthAlertTr : null;
+        const healthOk = af.healthOk !== false && !healthAlertTr;
         setFoot({
           hasCookies: Boolean(ig.hasCookies) || ig.status === "yuklu",
           profileLabel: String(profile.profile ?? "LOCAL"),
@@ -61,9 +66,22 @@ function SidebarFoot() {
             ? "Takip canlı: açık"
             : "Takip canlı: kapalı",
           watching,
+          healthOk,
+          healthAlertTr,
         });
       } catch {
-        if (!cancelled) setFoot(null);
+        if (!cancelled) {
+          setFoot({
+            hasCookies: false,
+            profileLabel: "LOCAL",
+            allowPaidApis: false,
+            autoFollowLabel: "Takip canlı: —",
+            watching: "izlenen yok",
+            healthOk: false,
+            healthAlertTr:
+              "API yanıt vermiyor — takip canlı / kayıt durumu bilinmiyor.",
+          });
+        }
       }
     })();
     return () => {
@@ -76,16 +94,24 @@ function SidebarFoot() {
   const profile = `${foot?.profileLabel ?? "LOCAL"} profil`;
   const af = foot?.autoFollowLabel ?? "Takip canlı: —";
   const watching = foot?.watching ?? "izlenen yok";
+  const alert = foot?.healthAlertTr;
+  const alertClass = alert
+    ? "mt-auto rounded-2xl border border-signal/50 bg-signal/10 px-3.5 py-3 text-[0.82rem] leading-relaxed text-paper"
+    : "mt-auto rounded-2xl border border-line bg-mint/5 px-3.5 py-3 text-[0.82rem] leading-relaxed text-fog";
 
   return (
-    <div
-      className="mt-auto rounded-2xl border border-line bg-mint/5 px-3.5 py-3 text-[0.82rem] leading-relaxed text-fog"
-      aria-live="polite"
-    >
-      <div className="mb-1.5 flex items-center gap-2 text-mint">
+    <div className={alertClass} aria-live="polite">
+      <div
+        className={`mb-1.5 flex items-center gap-2 ${alert ? "text-signal" : "text-mint"}`}
+      >
         <ClipboardList className="h-3.5 w-3.5" aria-hidden />
-        <span className="font-semibold text-paper/90">Durum</span>
+        <span className="font-semibold text-paper/90">
+          {alert ? "Durum — UYARI" : "Durum"}
+        </span>
       </div>
+      {alert ? (
+        <div className="mb-2 font-medium text-signal">{alert}</div>
+      ) : null}
       <div>
         {paid} · {ig} · {profile}
       </div>

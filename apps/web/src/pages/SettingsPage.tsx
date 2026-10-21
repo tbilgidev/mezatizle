@@ -33,6 +33,9 @@ type AutoFollowStatus = {
     captureStatus: string | null;
   }>;
   scanPaused?: boolean;
+  healthOk?: boolean;
+  healthAlertTr?: string | null;
+  priorityUsernames?: string[];
   labelTr: string;
   hintTr: string;
   cookiesReady: boolean;
@@ -262,7 +265,17 @@ export function SettingsPage() {
                     Çerez gerekli
                   </Badge>
                 ) : null}
+                {autoFollow?.healthAlertTr ? (
+                  <Badge variant="danger" className="ml-2">
+                    Poller uyarısı
+                  </Badge>
+                ) : null}
               </p>
+              {autoFollow?.healthAlertTr ? (
+                <p className="mb-3 rounded-xl border border-signal/40 bg-signal/10 px-3 py-2 text-sm font-medium text-signal">
+                  {autoFollow.healthAlertTr}
+                </p>
+              ) : null}
               <ul className="mb-4 space-y-1 text-sm text-fog">
                 <li>
                   Son tarama: {formatWhen(autoFollow?.lastPollAt)}
@@ -274,6 +287,14 @@ export function SettingsPage() {
                 </li>
                 <li>
                   Tarama aralığı: {formatPollInterval(autoFollow?.pollIntervalMs)}
+                </li>
+                <li>
+                  Öncelik profilleri:{" "}
+                  {autoFollow?.priorityUsernames?.length
+                    ? autoFollow.priorityUsernames
+                        .map((u) => `@${u}`)
+                        .join(", ")
+                    : "—"}
                 </li>
                 <li>
                   Son ayrıntı: {autoFollow?.lastDetail ?? autoFollow?.lastError ?? "—"}

@@ -29,8 +29,15 @@ import {
 import { normalizePriorityUsernames } from "./ig_following_lives.ts";
 
 const CONFIG_FILE = "auto-follow-live.json";
-/** Default sellers to profile-probe when reels_tray omits their live ring. */
-const DEFAULT_PRIORITY_USERNAMES = ["afra.vintagetaki"];
+/**
+ * Default sellers to profile-probe when reels_tray omits their live ring.
+ * Always includes known mezat sellers Tolga trusts auto-record for.
+ */
+const DEFAULT_PRIORITY_USERNAMES = [
+  "afra.vintagetaki",
+  "glamvintage_",
+  "glamvintage",
+];
 
 /** Min / max / default IG poll interval (5–6 minutes). */
 export const POLL_MS_MIN = 300_000;
@@ -38,6 +45,17 @@ export const POLL_MS_MAX = 360_000;
 export const POLL_MS_DEFAULT = 330_000;
 /** While a recording is active, re-check DB this often (no IG hit). */
 export const PAUSE_RECHECK_MS = 30_000;
+/**
+ * Hard ceiling for one IG poll (Playwright). Prevents the supervisor loop
+ * from hanging forever after a stuck browser / 429 page load.
+ */
+export const POLL_HARD_TIMEOUT_MS = 90_000;
+/**
+ * If last successful/attempted poll is older than this while enabled and
+ * not scan-paused, surface a loud "poller stuck" failure in Settings/sidebar.
+ * (2× max interval + rate-limit backoff ≈ 12+6 min → use 20 min.)
+ */
+export const POLL_STALE_MS = 20 * 60_000;
 
 export type AutoFollowLiveConfig = {
   enabled: boolean;
@@ -75,6 +93,10 @@ export type AutoFollowLiveStatus = {
   cookiesReady: boolean;
   /** Cookie-session watcher (@username), when known. */
   watcherUsername: string | null;
+  /** Loud failure for UI when poller/cookies unhealthy. */
+  healthOk: boolean;
+  healthAlertTr: string | null;
+  priorityUsernames: string[];
 };
 
 type PersistState = AutoFollowLiveConfig & {
@@ -347,6 +369,41 @@ export async function getAutoFollowLiveStatus(
   const labelTr = s.enabled
     ? "Takip canlıları otomatik kaydet: açık"
     : "Takip canlıları otomatik kaydet: kapalı";
+  const cookiesReady = Boolean(ig.hasCookies) || ig.status === "yuklu";
+  const priorityUsernames =
+    s.priorityUsernames ?? mergePriorityUsernames(null);
+  let healthAlertTr: string | null = null;
+  if (s.enabled) {
+    if (!cookiesReady) {
+      healthAlertTr =
+        "Takip canlı taraması durdu: Instagram çerezi yok — Ayarlar → Instagram oturumu.";
+    } else if (!loopStarted) {
+      healthAlertTr =
+        "Takip canlı poller çalışmıyor (API restart / AUTO_FOLLOW_LIVE=0).";
+    } else if (!scanPaused && s.lastPollAt) {
+      const age = Date.now() - new Date(s.lastPollAt).getTime();
+      if (Number.isFinite(age) && age > POLL_STALE_MS) {
+        healthAlertTr = `Takip canlı poller takıldı — son tarama ${Math.round(age / 60_000)} dk önce${s.lastError ? ` (${s.lastError})` : ""}.`;
+      }
+    } else if (!scanPaused && !s.lastPollAt && startedAt) {
+      const age = Date.now() - new Date(startedAt).getTime();
+      if (Number.isFinite(age) && age > POLL_STALE_MS) {
+        healthAlertTr =
+          "Takip canlı poller henüz tarama yapamadı — kontrol edin.";
+      }
+    }
+    // Surface recent cookie/429 failures only while we should be polling
+    // (not while scan is paused for an active kaydediliyor).
+    if (
+      !healthAlertTr &&
+      !scanPaused &&
+      s.lastPollOk === false &&
+      s.lastError &&
+      /429|rate-limit|çerez|oturum|blocked|401|403/i.test(s.lastError)
+    ) {
+      healthAlertTr = `Takip canlı uyarısı: ${s.lastError}`;
+    }
+  }
   return {
     enabled: s.enabled,
     pollIntervalMs: s.pollIntervalMs,
@@ -362,9 +419,12 @@ export async function getAutoFollowLiveStatus(
     startedAt,
     labelTr,
     hintTr:
-      `İzleyici hesabının (${watcherLabel}) takip ettiği hesaplar canlıya geçince otomatik kayıt başlar. Tarama ~5–6 dk’da bir; kayıt sürerken (bekleniyor/kaydediliyor) tarama durur — aynı anda tek kayıt. Manuel «Canlı yayın ekle» çalışmaya devam eder.`,
-    cookiesReady: Boolean(ig.hasCookies) || ig.status === "yuklu",
+      `İzleyici hesabının (${watcherLabel}) takip ettiği hesaplar canlıya geçince otomatik kayıt başlar. Tarama ~5–6 dk’da bir; tepsi boş/429 olsa bile öncelik profilleri (afra, glamvintage_, …) yoklanır. Kayıt sürerken tarama durur — aynı anda tek kayıt. Manuel «Canlı yayın ekle» aynı kullanıcı/broadcast için çift başlatmaz.`,
+    cookiesReady,
     watcherUsername,
+    healthOk: !healthAlertTr,
+    healthAlertTr,
+    priorityUsernames,
   };
 }
 
@@ -420,7 +480,20 @@ export async function runAutoFollowPollCycle(
     stateBefore.priorityUsernames,
     stateBefore.lastLivesSeen,
   );
-  const result = await poll(env, { priorityUsernames });
+  const result = await Promise.race([
+    poll(env, { priorityUsernames }),
+    new Promise<Awaited<ReturnType<typeof pollFollowingLives>>>((resolve) => {
+      setTimeout(
+        () =>
+          resolve({
+            ok: false,
+            kind: "error",
+            detail: `Takip canlı taraması zaman aşımı (${Math.round(POLL_HARD_TIMEOUT_MS / 1000)}s) — Playwright takılmış olabilir.`,
+          }),
+        POLL_HARD_TIMEOUT_MS,
+      );
+    }),
+  ]);
   const state = await loadPersist(env);
 
   if (!result.ok) {

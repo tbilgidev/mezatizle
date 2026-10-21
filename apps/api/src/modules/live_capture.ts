@@ -526,6 +526,60 @@ export async function createLiveCapture(
     );
   }
 
+  // Hard dedupe: never start a second capture for the same seller or broadcast
+  // (manual double-click / auto-follow race). Return the healthy in-flight one.
+  const wantBid = extractBroadcastIdFromUrl(parsed.watchUrl);
+  const activeDup = await sql<{
+    recording_id: string;
+    username: string;
+    watch_url: string | null;
+    source_url: string | null;
+    capture_status: string | null;
+    max_duration_minutes: number | null;
+    last_probe_detail: string | null;
+    capture_error: string | null;
+  }[]>`
+    SELECT lc.recording_id, s.instagram_username AS username,
+           lc.watch_url, r.source_url, r.capture_status,
+           lc.max_duration_minutes, lc.last_probe_detail, r.capture_error
+    FROM live_captures lc
+    JOIN recordings r ON r.id = lc.recording_id
+    JOIN sellers s ON s.id = r.seller_id
+    WHERE lc.status IN ('pending', 'waiting', 'recording', 'finalizing')
+       OR r.capture_status IN ('bekleniyor', 'kaydediliyor')
+       OR r.status IN ('awaiting_live', 'recording')
+  `;
+  const usernameLc = parsed.username.toLowerCase();
+  const hit = activeDup.find((row) => {
+    const u = String(row.username || "").toLowerCase();
+    if (u === usernameLc) return true;
+    if (!wantBid) return false;
+    const bid =
+      extractBroadcastIdFromUrl(row.watch_url || "") ||
+      extractBroadcastIdFromUrl(row.source_url || "");
+    return bid != null && bid === wantBid;
+  });
+  if (hit) {
+    console.warn(
+      `[live-capture] dedupe reuse ${hit.recording_id} for @${parsed.username}` +
+        (wantBid ? ` bid=${wantBid}` : ""),
+    );
+    return {
+      recordingId: hit.recording_id,
+      username: String(hit.username || parsed.username),
+      watchUrl: hit.watch_url || parsed.watchUrl,
+      captureStatus: hit.capture_status || "kaydediliyor",
+      lastError: hit.capture_error,
+      lastProbeDetail:
+        hit.last_probe_detail ||
+        "Aynı kullanıcı/broadcast zaten kaydediliyor — yeni kayıt açılmadı.",
+      maxDurationMinutes: hit.max_duration_minutes,
+      quality: CAPTURE_QUALITY,
+      policy: LIVE_CAPTURE_POLICY,
+      deduped: true as const,
+    };
+  }
+
   const id = crypto.randomUUID();
   const filename = `live-${parsed.username}-${id.slice(0, 8)}.mp4`;
   const destAbs = safeJoinStorage(env.storageRoot, "recordings", `${id}.mp4`);
@@ -858,10 +912,18 @@ async function startRecordingProcess(
     maxDurationSeconds,
   });
 
+  // Detached so an API restart does not kill a healthy ffmpeg mid-live.
+  // Supervisor reattaches via process_pid + part file growth.
   const child = spawn(args[0]!, args.slice(1), {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env },
+    detached: true,
   });
+  try {
+    child.unref();
+  } catch {
+    /* ignore */
+  }
   activeProcs.set(recordingId, child);
 
   const detail = maxDurationSeconds

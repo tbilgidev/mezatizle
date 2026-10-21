@@ -11,6 +11,7 @@ import {
   filterLivesNeedingCapture,
   runAutoFollowPollCycle,
   setAutoFollowLiveConfig,
+  getAutoFollowLiveConfig,
   getAutoFollowLiveStatus,
   hasBlockingActiveCapture,
   nextPollSleepMs,
@@ -18,6 +19,8 @@ import {
   POLL_MS_MIN,
   POLL_MS_MAX,
   POLL_MS_DEFAULT,
+  POLL_HARD_TIMEOUT_MS,
+  POLL_STALE_MS,
   type ActiveCaptureRef,
 } from "../apps/api/src/modules/auto_follow_live.ts";
 import type { AppEnv } from "../apps/api/src/lib/env.ts";
@@ -112,6 +115,26 @@ describe("poll interval 5–6 min", () => {
       random: () => 0,
     });
     expect(rl).toBeGreaterThanOrEqual(POLL_MS_MAX * 2);
+  });
+
+  test("poll hard-timeout and stale thresholds are finite safety nets", () => {
+    expect(POLL_HARD_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
+    expect(POLL_HARD_TIMEOUT_MS).toBeLessThanOrEqual(180_000);
+    expect(POLL_STALE_MS).toBeGreaterThan(POLL_MS_MAX * 2);
+  });
+});
+
+describe("priority usernames", () => {
+  test("defaults include afra + glamvintage_ for tray-miss probe", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mezat-af-"));
+    try {
+      const cfg = await getAutoFollowLiveConfig(fakeEnv(dir));
+      expect(cfg.priorityUsernames).toContain("afra.vintagetaki");
+      expect(cfg.priorityUsernames).toContain("glamvintage_");
+      expect(cfg.priorityUsernames).toContain("glamvintage");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

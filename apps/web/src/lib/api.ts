@@ -529,6 +529,9 @@ export const api = {
       labelTr: string;
       hintTr: string;
       cookiesReady: boolean;
+      healthOk?: boolean;
+      healthAlertTr?: string | null;
+      priorityUsernames?: string[];
     }>("/api/settings/auto-follow-live"),
   setAutoFollowLive: (body: { enabled?: boolean; pollIntervalMs?: number }) =>
     request<Record<string, unknown>>("/api/settings/auto-follow-live", {

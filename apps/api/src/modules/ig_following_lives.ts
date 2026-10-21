@@ -314,13 +314,10 @@ async function doPollFollowingLives(
       waitUntil: "domcontentloaded",
       timeout: 45_000,
     });
-    if (home && home.status() === 429) {
-      return {
-        ok: false,
-        kind: "rate_limited",
-        detail: "Instagram ana sayfa HTTP 429 (rate-limit).",
-      };
-    }
+    // Homepage 429 used to abort before priority profile probes — that missed
+    // afra/glam lives when reels_tray was empty/rate-limited. Continue and
+    // still probe priority usernames in this session.
+    let homeRateLimited = Boolean(home && home.status() === 429);
     if (/accounts\/login/i.test(page.url())) {
       return {
         ok: false,
@@ -329,7 +326,7 @@ async function doPollFollowingLives(
           "Çerezlerle giriş yapılamadı. Ayarlar → Instagram oturumu → cookies yenileyin.",
       };
     }
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(homeRateLimited ? 400 : 1200);
 
     const trayResult = await page.evaluate(async () => {
       const csrf =
@@ -377,7 +374,7 @@ async function doPollFollowingLives(
 
     const map = new Map<string, FollowingLive>();
     let source: FollowingLivesPollOk["source"] = "reels_tray";
-    let rateLimited = false;
+    let rateLimited = homeRateLimited;
     let blocked = false;
 
     for (const b of trayResult.bodies) {
@@ -404,8 +401,9 @@ async function doPollFollowingLives(
       source = map.size && source === "reels_tray" ? "mixed" : "html_signals";
     }
 
-    // Tray often omits some followed lives. Profile-probe priority usernames
-    // (operator watchlist + recent lastLivesSeen) in the same browser session.
+    // Tray often omits some followed lives (and homepage/tray 429 skips tray).
+    // Always profile-probe priority usernames (afra, glamvintage_, …) in the
+    // same browser session — this is the tray-miss safety net.
     const priority = normalizePriorityUsernames(opts?.priorityUsernames);
     const missingPriority = priority.filter((u) => !map.has(u)).slice(0, 12);
     if (missingPriority.length) {
