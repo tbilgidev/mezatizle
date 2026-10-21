@@ -7,7 +7,10 @@
  * - After ask: first follower comment «aldım» (OCR, with username) → buyer at listed price
  * - Bidding: opening → OCR bids («X», «X veririm») → seller win confirm → sale
  * - Counter: buyer «18 veririm» + seller accept → sale at 18 (not ask)
- * - Spoken first name without @ → never buyer_username
+ * - Verbal win (ASR): «X hanım sizindir» / «Y bey sizde» / «hayırlı olsun Z» —
+ *   match spoken name to recent aldım/bid username; seller need not reply in comments
+ * - Repeated verbal confirms on the same lot → **one** sale (dedup)
+ * - Spoken first name without @ → never buyer_username (unless matched to a commenter)
  * - Prefer unknown / no sale over inventing from seller chatter
  */
 
@@ -61,6 +64,40 @@ const UNSOLD_RE =
 /** Explicit seller win / sold — NOT seller «aldım» ask. */
 const SOLD_RE =
   /(sat[ıi]ld[ıi]|sold(?:\s+to)?|alan(?:[ıi])?\s+bell[iı]|satt[ıi]k|kazanan\s*[:@]|gitti\s*[@]|kapatt[ıi]k|onaylad[ıi]m\s*sat|tebrikler\s*@|['']?da\s+kald[ıi]|da\s+kald[ıi]|kazand[ıi]|ald[ıi]\s+@|@\w+\s+ald[ıi])/i;
+
+/** Honorific after a spoken first name in verbal win phrases. */
+const HONORIFIC =
+  "han[ıi]m(?:c[ıi][gğ]?[ıi]m)?|bey|abla(?:c[ıi][gğ]?[ıi]m)?|abi";
+
+/**
+ * Seller verbal win confirm (ASR) — often no written reply in comments.
+ * Bare «sizin» / mid-sentence «sizde» chatter is NOT a win.
+ */
+/** Word-ish end: ASCII `\b` breaks on Turkish ı/ğ/ü/ş/ö/ç. */
+const TR_END = "(?=\\s|$|[.!?…,;:])";
+const VERBAL_WIN_SIZINDIR_RE = new RegExp(
+  `\\bsizin\\s*dir${TR_END}|\\bsizindir${TR_END}`,
+  "i",
+);
+const VERBAL_WIN_SIZDE_KALDI_RE = new RegExp(
+  `\\bsizde\\s+kald[ıi]${TR_END}|\\bsizde\\s+kal(?:s[ıi]n)?${TR_END}`,
+  "i",
+);
+const VERBAL_WIN_NAME_SIZDE_RE = new RegExp(
+  `\\b([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\\s+(?:${HONORIFIC})\\s+sizde\\b`,
+  "i",
+);
+const VERBAL_WIN_NAME_ONLY_SIZDE_RE =
+  /^([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\s+sizde[.!?…]*$/i;
+const VERBAL_WIN_HAYIRLI_RE = /hay[ıi]rl[ıi]\s+olsun/i;
+const VERBAL_WIN_BRAVO_RE =
+  /\bbravo\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\b/i;
+const VERBAL_WIN_GULE_RE =
+  /g[uü]le\s+g[uü]le\s+(?:kullan|tak[ıi]n?|giy)/i;
+
+/** Soft confirm without a spoken name — only closes a lot that already has an aldım/bid. */
+const VERBAL_WIN_BARE_RE =
+  /^(?:tamam[,.]?\s+)?(?:hay[ıi]rl[ıi]\s+olsun|g[uü]le\s+g[uü]le\s+(?:kullan|tak[ıi]n?|giy))(?:\s+can[ıi]m)?[.!?…]*$/i;
 
 /**
  * Seller accepts a counter-offer.
@@ -185,6 +222,14 @@ export function consumeTrNumberTokens(
       current = (current || 1) * 100;
       matched = true;
       i++;
+      // «üç bin dört yüz üç bin sekiz yüz» — stop before a second amount
+      const nxt = tokens[i];
+      if (
+        nxt &&
+        (nxt in TR_ONES || nxt in TR_TENS || /^\d{1,7}$/.test(nxt))
+      ) {
+        break;
+      }
       continue;
     }
     if (t === "bin") {
@@ -230,7 +275,10 @@ export function parseTurkishWordAmount(text: string): number | undefined {
   if (!candidates.length) return undefined;
   const binScale = candidates.filter((n) => n >= 1000);
   const pool = binScale.length ? binScale : candidates;
-  return Math.max(...pool);
+  // Prefer the first amount when ASR lists a range («3400 … 3800») —
+  // Math.max used to glue ranges into absurd concatenations before the
+  // consumeTrNumberTokens stop; first ask is the safer lot opening.
+  return pool[0];
 }
 
 function clampPriceTry(n: number | undefined): number | undefined {
@@ -307,28 +355,155 @@ const SPOKEN_NAME_STOP = new Set(
     "urunumuz",
     "aldi",
     "kaldi",
+    "canim",
+    "tamam",
+    "diycegim",
+    "diyecegim",
+    "hepsini",
+    "var",
+    "geldim",
+    "sizin",
+    "sizde",
+    "bravo",
+    "hayirli",
+    "olsun",
+    "gule",
+    "kullan",
+    "takın",
+    "takin",
   ].map(foldTrToken),
 );
 
+function acceptSpokenName(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const name = raw.trim();
+  if (name.length < 2) return undefined;
+  if (SPOKEN_NAME_STOP.has(foldTrToken(name))) return undefined;
+  if (/^\d/.test(name)) return undefined;
+  return name;
+}
+
 /**
- * Spoken name from win phrases («Mehmet aldı», «satıldı Ayşe») — UI only.
+ * True when ASR/transcript looks like a seller verbal win confirm
+ * («X hanım sizindir», «Y bey sizde», «hayırlı olsun», …).
+ * Future/hypothetical («hayırlı olsun diyeceğim») is NOT a confirm.
+ */
+export function isVerbalWinPhrase(text: string): boolean {
+  const t = text.trim();
+  if (!t || t.length > 180) return false;
+  if (
+    /diyece[gğ][iı]m|diyece[gğ]iz|var\s+geldim|mi\s*\?|mi\s+kal[ıi]yor|yazarm[ıi][sş][ıi]m/i.test(
+      t,
+    )
+  ) {
+    return false;
+  }
+  if (VERBAL_WIN_SIZINDIR_RE.test(t)) return true;
+  if (VERBAL_WIN_SIZDE_KALDI_RE.test(t)) return true;
+  if (VERBAL_WIN_NAME_SIZDE_RE.test(t)) return true;
+  if (VERBAL_WIN_NAME_ONLY_SIZDE_RE.test(t)) return true;
+  if (VERBAL_WIN_BRAVO_RE.test(t)) return true;
+  if (VERBAL_WIN_HAYIRLI_RE.test(t)) {
+    // Named confirm, or short bare «(Tamam) hayırlı olsun (canım / güle güle…)»
+    if (parseSpokenBuyerName(t)) return true;
+    if (t.length <= 56) return true;
+    return false;
+  }
+  // Güle güle: only short packing-style confirms, not long chatter
+  if (
+    VERBAL_WIN_GULE_RE.test(t) &&
+    t.length <= 40 &&
+    /^(?:tamam[,.]?\s+)?g[uü]le\s+g[uü]le\s+(?:kullan|tak[ıi]n?|giy)(?:\s+can[ıi]m)?[.!?…]*$/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Soft verbal confirm with no recoverable spoken name. */
+export function isBareVerbalWin(text: string): boolean {
+  return VERBAL_WIN_BARE_RE.test(text.trim());
+}
+
+/**
+ * Spoken name from win phrases («Mehmet aldı», «satıldı Ayşe»,
+ * «Ayşe hanım sizindir», «hayırlı olsun Sevda») — UI / username match only.
  */
 export function parseSpokenBuyerName(text: string): string | undefined {
   if (parseBuyerHint(text)) return undefined;
   const patterns = [
+    new RegExp(
+      `\\b([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\\s+(?:${HONORIFIC})\\s+(?:sizindir|sizin\\s*dir|sizde)\\b`,
+      "i",
+    ),
+    new RegExp(
+      `\\b([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\\s+(?:${HONORIFIC})\\s+hay[ıi]rl[ıi]\\s+olsun`,
+      "i",
+    ),
+    /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})['']?[ea]\s+hay[ıi]rl[ıi]\s+olsun/i,
+    /hay[ıi]rl[ıi]\s+olsun\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})/i,
+    /\bbravo\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\b/i,
+    /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\s+de\s+sizin(?:dir|\s+hay)/i,
+    /^([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\s+sizde[.!?…]*$/i,
     /(?:sat[ıi]ld[ıi]|sold(?:\s+to)?)\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})(?=\s|$|,|\d)/i,
     /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\s+ald[ıi](?!\s*m)\b/i,
     /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})['']?da\s+kald[ıi]/i,
   ];
   for (const re of patterns) {
     const m = text.match(re);
-    if (!m?.[1]) continue;
-    const name = m[1].trim();
-    if (SPOKEN_NAME_STOP.has(foldTrToken(name))) continue;
-    if (/^\d/.test(name)) continue;
-    return name;
+    const name = acceptSpokenName(m?.[1]);
+    if (name) return name;
   }
   return undefined;
+}
+
+/**
+ * Match a spoken first name to a single recent commenter username / display name.
+ * Ambiguous or no match → undefined (prefer unknown over inventing).
+ */
+export function matchSpokenNameToBuyer(
+  spoken: string,
+  candidates: Array<{ buyerHint?: string; displayName?: string }>,
+): string | undefined {
+  const name = foldTrToken(spoken.trim());
+  if (name.length < 3) return undefined;
+  const hits: string[] = [];
+  for (const c of candidates) {
+    const user = (c.buyerHint ?? "").trim().replace(/^@/, "").toLowerCase();
+    if (!user) continue;
+    const display = c.displayName ? foldTrToken(c.displayName) : "";
+    let ok = false;
+    if (display) {
+      const displayTokens = display
+        .split(/[^a-z0-9]+/)
+        .filter((t) => t.length >= 3);
+      if (
+        display === name ||
+        displayTokens.some(
+          (t) => t === name || t.startsWith(name) || name.startsWith(t),
+        )
+      ) {
+        ok = true;
+      }
+    }
+    const foldedUser = foldTrToken(user);
+    if (!ok && foldedUser.includes(name)) ok = true;
+    if (!ok) {
+      const tokens = foldedUser
+        .split(/[^a-z0-9]+/)
+        .filter((t) => t.length >= 3);
+      ok = tokens.some(
+        (t) =>
+          t === name ||
+          (name.length >= 4 && (t.startsWith(name) || name.startsWith(t))),
+      );
+    }
+    if (ok) hits.push(user);
+  }
+  const uniq = [...new Set(hits)];
+  return uniq.length === 1 ? uniq[0] : undefined;
 }
 
 /**
@@ -517,6 +692,27 @@ export function parseAuctionText(
       confidence,
       matched: t,
       reason,
+    };
+  }
+
+  // Verbal win confirm (ASR): «X hanım sizindir» / «hayırlı olsun» — no @ required
+  if (source !== "comment" && isVerbalWinPhrase(t)) {
+    const bare = isBareVerbalWin(t) || !spokenBuyerName;
+    const conf = spokenBuyerName
+      ? amountTry != null
+        ? 0.84
+        : 0.8
+      : amountTry != null
+        ? 0.7
+        : 0.62;
+    return {
+      eventType: "sold",
+      amountTry,
+      buyerHint,
+      spokenBuyerName,
+      confidence: conf,
+      matched: t,
+      reason: bare ? "verbal_win_bare" : "verbal_win_named",
     };
   }
 
@@ -713,6 +909,8 @@ export interface BidContext {
   offsetMs: number;
   amountTry?: number;
   buyerHint?: string;
+  /** Optional display / full name from comment metadata for verbal-win matching. */
+  displayName?: string;
   source: "comment" | "transcript";
   reason?: string;
   eventId?: string;
@@ -772,6 +970,7 @@ export type TimelineEvent = {
 export type SaleMethod =
   | "aldim_first_comment"
   | "bid_win_confirm"
+  | "verbal_win_confirm"
   | "counter_accept"
   | "sold_phrase";
 
@@ -787,6 +986,9 @@ export type SaleCandidate = {
   productHint?: string;
   askAmountTry?: number;
 };
+
+/** Same buyer + similar price within this window = one sale (repeated verbal confirms). */
+export const SALE_DEDUP_WINDOW_MS = 180_000;
 
 type LotWindow = {
   openMs: number;
@@ -832,8 +1034,32 @@ function amountsNear(a: number, b: number): boolean {
 }
 
 /**
+ * Collapse repeated confirms: same buyer + similar price within
+ * SALE_DEDUP_WINDOW_MS → keep the first (one sale per lot).
+ */
+export function dedupeSaleCandidates(sales: SaleCandidate[]): SaleCandidate[] {
+  const out: SaleCandidate[] = [];
+  for (const s of sales) {
+    const dup = out.find((o) => {
+      if (!o.buyerUsername || o.buyerUsername !== s.buyerUsername) return false;
+      if (o.amountTry == null || s.amountTry == null) {
+        return Math.abs(o.offsetMs - s.offsetMs) <= SALE_DEDUP_WINDOW_MS;
+      }
+      return (
+        amountsNear(o.amountTry, s.amountTry) &&
+        Math.abs(o.offsetMs - s.offsetMs) <= SALE_DEDUP_WINDOW_MS
+      );
+    });
+    if (dup) continue;
+    out.push(s);
+  }
+  return out;
+}
+
+/**
  * Product-window reconcile: seller ask ≠ sale; first comment aldım wins;
- * bid+confirm; counter+accept. Prefer no sale over inventing.
+ * bid+confirm; verbal win («sizindir»); counter+accept.
+ * Prefer no sale over inventing. Repeated verbal confirms → one sale.
  */
 export function reconcileMezatWindows(
   events: TimelineEvent[],
@@ -869,11 +1095,19 @@ export function reconcileMezatWindows(
     win = null;
   };
 
+  const saneAsk = (n: number | undefined): number | undefined => {
+    if (n == null || !Number.isFinite(n)) return undefined;
+    if (n < OFFER_AMOUNT_SANITY_MIN_TRY || n > OFFER_AMOUNT_SANITY_MAX_TRY) {
+      return undefined;
+    }
+    return n;
+  };
+
   const openLot = (ev: TimelineEvent, ask?: number) => {
     flushAldimIfClaimed(ev.offsetMs);
     win = {
       openMs: ev.offsetMs,
-      askAmount: ask ?? ev.amountTry,
+      askAmount: saneAsk(ask ?? ev.amountTry),
       productHint: ev.productHint ?? ev.matched.slice(0, 120),
       openEventIds: [ev.id],
       bids: [],
@@ -1001,18 +1235,25 @@ export function reconcileMezatWindows(
       // Correlate with open window
       let buyer = ev.buyerHint;
       let amount = ev.amountTry;
+      const isVerbal =
+        reason.includes("verbal_win") || isVerbalWinPhrase(ev.matched);
       let method: SaleMethod = reason.includes("counter_accept")
         ? "counter_accept"
-        : "sold_phrase";
+        : isVerbal
+          ? "verbal_win_confirm"
+          : "sold_phrase";
       const evidence = [ev.id];
+      const openWin = win && !win.closed ? win : null;
 
-      if (win && !win.closed) {
-        evidence.push(...win.openEventIds);
-        if (win.askAmount != null && amount == null) amount = win.askAmount;
+      if (openWin) {
+        evidence.push(...openWin.openEventIds);
+        if (openWin.askAmount != null && amount == null) {
+          amount = openWin.askAmount;
+        }
 
         // Counter-accept: take latest counter bid amount + buyer
         if (method === "counter_accept" || reason.includes("counter_accept")) {
-          const counters = win.bids.filter(
+          const counters = openWin.bids.filter(
             (b) =>
               b.reason === "counter_offer" ||
               (b.amountTry != null && b.buyerHint),
@@ -1026,8 +1267,38 @@ export function reconcileMezatWindows(
           }
         }
 
-        // Win confirm after bids
-        if (!buyer && win.bids.length) {
+        // Verbal win: match spoken name → recent aldım / bid username
+        let verbalNameMiss = false;
+        if (!buyer && isVerbal && ev.spokenBuyerName) {
+          const pool: Array<{ buyerHint?: string; displayName?: string }> = [];
+          if (openWin.aldimClaim) {
+            pool.push({ buyerHint: openWin.aldimClaim.buyer });
+          }
+          for (const b of openWin.bids) {
+            pool.push({
+              buyerHint: b.buyerHint,
+              displayName: b.displayName,
+            });
+          }
+          const matched = matchSpokenNameToBuyer(ev.spokenBuyerName, pool);
+          if (matched) {
+            buyer = matched;
+            method = "verbal_win_confirm";
+            for (const b of openWin.bids) {
+              if (b.eventId && b.buyerHint === buyer) evidence.push(b.eventId);
+            }
+            if (openWin.aldimClaim?.buyer === buyer) {
+              evidence.push(openWin.aldimClaim.eventId);
+            }
+          } else {
+            // Named confirm that doesn't match any commenter → prefer unknown
+            // (do not invent / do not steal a different aldım claimer).
+            verbalNameMiss = true;
+          }
+        }
+
+        // Win confirm after bids (classic satıldı / lookback)
+        if (!buyer && !verbalNameMiss && openWin.bids.length) {
           const enriched = enrichSoldFromBids(
             {
               eventType: "sold",
@@ -1037,33 +1308,38 @@ export function reconcileMezatWindows(
               buyerHint: buyer,
               reason: ev.reason,
             },
-            win.bids,
+            openWin.bids,
             ev.offsetMs,
           );
           buyer = enriched.buyerHint;
-          if (buyer) method = "bid_win_confirm";
-          for (const b of win.bids) {
+          if (buyer) {
+            method = isVerbal ? "verbal_win_confirm" : "bid_win_confirm";
+          }
+          for (const b of openWin.bids) {
             if (b.eventId && b.buyerHint === buyer) evidence.push(b.eventId);
           }
         }
 
-        // Aldım claim + seller later confirms
-        if (!buyer && win.aldimClaim) {
-          buyer = win.aldimClaim.buyer;
-          amount = amount ?? win.askAmount;
-          evidence.push(win.aldimClaim.eventId);
-          method = "aldim_first_comment";
+        // Aldım claim + seller later confirms (incl. bare «hayırlı olsun»)
+        if (!buyer && !verbalNameMiss && openWin.aldimClaim) {
+          buyer = openWin.aldimClaim.buyer;
+          amount = amount ?? openWin.askAmount;
+          evidence.push(openWin.aldimClaim.eventId);
+          method = isVerbal ? "verbal_win_confirm" : "aldim_first_comment";
         }
-
-        win.closed = true;
-        win = null;
       }
 
       // Gate: need buyer comment OR @ on confirmation; price preferred
       const hasBuyer = Boolean(buyer);
       const hasPrice = amount != null;
       // Follower chatter «satıldı» without ask/price is not a sale (prefer unknown).
-      if (!hasPrice && method === "sold_phrase") continue;
+      if (!hasPrice && method === "sold_phrase") {
+        if (openWin && !isVerbal) {
+          openWin.closed = true;
+          win = null;
+        }
+        continue;
+      }
       let confidence = ev.confidence;
       if (hasBuyer && hasPrice) confidence = Math.max(confidence, 0.88);
       else if (hasBuyer) confidence = Math.max(confidence, 0.8);
@@ -1075,29 +1351,45 @@ export function reconcileMezatWindows(
       }
 
       const pseudo = { eventType: "sold" as const, confidence };
-      if (!isSaleWorthy(pseudo)) continue;
-      // Extra precision: never materialize sale without buyer evidence
-      if (!hasBuyer) continue;
+      const worthSale =
+        isSaleWorthy(pseudo) && hasBuyer && (hasPrice || method !== "sold_phrase");
 
-      sales.push({
-        offsetMs: ev.offsetMs,
-        amountTry: amount,
-        buyerUsername: buyer,
-        spokenBuyerName: ev.spokenBuyerName,
-        confidence,
-        reason: `${reason || "sold"}+${method}`,
-        saleMethod: method,
-        evidenceEventIds: [...new Set(evidence)],
-        productHint: ev.productHint ?? ev.matched.slice(0, 120),
-        askAmountTry: amount,
-      });
+      if (worthSale) {
+        if (openWin) {
+          openWin.closed = true;
+          win = null;
+        }
+        sales.push({
+          offsetMs: ev.offsetMs,
+          amountTry: amount,
+          buyerUsername: buyer,
+          spokenBuyerName: ev.spokenBuyerName,
+          confidence,
+          reason: `${reason || "sold"}+${method}`,
+          saleMethod: method,
+          evidenceEventIds: [...new Set(evidence)],
+          productHint: ev.productHint ?? ev.matched.slice(0, 120),
+          askAmountTry: amount,
+        });
+        continue;
+      }
+
+      // Unmatched verbal win: prefer unknown — do NOT close the lot
+      // (keeps pending aldım claim for later flush / next confirm).
+      if (isVerbal) continue;
+
+      // Classic sold without buyer evidence: close lot, skip sale
+      if (openWin) {
+        openWin.closed = true;
+        win = null;
+      }
     }
   }
 
   // End of timeline: complete open aldım claim if any
   flushAldimIfClaimed(Number.MAX_SAFE_INTEGER);
 
-  return sales;
+  return dedupeSaleCandidates(sales);
 }
 
 function isPricedAskEvent(ev: TimelineEvent): boolean {

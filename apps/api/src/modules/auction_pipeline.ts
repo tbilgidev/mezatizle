@@ -269,12 +269,15 @@ export async function reconcileSales(
         : null;
     const buyer = cand.buyerUsername;
     const offsetMs = cand.offsetMs;
+    // Legacy 8s key + ~3 min same-buyer≈price key (repeated verbal confirms).
     const dedupeKey = `${buyer}:${amountCents ?? "_"}:${Math.floor(offsetMs / 8000)}`;
-    if (seenKeys.has(dedupeKey)) {
+    const lotDedupeKey = `${buyer}:${amountCents != null ? Math.round(amountCents / 100 / 500) * 500 : "_"}:${Math.floor(offsetMs / 180_000)}`;
+    if (seenKeys.has(dedupeKey) || seenKeys.has(lotDedupeKey)) {
       skippedDuplicate++;
       continue;
     }
     seenKeys.add(dedupeKey);
+    seenKeys.add(lotDedupeKey);
 
     const gaps: string[] = [];
     if (amountCents == null) gaps.push("amount_unknown");
