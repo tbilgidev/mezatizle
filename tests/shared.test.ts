@@ -585,7 +585,7 @@ describe("mezat window reconcile", () => {
     expect(sales[0]!.saleMethod).toBe("verbal_win_confirm");
   });
 
-  test("unmatched spoken name prefers unknown (no invented buyer)", () => {
+  test("unmatched spoken name → needs_review (no invented @handle)", () => {
     const sales = reconcileMezatWindows([
       ev({
         id: "ask",
@@ -594,16 +594,6 @@ describe("mezat window reconcile", () => {
         matched: "aldım 2000 lira",
         amountTry: 2000,
         reason: "seller_aldim_ask",
-      }),
-      ev({
-        id: "c1",
-        offsetMs: 2000,
-        eventType: "bid",
-        matched: "aldım",
-        buyerHint: "z.g.sahsuvaroglu",
-        reason: "aldim_claim",
-        source: "comment",
-        confidence: 0.6,
       }),
       ev({
         id: "vw",
@@ -615,12 +605,49 @@ describe("mezat window reconcile", () => {
         confidence: 0.8,
       }),
     ]);
-    // Name does not match @z.g… — do not invent from the verbal line;
-    // lot stays open so aldım-first flush still records the comment sale.
+    // No commenter matches «Sevda» — persist needs_review (not silent drop).
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.buyerUsername).toBeUndefined();
+    expect(sales[0]!.spokenBuyerName).toBe("Sevda");
+    expect(sales[0]!.needsReview).toBe(true);
+    expect(sales[0]!.amountTry).toBe(2000);
+    expect(sales[0]!.saleMethod).toBe("verbal_win_confirm");
+  });
+
+  test("named miss then aldım claim prefers the comment sale (not double)", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "aldım 2000 lira",
+        amountTry: 2000,
+        reason: "seller_aldim_ask",
+      }),
+      ev({
+        id: "vw",
+        offsetMs: 5000,
+        eventType: "sold",
+        matched: "İris de sizin hayırlı olsun",
+        spokenBuyerName: "İris",
+        reason: "verbal_win_named",
+        confidence: 0.8,
+      }),
+      ev({
+        id: "c1",
+        offsetMs: 8000,
+        eventType: "bid",
+        matched: "aldım",
+        buyerHint: "z.g.sahsuvaroglu",
+        reason: "aldim_claim",
+        source: "comment",
+        confidence: 0.6,
+      }),
+    ]);
+    // Later aldım claims the lot → one auto sale; named miss dropped (not double).
     expect(sales.length).toBe(1);
     expect(sales[0]!.buyerUsername).toBe("z.g.sahsuvaroglu");
-    expect(sales[0]!.saleMethod).toBe("aldim_first_comment");
-    expect(sales[0]!.spokenBuyerName).toBeUndefined();
+    expect(sales[0]!.needsReview).toBeUndefined();
   });
 
   test("bare hayırlı olsun confirms open aldım claim once", () => {

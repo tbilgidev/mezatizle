@@ -186,6 +186,47 @@ export async function reconcileSales(
   );
   const gate = Number.isFinite(minConf) ? minConf : SALE_MIN_CONFIDENCE;
 
+  // Preserve operator approve/reject across re-reconcile (match by ~offset + buyer/spoken).
+  const priorDecisions = await sql<
+    {
+      status: string;
+      buyer_username: string | null;
+      amount_cents: string | null;
+      attrs: Record<string, unknown> | null;
+    }[]
+  >`
+    SELECT
+      sa.status,
+      sa.buyer_username,
+      sa.amount_cents::text AS amount_cents,
+      p.attributes AS attrs
+    FROM sales sa
+    LEFT JOIN products p ON p.id = sa.product_id
+    WHERE sa.recording_id = ${recordingId}
+      AND sa.status IN ('confirmed', 'rejected')
+  `;
+  const decisionByKey = new Map<string, string>();
+  for (const d of priorDecisions) {
+    const attrs = d.attrs && typeof d.attrs === "object" ? d.attrs : {};
+    const offsetMs =
+      attrs.offsetMs != null && Number.isFinite(Number(attrs.offsetMs))
+        ? Number(attrs.offsetMs)
+        : null;
+    const spoken =
+      typeof attrs.spokenBuyerName === "string"
+        ? attrs.spokenBuyerName.toLowerCase()
+        : "";
+    const buyer = (d.buyer_username ?? "").toLowerCase();
+    const amt =
+      d.amount_cents != null ? Math.round(Number(d.amount_cents) / 100) : "_";
+    if (offsetMs != null) {
+      decisionByKey.set(
+        `${Math.floor(offsetMs / 15_000)}|${buyer}|${spoken}|${amt}`,
+        d.status,
+      );
+    }
+  }
+
   const oldSales = await sql<{ id: string; product_id: string | null }[]>`
     SELECT id, product_id FROM sales WHERE recording_id = ${recordingId}
   `;
@@ -247,31 +288,42 @@ export async function reconcileSales(
   const candidates = reconcileMezatWindows(timeline);
 
   let salesCreated = 0;
+  let needsReviewCreated = 0;
+  let autoConfirmed = 0;
   let skippedLowConfidence = 0;
   let skippedNoBuyer = 0;
   let skippedDuplicate = 0;
   const seenKeys = new Set<string>();
 
   for (const cand of candidates) {
+    const wantsReview = cand.needsReview === true;
+    const hasBuyer = Boolean(cand.buyerUsername);
     const pseudo = { eventType: "sold" as const, confidence: cand.confidence };
-    if (!isSaleWorthy(pseudo) || cand.confidence < gate) {
-      skippedLowConfidence++;
-      continue;
-    }
-    if (!cand.buyerUsername) {
-      skippedNoBuyer++;
-      continue;
+
+    // Confident auto sales still require gate + buyer.
+    // Uncertain candidates (needsReview) persist even without @handle / below gate.
+    if (!wantsReview) {
+      if (!isSaleWorthy(pseudo) || cand.confidence < gate) {
+        skippedLowConfidence++;
+        continue;
+      }
+      if (!hasBuyer) {
+        skippedNoBuyer++;
+        continue;
+      }
     }
 
     const amountCents =
       cand.amountTry != null && cand.amountTry >= 10
         ? Math.round(cand.amountTry * 100)
         : null;
-    const buyer = cand.buyerUsername;
+    const buyer = cand.buyerUsername ?? null;
+    const spoken = (cand.spokenBuyerName ?? "").toLowerCase();
     const offsetMs = cand.offsetMs;
+    const buyerKey = (buyer ?? `spoken:${spoken || "bilinmiyor"}`).toLowerCase();
     // Legacy 8s key + ~3 min same-buyer≈price key (repeated verbal confirms).
-    const dedupeKey = `${buyer}:${amountCents ?? "_"}:${Math.floor(offsetMs / 8000)}`;
-    const lotDedupeKey = `${buyer}:${amountCents != null ? Math.round(amountCents / 100 / 500) * 500 : "_"}:${Math.floor(offsetMs / 180_000)}`;
+    const dedupeKey = `${buyerKey}:${amountCents ?? "_"}:${Math.floor(offsetMs / 8000)}`;
+    const lotDedupeKey = `${buyerKey}:${amountCents != null ? Math.round(amountCents / 100 / 500) * 500 : "_"}:${Math.floor(offsetMs / 180_000)}`;
     if (seenKeys.has(dedupeKey) || seenKeys.has(lotDedupeKey)) {
       skippedDuplicate++;
       continue;
@@ -281,6 +333,8 @@ export async function reconcileSales(
 
     const gaps: string[] = [];
     if (amountCents == null) gaps.push("amount_unknown");
+    if (!hasBuyer) gaps.push("buyer_unknown");
+    if (wantsReview) gaps.push("needs_review");
 
     const productHint =
       cand.productHint && cand.productHint.trim().length > 2
@@ -288,34 +342,56 @@ export async function reconcileSales(
         : `Canlı lot @ ${offsetMs}ms (inceleme)`;
 
     const saleMethod = cand.saleMethod;
-    const explanation = explainSaleTr({
-      confidence: cand.confidence,
-      reason: cand.reason,
-      buyer,
-      amountCents,
-      gaps,
-    });
+    const evidenceQuote =
+      cand.evidenceQuote?.trim().slice(0, 240) ||
+      cand.reason.slice(0, 240);
+    const explanation = [
+      explainSaleTr({
+        confidence: cand.confidence,
+        reason: cand.reason,
+        buyer: buyer ?? undefined,
+        amountCents,
+        gaps,
+      }),
+      evidenceQuote ? `Kanıt: «${evidenceQuote}»` : "",
+      wantsReview
+        ? "Operatör onayı bekleniyor (satış KPI’sına dahil değil)."
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" ");
 
-    const soldAt =
-      Number.isFinite(recordedAt.getTime())
-        ? new Date(recordedAt.getTime() + offsetMs)
-        : new Date();
+    const soldAt = Number.isFinite(recordedAt.getTime())
+      ? new Date(recordedAt.getTime() + offsetMs)
+      : new Date();
+
+    const decisionKey = `${Math.floor(offsetMs / 15_000)}|${(buyer ?? "").toLowerCase()}|${spoken}|${amountCents != null ? Math.round(amountCents / 100) : "_"}`;
+    const preserved = decisionByKey.get(decisionKey);
+    // Auto-confirm confident sales; uncertain stay needs_review until operator acts.
+    let status =
+      preserved === "confirmed" || preserved === "rejected"
+        ? preserved
+        : wantsReview || !hasBuyer
+          ? "needs_review"
+          : "confirmed";
 
     const product = await sql<{ id: string }[]>`
       INSERT INTO products (seller_id, title, description, attributes)
       VALUES (
         ${sellerId},
         ${productHint},
-        ${productHint},
+        ${evidenceQuote || productHint},
         ${sql.json({
           confidence: cand.confidence,
           amountKnown: amountCents != null,
-          buyerKnown: true,
+          buyerKnown: hasBuyer,
           spokenBuyerName: cand.spokenBuyerName ?? null,
           saleMethod,
           offsetMs,
           askAmountTry: cand.askAmountTry ?? null,
           gaps,
+          needsReview: wantsReview || status === "needs_review",
+          evidenceQuote,
         })}
       )
       RETURNING id
@@ -347,7 +423,7 @@ export async function reconcileSales(
         ${amountCents},
         'TRY',
         ${soldAt.toISOString()},
-        'needs_review'
+        ${status}
       )
       RETURNING id
     `;
@@ -359,7 +435,11 @@ export async function reconcileSales(
         'auction_event',
         'auction_events',
         ${cand.evidenceEventIds[0] ?? sale[0]!.id},
-        ${"Mezat penceresi eşlemesi (alıcı kanıtı zorunlu)"},
+        ${
+          status === "needs_review"
+            ? "İnceleme bekleyen mezat adayı"
+            : "Mezat penceresi eşlemesi (otomatik satış)"
+        },
         ${sql.json({
           confidence: cand.confidence,
           gate,
@@ -370,8 +450,11 @@ export async function reconcileSales(
           spokenBuyerName: cand.spokenBuyerName ?? null,
           gaps,
           explanationTr: explanation,
+          evidenceQuote,
           offsetMs,
           evidenceEventIds: cand.evidenceEventIds,
+          needsReview: status === "needs_review",
+          autoConfirmed: status === "confirmed" && !preserved,
         })}
       )
     `;
@@ -389,6 +472,8 @@ export async function reconcileSales(
       `;
     }
     salesCreated++;
+    if (status === "needs_review") needsReviewCreated++;
+    if (status === "confirmed" && !preserved) autoConfirmed++;
   }
 
   await sql`
@@ -397,6 +482,8 @@ export async function reconcileSales(
   `;
   return {
     salesCreated,
+    needsReviewCreated,
+    autoConfirmed,
     skippedLowConfidence,
     skippedNoBuyer,
     skippedDuplicate,

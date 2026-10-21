@@ -1146,6 +1146,13 @@ export type SaleCandidate = {
   evidenceEventIds: string[];
   productHint?: string;
   askAmountTry?: number;
+  /**
+   * Uncertain / ambiguous — persist as status `needs_review` for the operator.
+   * Must not inflate sold KPIs until approved.
+   */
+  needsReview?: boolean;
+  /** Short evidence snippet (ASR/comment quote) for the report list. */
+  evidenceQuote?: string;
 };
 
 /** Same buyer + similar price within this window = one sale (repeated verbal confirms). */
@@ -1160,6 +1167,20 @@ type LotWindow = {
   aldimClaim?: { buyer: string; offsetMs: number; eventId: string };
   bids: BidContext[];
   closed: boolean;
+  /**
+   * Named verbal («İris hayırlı olsun») that did not match a handle.
+   * Emitted as needs_review only if the lot closes without a confident sale
+   * (keeps correction / later aldım flows intact).
+   */
+  namedMissReview?: {
+    offsetMs: number;
+    spokenBuyerName: string;
+    amountTry?: number;
+    evidenceEventIds: string[];
+    evidenceQuote: string;
+    productHint?: string;
+    reason: string;
+  };
 };
 
 /**
@@ -1241,6 +1262,25 @@ export function reconcileMezatWindows(
     eventId: string;
   } | null = null;
 
+  const flushNamedMissIfPending = () => {
+    if (!win?.namedMissReview) return;
+    const m = win.namedMissReview;
+    sales.push({
+      offsetMs: m.offsetMs,
+      amountTry: m.amountTry ?? win.askAmount,
+      spokenBuyerName: m.spokenBuyerName,
+      confidence: 0.58,
+      reason: m.reason,
+      saleMethod: "verbal_win_confirm",
+      evidenceEventIds: [...new Set([...m.evidenceEventIds, ...win.openEventIds])],
+      productHint: m.productHint ?? win.productHint,
+      askAmountTry: m.amountTry ?? win.askAmount,
+      needsReview: true,
+      evidenceQuote: m.evidenceQuote,
+    });
+    win.namedMissReview = undefined;
+  };
+
   const flushAldimIfClaimed = (closeMs: number) => {
     if (!win || win.closed) return;
     // Auto-complete when a follower «aldım» claimed the open ask.
@@ -1261,7 +1301,12 @@ export function reconcileMezatWindows(
         ],
         productHint: win.productHint,
         askAmountTry: win.askAmount,
+        evidenceQuote: `@${win.aldimClaim.buyer} aldım → ${win.askAmount} TRY`,
       });
+      win.namedMissReview = undefined;
+    } else {
+      // No confident sale — surface unmatched named verbal if any.
+      flushNamedMissIfPending();
     }
     win.closed = true;
     void closeMs;
@@ -1325,8 +1370,11 @@ export function reconcileMezatWindows(
         // Correction voiding a bad ask: keep the follower claim for the restated price.
         if (win.aldimClaim && reason === "correction_or_void") {
           carryClaim = { ...win.aldimClaim };
+          // Named miss on a voided ask is stale — drop it with the correction.
+          win.namedMissReview = undefined;
         } else {
           carryClaim = null;
+          flushNamedMissIfPending();
         }
         win.closed = true;
         win = null;
@@ -1488,6 +1536,8 @@ export function reconcileMezatWindows(
           : "sold_phrase";
       const evidence = [ev.id];
       const openWin = win && !win.closed ? win : null;
+      /** Named verbal confirm that did not match any commenter handle. */
+      let verbalNameMiss = false;
 
       if (openWin) {
         evidence.push(...openWin.openEventIds);
@@ -1512,7 +1562,6 @@ export function reconcileMezatWindows(
         }
 
         // Verbal win: match spoken name → recent aldım / bid username
-        let verbalNameMiss = false;
         if (!buyer && isVerbal && ev.spokenBuyerName) {
           const pool: Array<{ buyerHint?: string; displayName?: string }> = [];
           if (openWin.aldimClaim) {
@@ -1614,16 +1663,35 @@ export function reconcileMezatWindows(
           evidenceEventIds: [...new Set(evidence)],
           productHint: ev.productHint ?? ev.matched.slice(0, 120),
           askAmountTry: amount,
+          evidenceQuote: ev.matched.slice(0, 200),
         });
         continue;
       }
 
-      // Unmatched verbal win: prefer unknown — do NOT close the lot
-      // (keeps pending aldım claim for later flush / next confirm).
+      // Named verbal («İris / Sevda hayırlı olsun») with no handle match →
+      // stash on the open lot; emit needs_review only if lot ends without a sale.
+      // Do not steal / close over an unrelated aldım — and do not invent @handle.
+      if (isVerbal && verbalNameMiss && ev.spokenBuyerName && openWin) {
+        openWin.namedMissReview = {
+          offsetMs: ev.offsetMs,
+          spokenBuyerName: ev.spokenBuyerName,
+          amountTry: amount ?? openWin.askAmount,
+          evidenceEventIds: [...new Set(evidence)],
+          evidenceQuote: ev.matched.slice(0, 200),
+          productHint: ev.productHint ?? ev.matched.slice(0, 120),
+          reason: `${reason || "verbal_win"}+named_unmatched_needs_review`,
+        };
+        continue;
+      }
+
+      // Unmatched bare / named verbal with no open lot: ignore
+      // (repeat hayırlı after close must not invent extra needs_review rows).
       if (isVerbal) continue;
 
       // Classic sold without buyer evidence: close lot, skip sale
+      // (do not invent needs_review from «lazım olur» / counter chatter).
       if (openWin) {
+        flushNamedMissIfPending();
         openWin.closed = true;
         win = null;
       }
@@ -1632,6 +1700,38 @@ export function reconcileMezatWindows(
 
   // End of timeline: complete open aldım claim if any
   flushAldimIfClaimed(Number.MAX_SAFE_INTEGER);
+
+  // Late orphan aldım (no ask ever attached) → needs_review only when the
+  // orphan sits after the last priced ask (post-ASR / trailing comments).
+  let lastAskMs = -1;
+  for (const ev of sorted) {
+    if (
+      (ev.eventType === "price_mention" || ev.eventType === "item_intro") &&
+      ev.amountTry != null
+    ) {
+      lastAskMs = Math.max(lastAskMs, ev.offsetMs);
+    }
+  }
+  for (const o of orphanClaims) {
+    if (lastAskMs >= 0 && o.offsetMs <= lastAskMs + 60_000) continue;
+    const already = sales.some(
+      (s) =>
+        s.buyerUsername === o.buyer &&
+        Math.abs(s.offsetMs - o.offsetMs) <= SALE_DEDUP_WINDOW_MS,
+    );
+    if (already) continue;
+    sales.push({
+      offsetMs: o.offsetMs,
+      buyerUsername: o.buyer,
+      confidence: 0.5,
+      reason: "orphan_aldim_no_ask_needs_review",
+      saleMethod: "aldim_first_comment",
+      evidenceEventIds: [o.eventId],
+      productHint: `Yorum aldım @ ${o.offsetMs}ms (ask yok)`,
+      needsReview: true,
+      evidenceQuote: `@${o.buyer} aldım (ask penceresi yok)`,
+    });
+  }
 
   return dedupeSaleCandidates(sales);
 }

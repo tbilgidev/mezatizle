@@ -128,6 +128,198 @@ function SaleThumb({ sale }: { sale: ReportSale }) {
   );
 }
 
+function buyerLabel(s: ReportSale): { text: string; known: boolean } {
+  if (s.buyerUsername) {
+    return { text: `@${s.buyerUsername.replace(/^@/, "")}`, known: true };
+  }
+  if (s.spokenBuyerName) {
+    return { text: s.spokenBuyerName, known: false };
+  }
+  return { text: "bilinmiyor", known: false };
+}
+
+function SaleTable({
+  rows,
+  busyId,
+  reviewedIds,
+  playerSaleId,
+  mode,
+  onOpen,
+  onReview,
+}: {
+  rows: ReportSale[];
+  busyId: string | null;
+  reviewedIds: Set<string>;
+  playerSaleId: string | null;
+  mode: "sold" | "review" | "rejected";
+  onOpen: (s: ReportSale) => void;
+  onReview: (id: string, status: string) => void;
+}) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[720px] border-collapse text-left text-sm">
+        <thead>
+          <tr className="border-b border-line text-xs uppercase tracking-wide text-fog">
+            <th className="pb-2 pr-3 font-semibold">Görsel</th>
+            <th className="pb-2 pr-3 font-semibold">Ürün / kanıt</th>
+            <th className="pb-2 pr-3 font-semibold">Alıcı</th>
+            <th className="pb-2 pr-3 font-semibold">Tutar</th>
+            <th className="pb-2 pr-3 font-semibold">Yöntem</th>
+            <th className="pb-2 pr-3 font-semibold">Zaman</th>
+            <th className="pb-2 pr-3 font-semibold">Güven</th>
+            <th className="pb-2 font-semibold">Kanıt / işlem</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((s) => {
+            const unlocked =
+              mode === "sold" ||
+              reviewedIds.has(s.id) ||
+              playerSaleId === s.id;
+            const productLabel =
+              s.productTitle ?? s.productDescription ?? "Ürün tanımı yok";
+            const buyer = buyerLabel(s);
+            const quote =
+              s.evidenceQuote?.trim() ||
+              (s.explanationTr ? s.explanationTr.slice(0, 160) : null);
+            return (
+              <tr
+                key={s.id}
+                className="border-b border-line/70 align-top transition-colors hover:bg-white/[0.03]"
+              >
+                <td className="py-3 pr-3">
+                  <button
+                    type="button"
+                    className="block rounded-xl focus-visible:outline focus-visible:outline-2 focus-visible:outline-mint"
+                    onClick={() => onOpen(s)}
+                    title="Videoya git"
+                  >
+                    <SaleThumb sale={s} />
+                  </button>
+                </td>
+                <td className="py-3 pr-3">
+                  <button
+                    type="button"
+                    className="max-w-[20rem] text-left"
+                    onClick={() => onOpen(s)}
+                  >
+                    <div className="font-semibold text-paper">
+                      {productLabel}
+                    </div>
+                    {quote ? (
+                      <div className="mt-0.5 line-clamp-3 text-xs italic text-fog">
+                        «{quote}»
+                      </div>
+                    ) : null}
+                    <Badge
+                      variant={saleBadge(s.status)}
+                      className="mt-1.5"
+                    >
+                      {statusTr(s.status)}
+                    </Badge>
+                  </button>
+                </td>
+                <td className="py-3 pr-3 whitespace-nowrap">
+                  {buyer.known ? (
+                    <span className="font-semibold text-mint">{buyer.text}</span>
+                  ) : (
+                    <span className="text-fog" title="Alıcı tahmini">
+                      {buyer.text}
+                    </span>
+                  )}
+                </td>
+                <td className="py-3 pr-3 whitespace-nowrap font-display text-base font-semibold tracking-tight">
+                  {formatTry(s.amountTry)}
+                </td>
+                <td className="py-3 pr-3 whitespace-nowrap text-fog">
+                  {methodTr(s.detectionMethod)}
+                </td>
+                <td className="py-3 pr-3 whitespace-nowrap text-fog">
+                  {s.offsetMs != null
+                    ? formatOffset(s.offsetMs)
+                    : formatDateTr(s.soldAt)}
+                </td>
+                <td className="py-3 pr-3 whitespace-nowrap">
+                  {confidenceLabel(s.confidence)}
+                </td>
+                <td className="py-3">
+                  <div className="flex flex-col gap-1.5">
+                    <button
+                      type="button"
+                      className="inline-flex items-center gap-1 text-sm font-semibold text-mint hover:text-mint-bright disabled:opacity-50"
+                      disabled={busyId === s.id}
+                      onClick={() => onOpen(s)}
+                    >
+                      <Film className="h-3.5 w-3.5" />
+                      Videoya git
+                    </button>
+                    <Link
+                      to={`/evidence/${s.id}`}
+                      className="text-xs font-semibold text-fog hover:text-mint"
+                    >
+                      Kanıt paneli →
+                    </Link>
+                    {mode === "review" ? (
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        <Button
+                          size="sm"
+                          disabled={busyId === s.id || !unlocked}
+                          title={
+                            !unlocked
+                              ? "Önce videoyu inceleyin"
+                              : undefined
+                          }
+                          onClick={() => onReview(s.id, "confirmed")}
+                        >
+                          Satış olarak onayla
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="danger"
+                          disabled={busyId === s.id || !unlocked}
+                          title={
+                            !unlocked
+                              ? "Önce videoyu inceleyin"
+                              : undefined
+                          }
+                          onClick={() => onReview(s.id, "rejected")}
+                        >
+                          Satış değil
+                        </Button>
+                      </div>
+                    ) : mode === "sold" ? (
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        <Button
+                          size="sm"
+                          variant="danger"
+                          disabled={busyId === s.id}
+                          onClick={() => onReview(s.id, "rejected")}
+                        >
+                          Satış değil
+                        </Button>
+                      </div>
+                    ) : (
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        <Button
+                          size="sm"
+                          disabled={busyId === s.id}
+                          onClick={() => onReview(s.id, "confirmed")}
+                        >
+                          Satış olarak onayla
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export function ReportDetailPage() {
   const { recordingId = "" } = useParams();
   const [report, setReport] = useState<ReportDetail | null>(null);
@@ -193,6 +385,21 @@ export function ReportDetailPage() {
   const sales = useMemo(
     () => (Array.isArray(report?.sales) ? report!.sales : []),
     [report],
+  );
+  const soldSales = useMemo(
+    () =>
+      sales.filter(
+        (s) => s.status === "confirmed" || s.status === "candidate",
+      ),
+    [sales],
+  );
+  const reviewSales = useMemo(
+    () => sales.filter((s) => s.status === "needs_review"),
+    [sales],
+  );
+  const rejectedSales = useMemo(
+    () => sales.filter((s) => s.status === "rejected"),
+    [sales],
   );
 
   const analysisRow = useMemo(() => {
@@ -303,7 +510,11 @@ export function ReportDetailPage() {
             label: "Süre",
             value: formatDuration(report.durationSeconds),
           },
-          { key: "sold", label: "Satılan", value: String(report.saleCount) },
+          {
+            key: "sold",
+            label: "Satılan",
+            value: String(report.confirmedCount ?? report.saleCount),
+          },
           {
             key: "totalSold",
             label: "Toplam satış",
@@ -398,164 +609,97 @@ export function ReportDetailPage() {
         <CardHeader>
           <CardTitle>Satış listesi</CardTitle>
           <p className="text-sm text-fog">
-            Ne satıldı, kaça satıldı, kim aldı — satıra tıklayınca video kanıtına
-            gidilir. Onay / red için önce görüntüyü inceleyin.
+            Otomatik onaylanan satışlar — satıra tıklayınca video kanıtına
+            gidilir. İnceleme bekleyenler aşağıdaki ayrı bölümde.
           </p>
         </CardHeader>
         <CardContent>
-          {!sales.length ? (
+          {!soldSales.length ? (
             <EmptyState
-              title="Satış adayı yok"
-              hint={emptySalesHint(report, analysisFailed)}
+              title={
+                reviewSales.length
+                  ? "Onaylı satış yok"
+                  : "Satış adayı yok"
+              }
+              hint={
+                reviewSales.length
+                  ? `${reviewSales.length} aday inceleme bekliyor — onaylanınca burada ve KPI’da görünür.`
+                  : emptySalesHint(report, analysisFailed)
+              }
             />
           ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[720px] border-collapse text-left text-sm">
-                <thead>
-                  <tr className="border-b border-line text-xs uppercase tracking-wide text-fog">
-                    <th className="pb-2 pr-3 font-semibold">Görsel</th>
-                    <th className="pb-2 pr-3 font-semibold">Ürün</th>
-                    <th className="pb-2 pr-3 font-semibold">Alıcı</th>
-                    <th className="pb-2 pr-3 font-semibold">Tutar</th>
-                    <th className="pb-2 pr-3 font-semibold">Yöntem</th>
-                    <th className="pb-2 pr-3 font-semibold">Zaman</th>
-                    <th className="pb-2 pr-3 font-semibold">Güven</th>
-                    <th className="pb-2 font-semibold">Kanıt / işlem</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sales.map((s) => {
-                    const unlocked =
-                      reviewedIds.has(s.id) || player?.saleId === s.id;
-                    const productLabel =
-                      s.productTitle ??
-                      s.productDescription ??
-                      "Ürün tanımı yok";
-                    return (
-                      <tr
-                        key={s.id}
-                        className="border-b border-line/70 align-top transition-colors hover:bg-white/[0.03]"
-                      >
-                        <td className="py-3 pr-3">
-                          <button
-                            type="button"
-                            className="block rounded-xl focus-visible:outline focus-visible:outline-2 focus-visible:outline-mint"
-                            onClick={() => void openEvidencePlayer(s)}
-                            title="Görüntüyü incele"
-                          >
-                            <SaleThumb sale={s} />
-                          </button>
-                        </td>
-                        <td className="py-3 pr-3">
-                          <button
-                            type="button"
-                            className="max-w-[18rem] text-left"
-                            onClick={() => void openEvidencePlayer(s)}
-                          >
-                            <div className="font-semibold text-paper">
-                              {productLabel}
-                            </div>
-                            {s.explanationTr ? (
-                              <div className="mt-0.5 line-clamp-2 text-xs text-fog">
-                                {s.explanationTr}
-                              </div>
-                            ) : s.productDescription &&
-                              s.productTitle &&
-                              s.productDescription !== s.productTitle ? (
-                              <div className="mt-0.5 line-clamp-2 text-xs text-fog">
-                                {s.productDescription}
-                              </div>
-                            ) : null}
-                            <Badge
-                              variant={saleBadge(s.status)}
-                              className="mt-1.5"
-                            >
-                              {statusTr(s.status)}
-                            </Badge>
-                          </button>
-                        </td>
-                        <td className="py-3 pr-3 whitespace-nowrap">
-                          {s.buyerUsername ? (
-                            <span className="font-semibold text-mint">
-                              @{s.buyerUsername.replace(/^@/, "")}
-                            </span>
-                          ) : s.spokenBuyerName ? (
-                            <span className="text-fog" title="Konuşulan isim">
-                              {s.spokenBuyerName}
-                            </span>
-                          ) : (
-                            <span className="text-fog">Bilinmiyor</span>
-                          )}
-                        </td>
-                        <td className="py-3 pr-3 whitespace-nowrap font-display text-base font-semibold tracking-tight">
-                          {formatTry(s.amountTry)}
-                        </td>
-                        <td className="py-3 pr-3 whitespace-nowrap text-fog">
-                          {methodTr(s.detectionMethod)}
-                        </td>
-                        <td className="py-3 pr-3 whitespace-nowrap text-fog">
-                          {s.offsetMs != null
-                            ? formatOffset(s.offsetMs)
-                            : formatDateTr(s.soldAt)}
-                        </td>
-                        <td className="py-3 pr-3 whitespace-nowrap">
-                          {confidenceLabel(s.confidence)}
-                        </td>
-                        <td className="py-3">
-                          <div className="flex flex-col gap-1.5">
-                            <button
-                              type="button"
-                              className="inline-flex items-center gap-1 text-sm font-semibold text-mint hover:text-mint-bright disabled:opacity-50"
-                              disabled={busyId === s.id}
-                              onClick={() => void openEvidencePlayer(s)}
-                            >
-                              <Film className="h-3.5 w-3.5" />
-                              Görüntüyü incele
-                            </button>
-                            <Link
-                              to={`/evidence/${s.id}`}
-                              className="text-xs font-semibold text-fog hover:text-mint"
-                            >
-                              Kanıt paneli →
-                            </Link>
-                            <div className="mt-1 flex flex-wrap gap-1.5">
-                              <Button
-                                size="sm"
-                                disabled={busyId === s.id || !unlocked}
-                                title={
-                                  !unlocked
-                                    ? "Önce görüntüyü inceleyin"
-                                    : undefined
-                                }
-                                onClick={() => void review(s.id, "confirmed")}
-                              >
-                                Onayla
-                              </Button>
-                              <Button
-                                size="sm"
-                                variant="danger"
-                                disabled={busyId === s.id || !unlocked}
-                                title={
-                                  !unlocked
-                                    ? "Önce görüntüyü inceleyin"
-                                    : undefined
-                                }
-                                onClick={() => void review(s.id, "rejected")}
-                              >
-                                Reddet
-                              </Button>
-                            </div>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+            <SaleTable
+              rows={soldSales}
+              busyId={busyId}
+              reviewedIds={reviewedIds}
+              playerSaleId={player?.saleId ?? null}
+              mode="sold"
+              onOpen={(s) => void openEvidencePlayer(s)}
+              onReview={(id, st) => void review(id, st)}
+            />
           )}
         </CardContent>
       </Card>
+
+      <Card className="mb-4" data-section="needs-review">
+        <CardHeader>
+          <CardTitle>
+            İnceleme bekleyenler
+            {reviewSales.length ? (
+              <span className="ml-2 text-base font-semibold text-signal">
+                ({reviewSales.length})
+              </span>
+            ) : null}
+          </CardTitle>
+          <p className="text-sm text-fog">
+            Belirsiz adaylar (isimsiz sözlü onay, eşleşmeyen alıcı, ask’siz
+            aldım…). Satış KPI’sına dahil değil — her satırı{" "}
+            <strong className="font-semibold text-paper">Satış olarak onayla</strong>{" "}
+            veya <strong className="font-semibold text-paper">Satış değil</strong>{" "}
+            ile işaretleyin.
+          </p>
+        </CardHeader>
+        <CardContent>
+          {!reviewSales.length ? (
+            <EmptyState
+              title="İnceleme bekleyen yok"
+              hint="Belirsiz aday çıkarsa burada listelenir."
+            />
+          ) : (
+            <SaleTable
+              rows={reviewSales}
+              busyId={busyId}
+              reviewedIds={reviewedIds}
+              playerSaleId={player?.saleId ?? null}
+              mode="review"
+              onOpen={(s) => void openEvidencePlayer(s)}
+              onReview={(id, st) => void review(id, st)}
+            />
+          )}
+        </CardContent>
+      </Card>
+
+      {rejectedSales.length > 0 ? (
+        <Card className="mb-4">
+          <CardHeader>
+            <CardTitle>Satış değil ({rejectedSales.length})</CardTitle>
+            <p className="text-sm text-fog">
+              Operatörün reddettiği adaylar — KPI’ya dahil değil.
+            </p>
+          </CardHeader>
+          <CardContent>
+            <SaleTable
+              rows={rejectedSales}
+              busyId={busyId}
+              reviewedIds={reviewedIds}
+              playerSaleId={player?.saleId ?? null}
+              mode="rejected"
+              onOpen={(s) => void openEvidencePlayer(s)}
+              onReview={(id, st) => void review(id, st)}
+            />
+          </CardContent>
+        </Card>
+      ) : null}
 
       <Card>
         <CardHeader>

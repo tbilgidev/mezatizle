@@ -112,12 +112,18 @@ const timeline: TimelineEvent[] = rows.map((r, i) => {
 });
 const offer = summarizeOfferWindows(timeline);
 const afterSales = await sql<
-  { buyer_username: string | null; amount_cents: string | null }[]
+  {
+    buyer_username: string | null;
+    amount_cents: string | null;
+    status: string;
+  }[]
 >`
-  SELECT buyer_username, amount_cents::text AS amount_cents
+  SELECT buyer_username, amount_cents::text AS amount_cents, status
   FROM sales WHERE recording_id = ${RECORDING_ID}
   ORDER BY sold_at ASC NULLS LAST, created_at ASC
 `;
+const confirmedSales = afterSales.filter((s) => s.status === "confirmed");
+const reviewSales = afterSales.filter((s) => s.status === "needs_review");
 const verbalSold = rows.filter((r) => {
   const p = r.payload ?? {};
   return (
@@ -137,11 +143,12 @@ console.log("--- after ---");
 console.log({
   productsOffered: offer.productsOffered,
   totalAskTry: offer.offeredSumTry,
-  productsSold: afterSales.length,
-  totalSoldTry: afterSales.reduce(
+  productsSold: confirmedSales.length,
+  totalSoldTry: confirmedSales.reduce(
     (a, s) => a + (s.amount_cents != null ? Number(s.amount_cents) / 100 : 0),
     0,
   ),
+  needsReview: reviewSales.length,
   transcriptSegments: Number(segs?.n ?? 0),
   comments: Number(comments?.n ?? 0),
   verbalWinSoldEvents: verbalSold.length,
@@ -154,6 +161,7 @@ console.log({
   sales: afterSales.map((s) => ({
     buyer: s.buyer_username,
     try: s.amount_cents != null ? Number(s.amount_cents) / 100 : null,
+    status: s.status,
   })),
 });
 

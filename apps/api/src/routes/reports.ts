@@ -39,11 +39,14 @@ export type ReportListItem = {
   productsOfferedSumTry: number;
   /** Alias for UI workers. */
   totalAskTry: number;
-  /** Satılan ürün sayısı (= saleCount with amount; alias for UI). */
+  /**
+   * Satılan ürün sayısı — yalnızca `confirmed` (otomatik + operatör onaylı).
+   * `needs_review` KPI’ya dahil değil.
+   */
   productsSoldCount: number;
   /** Alias for UI workers. */
   productsSold: number;
-  /** Toplam satış tutarı (= sumAmountTry). */
+  /** Toplam satış tutarı — yalnızca confirmed (= sumAmountTry). */
   productsSoldSumTry: number;
   /** Alias for UI workers. */
   totalSoldTry: number;
@@ -80,6 +83,8 @@ export type ReportSaleRow = {
   status: string;
   evidenceIds: string[];
   explanationTr: string | null;
+  /** ASR/yorum kanıt alıntısı (inceleme listesi). */
+  evidenceQuote: string | null;
 };
 
 export type ReportDetail = ReportListItem & {
@@ -182,6 +187,7 @@ async function loadSalesByMethod(
     FROM sales sa
     LEFT JOIN products p ON p.id = sa.product_id
     WHERE sa.recording_id = ${recordingId}
+      AND sa.status = 'confirmed'
     GROUP BY 1
   `;
   const out = {
@@ -217,8 +223,13 @@ function rowToListItem(
     salesByMethod: ReportListItem["salesByMethod"];
   },
 ): ReportListItem {
-  const saleCount = Number(r.sale_count ?? 0);
-  const sumCents = r.sum_amount_cents != null ? Number(r.sum_amount_cents) : null;
+  const confirmedCount = Number(r.confirmed_count ?? 0);
+  const needsReviewCount = Number(r.needs_review_count ?? 0);
+  const rejectedCount = Number(r.rejected_count ?? 0);
+  // saleCount kept as "all non-rejected rows" for list badges; sold KPI = confirmed only.
+  const saleCount = confirmedCount + needsReviewCount;
+  const sumCents =
+    r.sum_amount_cents != null ? Number(r.sum_amount_cents) : null;
   const avgConf =
     r.avg_event_confidence != null &&
     Number.isFinite(Number(r.avg_event_confidence))
@@ -244,9 +255,9 @@ function rowToListItem(
         ? Number(r.duration_seconds)
         : null,
     saleCount,
-    needsReviewCount: Number(r.needs_review_count ?? 0),
-    confirmedCount: Number(r.confirmed_count ?? 0),
-    rejectedCount: Number(r.rejected_count ?? 0),
+    needsReviewCount,
+    confirmedCount,
+    rejectedCount,
     sumAmountTry: soldSum,
     currency: "TRY",
     sourceType: r.source_type != null ? String(r.source_type) : null,
@@ -256,11 +267,11 @@ function rowToListItem(
     productsOffered: offered,
     productsOfferedSumTry: offeredSum,
     totalAskTry: offeredSum,
-    productsSoldCount: saleCount,
-    productsSold: saleCount,
+    productsSoldCount: confirmedCount,
+    productsSold: confirmedCount,
     productsSoldSumTry: soldSum,
     totalSoldTry: soldSum,
-    productsUnsoldCount: Math.max(0, offered - saleCount),
+    productsUnsoldCount: Math.max(0, offered - confirmedCount),
     salesByMethod: kpis?.salesByMethod ?? {
       aldimFirstComment: 0,
       bidWinConfirm: 0,
@@ -314,12 +325,14 @@ export function reportsRoutes(sql: Sql) {
         r.source_type,
         s.instagram_username,
         s.display_name,
-        COUNT(sa.id)::int AS sale_count,
+        COUNT(sa.id) FILTER (
+          WHERE sa.status IN ('confirmed', 'needs_review', 'candidate')
+        )::int AS sale_count,
         COUNT(sa.id) FILTER (WHERE sa.status = 'needs_review')::int AS needs_review_count,
         COUNT(sa.id) FILTER (WHERE sa.status = 'confirmed')::int AS confirmed_count,
         COUNT(sa.id) FILTER (WHERE sa.status = 'rejected')::int AS rejected_count,
         SUM(sa.amount_cents) FILTER (
-          WHERE sa.amount_cents IS NOT NULL AND sa.status <> 'rejected'
+          WHERE sa.amount_cents IS NOT NULL AND sa.status = 'confirmed'
         ) AS sum_amount_cents,
         (
           SELECT AVG(ae.confidence)
@@ -420,12 +433,14 @@ export function reportsRoutes(sql: Sql) {
         r.source_type,
         s.instagram_username,
         s.display_name,
-        COUNT(sa.id)::int AS sale_count,
+        COUNT(sa.id) FILTER (
+          WHERE sa.status IN ('confirmed', 'needs_review', 'candidate')
+        )::int AS sale_count,
         COUNT(sa.id) FILTER (WHERE sa.status = 'needs_review')::int AS needs_review_count,
         COUNT(sa.id) FILTER (WHERE sa.status = 'confirmed')::int AS confirmed_count,
         COUNT(sa.id) FILTER (WHERE sa.status = 'rejected')::int AS rejected_count,
         SUM(sa.amount_cents) FILTER (
-          WHERE sa.amount_cents IS NOT NULL AND sa.status <> 'rejected'
+          WHERE sa.amount_cents IS NOT NULL AND sa.status = 'confirmed'
         ) AS sum_amount_cents,
         (
           SELECT AVG(ae.confidence)
@@ -530,6 +545,11 @@ export function reportsRoutes(sql: Sql) {
         typeof evPayload.explanationTr === "string"
           ? evPayload.explanationTr
           : null;
+      const evidenceQuote =
+        attrString(attrs, "evidenceQuote") ??
+        (typeof evPayload.evidenceQuote === "string"
+          ? evPayload.evidenceQuote
+          : null);
 
       return {
         id: String(s.id),
@@ -562,6 +582,7 @@ export function reportsRoutes(sql: Sql) {
         status: String(s.status),
         evidenceIds: evList.map((e) => e.id),
         explanationTr,
+        evidenceQuote,
       };
     });
 

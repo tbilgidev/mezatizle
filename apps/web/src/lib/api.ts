@@ -136,6 +136,8 @@ export type ReportSale = {
   /** Timeline offset in muxed recording (ms) for video seek. */
   offsetMs: number | null;
   explanationTr: string | null;
+  /** Short ASR/comment quote for needs_review list. */
+  evidenceQuote?: string | null;
 };
 
 export type ReportDetail = ReportListItem & {
