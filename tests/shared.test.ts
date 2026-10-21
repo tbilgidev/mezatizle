@@ -350,6 +350,41 @@ describe("mezat window reconcile", () => {
     expect(sales[0]!.saleMethod).toBe("aldim_first_comment");
   });
 
+  test("late follower aldım (minutes after ask) still claims open lot", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "aldım 4500 lira",
+        amountTry: 4500,
+        reason: "seller_aldim_ask",
+      }),
+      ev({
+        id: "c1",
+        offsetMs: 5 * 60_000,
+        eventType: "bid",
+        matched: "Aldim",
+        buyerHint: "z.g.sahsuvaroglu",
+        reason: "aldim_claim",
+        source: "comment",
+        confidence: 0.6,
+      }),
+      ev({
+        id: "next",
+        offsetMs: 6 * 60_000,
+        eventType: "price_mention",
+        matched: "sıradaki 3000",
+        amountTry: 3000,
+        reason: "seller_aldim_ask",
+      }),
+    ]);
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.buyerUsername).toBe("z.g.sahsuvaroglu");
+    expect(sales[0]!.amountTry).toBe(4500);
+    expect(sales[0]!.saleMethod).toBe("aldim_first_comment");
+  });
+
   test("bid then seller confirm correlates OCR buyer", () => {
     const sales = reconcileMezatWindows([
       ev({

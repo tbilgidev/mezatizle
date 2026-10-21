@@ -226,7 +226,14 @@ export async function reconcileSales(
         p.amountTry != null && Number.isFinite(Number(p.amountTry))
           ? Number(p.amountTry)
           : undefined,
-      buyerHint: typeof p.buyerHint === "string" ? p.buyerHint : undefined,
+      buyerHint:
+        typeof p.buyerHint === "string"
+          ? p.buyerHint
+          : typeof p.author === "string" &&
+              p.source === "comment" &&
+              /^[A-Za-z0-9._]{1,30}$/.test(p.author)
+            ? p.author.toLowerCase()
+            : undefined,
       spokenBuyerName:
         typeof p.spokenBuyerName === "string" ? p.spokenBuyerName : undefined,
       reason: typeof p.reason === "string" ? p.reason : undefined,

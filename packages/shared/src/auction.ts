@@ -44,8 +44,13 @@ export const SALE_MIN_CONFIDENCE = 0.78;
 /** Window (ms) to look for nearby OCR bids when attaching a buyer to a sold event. */
 export const SALE_BID_LOOKBACK_MS = 45_000;
 
-/** Max ms after ask for first comment «aldım» to claim the lot. */
-export const ALDIM_CLAIM_WINDOW_MS = 90_000;
+/**
+ * Max ms after ask for first comment «aldım» to claim the lot.
+ * Real mezats often claim minutes after the ask (chat lag / camera pan).
+ * 90s was too tight (afra: 19 live_api aldım → 1 sale). Lot close (next ask /
+ * pass / sold) remains the primary gate; this is a safety cap only.
+ */
+export const ALDIM_CLAIM_WINDOW_MS = 20 * 60_000;
 
 const CORRECTION_RE =
   /(düzeltme|duzeltme|yanl[ıi][sş]|iptal(?:\s+edildi)?|geri\s*al|özür|ozur|hata\s*oldu|yanl[ıi][sş]\s*söyled|vazgeç|vazge[cç]|işlem\s*yok|islem\s*yok)/i;
@@ -839,13 +844,11 @@ export function reconcileMezatWindows(
 
   const flushAldimIfClaimed = (closeMs: number) => {
     if (!win || win.closed) return;
-    // Only auto-complete aldım lots when we have a real OCR buyer claim
-    // and no auction bidding superseded it.
-    if (
-      win.aldimClaim &&
-      win.askAmount != null &&
-      win.bids.filter((b) => b.amountTry != null).length === 0
-    ) {
+    // Auto-complete when a follower «aldım» claimed the open ask.
+    // Number crumbs in chat must not block aldım-first mezats (afra); only an
+    // explicit counter-offer means the lot left fixed-ask mode.
+    const hasCounter = win.bids.some((b) => b.reason === "counter_offer");
+    if (win.aldimClaim && win.askAmount != null && !hasCounter) {
       sales.push({
         offsetMs: win.aldimClaim.offsetMs,
         amountTry: win.askAmount,
@@ -1059,6 +1062,8 @@ export function reconcileMezatWindows(
       // Gate: need buyer comment OR @ on confirmation; price preferred
       const hasBuyer = Boolean(buyer);
       const hasPrice = amount != null;
+      // Follower chatter «satıldı» without ask/price is not a sale (prefer unknown).
+      if (!hasPrice && method === "sold_phrase") continue;
       let confidence = ev.confidence;
       if (hasBuyer && hasPrice) confidence = Math.max(confidence, 0.88);
       else if (hasBuyer) confidence = Math.max(confidence, 0.8);
