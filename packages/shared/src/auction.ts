@@ -55,6 +55,12 @@ export const SALE_BID_LOOKBACK_MS = 45_000;
  */
 export const ALDIM_CLAIM_WINDOW_MS = 20 * 60_000;
 
+/** Comment «aldım» may land a few seconds before the spoken ask is segmented. */
+export const ALDIM_PRE_ASK_MS = 20_000;
+
+/** After a correction/void pass, re-attach the discarded aldım to the restated ask. */
+export const ALDIM_CARRY_AFTER_CORRECTION_MS = 90_000;
+
 const CORRECTION_RE =
   /(düzeltme|duzeltme|yanl[ıi][sş]|iptal(?:\s+edildi)?|geri\s*al|özür|ozur|hata\s*oldu|yanl[ıi][sş]\s*söyled|vazgeç|vazge[cç]|işlem\s*yok|islem\s*yok)/i;
 
@@ -95,9 +101,28 @@ const VERBAL_WIN_BRAVO_RE =
 const VERBAL_WIN_GULE_RE =
   /g[uü]le\s+g[uü]le\s+(?:kullan|tak[ıi]n?|giy)/i;
 
+/**
+ * Seller announces a named follower aldım arrived
+ * («Şehnaz hanımdan bir aldım geldi», «Şeyhna … aldım geldi»).
+ */
+/** Leading edge: JS `\\b` breaks on Turkish capitals (Ş/İ are non-\\w). */
+const TR_NAME_LEAD = "(?:^|[^A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû])";
+const TR_NAME = "([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})";
+const VERBAL_WIN_ALDIM_GELDI_RE = new RegExp(
+  `${TR_NAME_LEAD}${TR_NAME}(?:\\s+(?:${HONORIFIC}))?(?:\\s+\\S+){0,5}?\\s+(?:bir\\s+)?ald[ıi]m\\s+geldi`,
+  "i",
+);
+
 /** Soft confirm without a spoken name — only closes a lot that already has an aldım/bid. */
 const VERBAL_WIN_BARE_RE =
-  /^(?:tamam[,.]?\s+)?(?:hay[ıi]rl[ıi]\s+olsun|g[uü]le\s+g[uü]le\s+(?:kullan|tak[ıi]n?|giy))(?:\s+can[ıi]m)?[.!?…]*$/i;
+  /^(?:tamam[,.]?\s+)?(?:hay[ıi]rl[ıi]\s+olsun(?:\s+can[ıi]m)?|g[uü]le\s+g[uü]le\s+(?:kullan|tak[ıi]n?|giy)(?:\s+\S+){0,3})[.!?…]*$/i;
+
+/** Foreign currency chatter must not open a TRY lot. */
+const FOREIGN_CURRENCY_RE =
+  /\b(?:pound|sterlin|euro|eur|dolar|dollar|usd|gbp)\w*/i;
+
+/** Market-range chatter («18-20 bin liradan başlıyor») — not this lot's ask. */
+const PRICE_RANGE_BIN_RE = /\d{1,3}\s*[-–—]\s*\d{1,3}\s*bin/i;
 
 /**
  * Seller accepts a counter-offer.
@@ -146,8 +171,9 @@ export function isAuctionNoise(text: string): boolean {
   return false;
 }
 
+/** Word-ish TL/TRY — never match «tl» inside «mutlaka» / «atlas». */
 const CURRENCY_RE =
-  /(?:tl|₺|try|türk\s*liras[ıi]|turk\s*liras[ıi]|liras[ıi]?)/i;
+  /(?:₺|(?:^|[^A-Za-zÇĞİÖŞÜçğıöşü])(?:tl|try)(?=[^A-Za-zÇĞİÖŞÜçğıöşü]|$)|türk\s*liras[ıi]|turk\s*liras[ıi]|\blira(?:s[ıi])?\b)/i;
 
 export function hasCurrencyMarker(text: string): boolean {
   return CURRENCY_RE.test(text);
@@ -201,7 +227,19 @@ export function consumeTrNumberTokens(
   while (i < tokens.length) {
     const t = tokens[i]!;
     if (/^\d{1,7}$/.test(t)) {
-      current += Number(t);
+      const n = Number(t);
+      // «3 500» from stripping the thousand-dot in «3.500» → 3500
+      if (
+        matched &&
+        current >= 1 &&
+        current <= 9 &&
+        n >= 100 &&
+        n <= 999
+      ) {
+        current = current * 1000 + n;
+      } else {
+        current += n;
+      }
       matched = true;
       i++;
       continue;
@@ -291,12 +329,27 @@ function clampPriceTry(n: number | undefined): number | undefined {
 /** Parse TRY amount: 700 TL, 1.500, on bin, 8 bin lira, üç bin beş yüz. */
 export function parsePriceTry(text: string): number | undefined {
   const t = text.trim();
+  // Market-range chatter is not a single ask amount.
+  if (PRICE_RANGE_BIN_RE.test(t)) return undefined;
+  if (FOREIGN_CURRENCY_RE.test(t)) return undefined;
+
   const withCur = t.match(
-    /(\d{1,3}(?:[.,]\d{3})+|\d{2,7})\s*(?:tl|₺|try|türk\s*liras[ıi]|turk\s*liras[ıi]|liras[ıi]?)/i,
+    /(\d{1,3}(?:[.,]\d{3})+|\d{2,7})\s*(?:tl|₺|try|türk\s*liras[ıi]|turk\s*liras[ıi]|lira(?:s[ıi])?)\b/i,
   );
   if (withCur?.[1]) {
     const raw = withCur[1].replace(/\./g, "").replace(/,/g, "");
     return clampPriceTry(Number(raw));
+  }
+
+  // Explicit Turkish thousand-dots near fiyat/lira («3.500 lira», «fiyatımız 3.500»)
+  const dotted = t.match(
+    /(\d{1,3}(?:\.\d{3})+)(?!,|\d)/,
+  );
+  if (
+    dotted?.[1] &&
+    (hasCurrencyMarker(t) || /\bfiyat/i.test(t) || /\blira\b/i.test(t))
+  ) {
+    return clampPriceTry(Number(dotted[1].replace(/\./g, "")));
   }
 
   const digitBin = foldTrToken(t).match(
@@ -317,6 +370,20 @@ export function parsePriceTry(text: string): number | undefined {
   const raw = (bare?.[1] ?? "").replace(/\./g, "").replace(/,/g, "");
   if (!raw) return undefined;
   return clampPriceTry(Number(raw));
+}
+
+/**
+ * True when a follower comment «aldım» is a real take-it claim (not a question /
+ * hypothetical). Prefer under-count: ambiguous questions never claim a lot.
+ */
+export function isFollowerAldimClaimText(text: string): boolean {
+  const t = text.trim();
+  if (!t || !/ald[ıi]m/i.test(t)) return false;
+  if (/\?/.test(t)) return false;
+  if (/\bacaba\b/i.test(t)) return false;
+  if (/\b(?:mi|mı|mü|mu)\s+ald[ıi]m\b/i.test(t)) return false;
+  if (/\bald[ıi]m\s+(?:mi|mı|mü|mu)\b/i.test(t)) return false;
+  return true;
 }
 
 export function parseBuyerHint(text: string): string | undefined {
@@ -371,13 +438,26 @@ const SPOKEN_NAME_STOP = new Set(
     "kullan",
     "takın",
     "takin",
+    "mi",
+    "mı",
+    "mu",
+    "mü",
+    "su",
+    "şu",
+    "o",
+    "ama",
+    "ile",
+    "icin",
+    "satildi",
+    "satın",
+    "satin",
   ].map(foldTrToken),
 );
 
 function acceptSpokenName(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
   const name = raw.trim();
-  if (name.length < 2) return undefined;
+  if (name.length < 3) return undefined;
   if (SPOKEN_NAME_STOP.has(foldTrToken(name))) return undefined;
   if (/^\d/.test(name)) return undefined;
   return name;
@@ -403,19 +483,21 @@ export function isVerbalWinPhrase(text: string): boolean {
   if (VERBAL_WIN_NAME_SIZDE_RE.test(t)) return true;
   if (VERBAL_WIN_NAME_ONLY_SIZDE_RE.test(t)) return true;
   if (VERBAL_WIN_BRAVO_RE.test(t)) return true;
+  if (VERBAL_WIN_ALDIM_GELDI_RE.test(t)) return true;
   if (VERBAL_WIN_HAYIRLI_RE.test(t)) {
     // Named confirm, or short bare «(Tamam) hayırlı olsun (canım / güle güle…)»
     if (parseSpokenBuyerName(t)) return true;
     if (t.length <= 56) return true;
     return false;
   }
-  // Güle güle: only short packing-style confirms, not long chatter
+  // Güle güle: packing-style confirms («güle güle takın hepsini»), not long chatter
   if (
     VERBAL_WIN_GULE_RE.test(t) &&
-    t.length <= 40 &&
-    /^(?:tamam[,.]?\s+)?g[uü]le\s+g[uü]le\s+(?:kullan|tak[ıi]n?|giy)(?:\s+can[ıi]m)?[.!?…]*$/i.test(
+    t.length <= 56 &&
+    /^(?:tamam[,.]?\s+)?g[uü]le\s+g[uü]le\s+(?:kullan|tak[ıi]n?|giy)\b/i.test(
       t,
-    )
+    ) &&
+    !/de[gğ]i[sş]ik|ama\b|fakat\b|ama\s/i.test(t)
   ) {
     return true;
   }
@@ -434,6 +516,7 @@ export function isBareVerbalWin(text: string): boolean {
 export function parseSpokenBuyerName(text: string): string | undefined {
   if (parseBuyerHint(text)) return undefined;
   const patterns = [
+    VERBAL_WIN_ALDIM_GELDI_RE,
     new RegExp(
       `\\b([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\\s+(?:${HONORIFIC})\\s+(?:sizindir|sizin\\s*dir|sizde)\\b`,
       "i",
@@ -459,6 +542,44 @@ export function parseSpokenBuyerName(text: string): string | undefined {
   return undefined;
 }
 
+/** Small Levenshtein for ASR typos («Şeyhna» ↔ «Şehnaz»). */
+function editDistanceAtMost(a: string, b: string, max: number): boolean {
+  if (a === b) return true;
+  if (Math.abs(a.length - b.length) > max) return false;
+  const m = a.length;
+  const n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = new Array<number>(n + 1);
+    cur[0] = i;
+    let rowMin = cur[0]!;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(
+        (prev[j] ?? 99) + 1,
+        (cur[j - 1] ?? 99) + 1,
+        (prev[j - 1] ?? 99) + cost,
+      );
+      rowMin = Math.min(rowMin, cur[j]!);
+    }
+    if (rowMin > max) return false;
+    prev = cur;
+  }
+  return (prev[n] ?? 99) <= max;
+}
+
+function nameTokenMatchesSpoken(spoken: string, token: string): boolean {
+  if (!token || token.length < 3) return false;
+  if (token === spoken) return true;
+  if (token.startsWith(spoken) || spoken.startsWith(token)) return true;
+  // ASR typos: «Şeyhna»↔«Şehnaz» (distance 2). Keep tight for short names.
+  if (spoken.length >= 5 && token.length >= 5) {
+    const max = spoken.length >= 6 ? 2 : 1;
+    return editDistanceAtMost(spoken, token, max);
+  }
+  return false;
+}
+
 /**
  * Match a spoken first name to a single recent commenter username / display name.
  * Ambiguous or no match → undefined (prefer unknown over inventing).
@@ -481,9 +602,7 @@ export function matchSpokenNameToBuyer(
         .filter((t) => t.length >= 3);
       if (
         display === name ||
-        displayTokens.some(
-          (t) => t === name || t.startsWith(name) || name.startsWith(t),
-        )
+        displayTokens.some((t) => nameTokenMatchesSpoken(name, t))
       ) {
         ok = true;
       }
@@ -494,11 +613,17 @@ export function matchSpokenNameToBuyer(
       const tokens = foldedUser
         .split(/[^a-z0-9]+/)
         .filter((t) => t.length >= 3);
-      ok = tokens.some(
-        (t) =>
-          t === name ||
-          (name.length >= 4 && (t.startsWith(name) || name.startsWith(t))),
-      );
+      // Username prefix before trailing digits (halecaloglu1 → halecaloglu)
+      const prefix = foldedUser.replace(/\d+$/g, "");
+      if (prefix.length >= 3) tokens.push(prefix);
+      // First-name glued into handle: sehnazsenerergun ↔ «Şehnaz» / ASR «Şeyhna»
+      if (name.length >= 5 && foldedUser.length >= name.length) {
+        tokens.push(foldedUser.slice(0, name.length));
+        if (foldedUser.length > name.length) {
+          tokens.push(foldedUser.slice(0, name.length + 1));
+        }
+      }
+      ok = tokens.some((t) => nameTokenMatchesSpoken(name, t));
     }
     if (ok) hits.push(user);
   }
@@ -564,6 +689,18 @@ export function isSellerAcceptPhrase(text: string): boolean {
   if (!t) return false;
   if (ACCEPT_STRONG_RE.test(t)) return true;
   if (/^(tamam|olur|okey|okay|kabul)[.!?…]*$/i.test(t)) return true;
+  // Long «Tamam …» without price/olur/bin is packing chatter, not accept.
+  if (
+    /^tamam\b/i.test(t) &&
+    t.length > 28 &&
+    !/\bolur\b/i.test(t) &&
+    !/\bbin\b/i.test(t) &&
+    !/\d{2,7}/.test(t) &&
+    !hasCurrencyMarker(t) &&
+    !parseBuyerHint(t)
+  ) {
+    return false;
+  }
   // «tamam olur», «tamam 18 bin», «olur 5000»
   if (
     /^(tamam|olur|okey|okay|kabul)\b/i.test(t) &&
@@ -679,6 +816,14 @@ export function parseAuctionText(
 
   // Explicit win / sold (seller confirmation) — requires evidence later
   if (SOLD_RE.test(t)) {
+    // Questions («satıldı mı») are chatter — never a sale confirm.
+    if (
+      /\?/.test(t) ||
+      /sat[ıi]ld[ıi]\s*(?:mi|mı|mü|mu)\b/i.test(t) ||
+      /(?:mi|mı|mü|mu)\s+sat[ıi]ld/i.test(t)
+    ) {
+      return null;
+    }
     const { confidence, reason } = soldConfidence(
       Boolean(buyerHint),
       amountTry != null,
@@ -806,6 +951,15 @@ export function parseAuctionText(
   if (BID_RE.test(t) || COUNTER_RE.test(t)) {
     const isCounter = COUNTER_RE.test(t);
     const isAldim = /ald[ıi]m/i.test(t);
+    // Questions («Acaba senden mi aldım?») must not claim a lot.
+    if (
+      source === "comment" &&
+      isAldim &&
+      !isCounter &&
+      !isFollowerAldimClaimText(t)
+    ) {
+      return null;
+    }
     // Comment «aldım 500 TL» with currency/bin but no «dir» → still a claim/bid at that price
     // (follower stating take-it); seller «… dir» already handled above.
     return {
@@ -873,6 +1027,10 @@ export function parseAuctionText(
     amountTry != null &&
     (PRICE_WORD_RE.test(t) || hasCurrency || /\bbin\b/i.test(t))
   ) {
+    // Foreign currency / market-range chatter is not a TRY lot ask.
+    if (FOREIGN_CURRENCY_RE.test(t) || PRICE_RANGE_BIN_RE.test(t)) {
+      return null;
+    }
     return {
       eventType: "price_mention",
       amountTry,
@@ -883,6 +1041,9 @@ export function parseAuctionText(
   }
 
   if (amountTry != null && PRICE_WORD_RE.test(t)) {
+    if (FOREIGN_CURRENCY_RE.test(t) || PRICE_RANGE_BIN_RE.test(t)) {
+      return null;
+    }
     return {
       eventType: "price_mention",
       amountTry,
@@ -1067,6 +1228,18 @@ export function reconcileMezatWindows(
   const sorted = [...events].sort((a, b) => a.offsetMs - b.offsetMs);
   const sales: SaleCandidate[] = [];
   let win: LotWindow | null = null;
+  /** Aldım comments that arrived with no open lot (often just before the ask). */
+  const orphanClaims: Array<{
+    buyer: string;
+    offsetMs: number;
+    eventId: string;
+  }> = [];
+  /** Claim discarded by a correction/void pass — re-attach to restated ask. */
+  let carryClaim: {
+    buyer: string;
+    offsetMs: number;
+    eventId: string;
+  } | null = null;
 
   const flushAldimIfClaimed = (closeMs: number) => {
     if (!win || win.closed) return;
@@ -1103,6 +1276,34 @@ export function reconcileMezatWindows(
     return n;
   };
 
+  const attachPendingClaim = (openMs: number) => {
+    if (!win || win.aldimClaim) return;
+    if (
+      carryClaim &&
+      openMs - carryClaim.offsetMs >= 0 &&
+      openMs - carryClaim.offsetMs <= ALDIM_CARRY_AFTER_CORRECTION_MS
+    ) {
+      win.aldimClaim = { ...carryClaim };
+      carryClaim = null;
+      return;
+    }
+    // Orphan aldım shortly before (or tiny after) this ask
+    for (let i = orphanClaims.length - 1; i >= 0; i--) {
+      const o = orphanClaims[i]!;
+      const dt = openMs - o.offsetMs;
+      if (dt >= 0 && dt <= ALDIM_PRE_ASK_MS) {
+        win.aldimClaim = { ...o };
+        orphanClaims.splice(i, 1);
+        return;
+      }
+      if (dt < 0 && o.offsetMs - openMs <= 5_000) {
+        win.aldimClaim = { ...o };
+        orphanClaims.splice(i, 1);
+        return;
+      }
+    }
+  };
+
   const openLot = (ev: TimelineEvent, ask?: number) => {
     flushAldimIfClaimed(ev.offsetMs);
     win = {
@@ -1113,6 +1314,7 @@ export function reconcileMezatWindows(
       bids: [],
       closed: false,
     };
+    attachPendingClaim(ev.offsetMs);
   };
 
   for (const ev of sorted) {
@@ -1120,6 +1322,12 @@ export function reconcileMezatWindows(
 
     if (ev.eventType === "pass") {
       if (win && !win.closed) {
+        // Correction voiding a bad ask: keep the follower claim for the restated price.
+        if (win.aldimClaim && reason === "correction_or_void") {
+          carryClaim = { ...win.aldimClaim };
+        } else {
+          carryClaim = null;
+        }
         win.closed = true;
         win = null;
       }
@@ -1179,13 +1387,29 @@ export function reconcileMezatWindows(
         continue;
       }
 
-      // Clear new product after min gap (price-line style lives)
+      // Same-lot price cut / bump («2000 lira» after a 4200 ask) without product cue —
+      // update ask in place rather than inventing a phantom next lot.
       if (
         reason === "seller_price_line" &&
         askAmt != null &&
         win.askAmount != null &&
         !near &&
-        dtSinceOpen >= LOT_MIN_NEW_MS
+        dtSinceOpen <= 5 * 60_000 &&
+        !isLotOpeningPriceLine(ev.matched)
+      ) {
+        win.askAmount = askAmt;
+        win.openEventIds.push(ev.id);
+        continue;
+      }
+
+      // Clear new product after min gap (price-line style lives) — only with product cue
+      if (
+        reason === "seller_price_line" &&
+        askAmt != null &&
+        win.askAmount != null &&
+        !near &&
+        dtSinceOpen >= LOT_MIN_NEW_MS &&
+        isLotOpeningPriceLine(ev.matched)
       ) {
         openLot(ev, askAmt);
         continue;
@@ -1199,24 +1423,44 @@ export function reconcileMezatWindows(
     }
 
     if (ev.eventType === "bid") {
-      if (!win || win.closed) {
-        // Orphan bid — ignore as sale (need ask or later confirm)
-        continue;
-      }
       const isAldimClaim =
         reason === "aldim_claim" ||
-        (/ald[ıi]m/i.test(ev.matched) && ev.amountTry == null);
-      if (
-        isAldimClaim &&
-        ev.buyerHint &&
-        !win.aldimClaim &&
-        ev.offsetMs - win.openMs <= ALDIM_CLAIM_WINDOW_MS
-      ) {
-        win.aldimClaim = {
-          buyer: ev.buyerHint,
-          offsetMs: ev.offsetMs,
-          eventId: ev.id,
-        };
+        (/ald[ıi]m/i.test(ev.matched) &&
+          ev.amountTry == null &&
+          isFollowerAldimClaimText(ev.matched));
+      if (!win || win.closed) {
+        // Orphan aldım — may attach when the ask lands a few seconds later.
+        if (isAldimClaim && ev.buyerHint && ev.source === "comment") {
+          orphanClaims.push({
+            buyer: ev.buyerHint,
+            offsetMs: ev.offsetMs,
+            eventId: ev.id,
+          });
+        }
+        continue;
+      }
+      if (isAldimClaim && ev.buyerHint && ev.source === "comment") {
+        if (
+          !win.aldimClaim &&
+          ev.offsetMs - win.openMs <= ALDIM_CLAIM_WINDOW_MS
+        ) {
+          win.aldimClaim = {
+            buyer: ev.buyerHint,
+            offsetMs: ev.offsetMs,
+            eventId: ev.id,
+          };
+        } else if (
+          win.aldimClaim &&
+          win.aldimClaim.buyer !== ev.buyerHint
+        ) {
+          // Second follower on this lot — keep as orphan for a near-future new ask
+          // (common when seller announces the next price a beat after the comment).
+          orphanClaims.push({
+            buyer: ev.buyerHint,
+            offsetMs: ev.offsetMs,
+            eventId: ev.id,
+          });
+        }
       }
       if (ev.buyerHint || ev.amountTry != null) {
         win.bids.push({
@@ -1405,6 +1649,16 @@ function isPricedAskEvent(ev: TimelineEvent): boolean {
 }
 
 /**
+ * Bare «1800 lira.» crumbs must not split lots. Prefer under-count of offered.
+ * Product-cue lines («bunlar da 1000 lira», «fiyatı 3500») may open the next lot.
+ */
+function isLotOpeningPriceLine(text: string): boolean {
+  return /fiyat|set(?:i|imiz)?|a[cç][ıi]l[ıi][sş]|ald[ıi]m\s+diyene|bunun|bunlar(?:\s+da)?|k[uü]pe|kolye|bro[sş]|bilezik|bileklik|y[uü]z[uü]k|cam\s+kolye|\bmezat\b|ile\s+mezat/i.test(
+    text,
+  );
+}
+
+/**
  * Sparse product-centric lots from a timeline.
  *
  * One lot = one product window from first ask until pass/sold or a clear new ask.
@@ -1487,7 +1741,9 @@ export function buildProductLots(events: TimelineEvent[]): ProductLot[] {
 
     // Clear new product cue (different ask after the lot has had time to settle)
     const clearNew =
-      (strong || reason === "seller_price_line") &&
+      (strong ||
+        (reason === "seller_price_line" &&
+          isLotOpeningPriceLine(ev.matched))) &&
       !nearOpening &&
       !nearLast &&
       dtOpen >= LOT_MIN_NEW_MS;

@@ -5,6 +5,7 @@ import {
   explainSaleTr,
   isAuctionNoise,
   isSaleWorthy,
+  isSellerAcceptPhrase,
   isVerbalWinPhrase,
   matchSpokenNameToBuyer,
   normalizeInstagramUsername,
@@ -664,6 +665,200 @@ describe("mezat window reconcile", () => {
     expect(sales[0]!.amountTry).toBe(4200);
     expect(sales[0]!.saleMethod).toBe("verbal_win_confirm");
   });
+
+  test("correction pass carries aldım to restated ask + güle güle confirm", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask1",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "Bunların fiyatı 5 bin lira.",
+        amountTry: 5000,
+        reason: "price_mention",
+      }),
+      ev({
+        id: "vw_name",
+        offsetMs: 20_000,
+        eventType: "sold",
+        matched: "Şeyhna zavallıdan bir aldım geldi.",
+        spokenBuyerName: "Şeyhna",
+        reason: "verbal_win_named",
+        confidence: 0.8,
+      }),
+      ev({
+        id: "c1",
+        offsetMs: 40_000,
+        eventType: "bid",
+        matched: "Aldım hazırdı",
+        buyerHint: "sehnazsenerergun",
+        reason: "aldim_claim",
+        source: "comment",
+        confidence: 0.6,
+      }),
+      ev({
+        id: "pass",
+        offsetMs: 50_000,
+        eventType: "pass",
+        matched: "Tamam senin yanlış oldu.",
+        reason: "correction_or_void",
+      }),
+      ev({
+        id: "ask2",
+        offsetMs: 60_000,
+        eventType: "price_mention",
+        matched: "Fiyatı dediğim gibi 5 bin lira.",
+        amountTry: 5000,
+        reason: "price_mention",
+      }),
+      ev({
+        id: "vw_gule",
+        offsetMs: 90_000,
+        eventType: "sold",
+        matched: "Güle güle takın hepsini.",
+        reason: "verbal_win_bare",
+        confidence: 0.62,
+      }),
+    ]);
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.buyerUsername).toBe("sehnazsenerergun");
+    expect(sales[0]!.amountTry).toBe(5000);
+    expect(sales[0]!.saleMethod).toBe("verbal_win_confirm");
+  });
+
+  test("orphan aldım shortly before ask still claims the lot", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "c1",
+        offsetMs: 1000,
+        eventType: "bid",
+        matched: "Aldım",
+        buyerHint: "draylingunbay",
+        reason: "aldim_claim",
+        source: "comment",
+        confidence: 0.6,
+      }),
+      ev({
+        id: "ask",
+        offsetMs: 1500,
+        eventType: "price_mention",
+        matched: "Bunlar da 1000 lira.",
+        amountTry: 1000,
+        reason: "price_mention",
+      }),
+      ev({
+        id: "ask2",
+        offsetMs: 80_000,
+        eventType: "price_mention",
+        matched: "Bunun da fiyatı 6000 lira.",
+        amountTry: 6000,
+        reason: "price_mention",
+      }),
+    ]);
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.buyerUsername).toBe("draylingunbay");
+    expect(sales[0]!.amountTry).toBe(1000);
+    expect(sales[0]!.saleMethod).toBe("aldim_first_comment");
+  });
+
+  test("second aldım on open lot orphans onto the next ask", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask1",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "3.000 liraydı bunun fiyatı.",
+        amountTry: 3000,
+        reason: "price_mention",
+      }),
+      ev({
+        id: "c1",
+        offsetMs: 10_000,
+        eventType: "bid",
+        matched: "Aldim",
+        buyerHint: "z.g.sahsuvaroglu",
+        reason: "aldim_claim",
+        source: "comment",
+        confidence: 0.6,
+      }),
+      ev({
+        id: "c2",
+        offsetMs: 40_000,
+        eventType: "bid",
+        matched: "Aldım",
+        buyerHint: "draylingunbay",
+        reason: "aldim_claim",
+        source: "comment",
+        confidence: 0.6,
+      }),
+      ev({
+        id: "ask2",
+        offsetMs: 41_000,
+        eventType: "price_mention",
+        matched: "Bunlar da 1000 lira.",
+        amountTry: 1000,
+        reason: "price_mention",
+      }),
+      ev({
+        id: "ask3",
+        offsetMs: 120_000,
+        eventType: "price_mention",
+        matched: "Bunun da fiyatı 6000 lira.",
+        amountTry: 6000,
+        reason: "price_mention",
+      }),
+    ]);
+    expect(sales.length).toBe(2);
+    expect(sales.map((s) => [s.buyerUsername, s.amountTry])).toEqual([
+      ["z.g.sahsuvaroglu", 3000],
+      ["draylingunbay", 1000],
+    ]);
+  });
+
+  test("pey number comment + bare hayırlı olsun confirms sale", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "Bunun fiyatı da 4000 lira.",
+        amountTry: 4000,
+        reason: "price_mention",
+      }),
+      ev({
+        id: "pey",
+        offsetMs: 3000,
+        eventType: "bid",
+        matched: "4000",
+        amountTry: 4000,
+        buyerHint: "claudia_sadioglu",
+        reason: "comment_number_bid",
+        source: "comment",
+        confidence: 0.62,
+      }),
+      ev({
+        id: "c1",
+        offsetMs: 5000,
+        eventType: "bid",
+        matched: "aldim",
+        buyerHint: "claudia_sadioglu",
+        reason: "aldim_claim",
+        source: "comment",
+        confidence: 0.6,
+      }),
+      ev({
+        id: "vw",
+        offsetMs: 12000,
+        eventType: "sold",
+        matched: "hayırlı olsun",
+        reason: "verbal_win_bare",
+        confidence: 0.62,
+      }),
+    ]);
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.buyerUsername).toBe("claudia_sadioglu");
+    expect(sales[0]!.amountTry).toBe(4000);
+    expect(sales[0]!.saleMethod).toBe("verbal_win_confirm");
+  });
 });
 
 describe("verbal win phrase parse", () => {
@@ -724,6 +919,56 @@ describe("verbal win phrase parse", () => {
         { buyerHint: "halecaloglu1", displayName: "Hale Ç" },
       ]),
     ).toBe("halecaloglu1");
+  });
+
+  test("ASR typo Şeyhna matches @sehnaz… username prefix", () => {
+    expect(
+      matchSpokenNameToBuyer("Şeyhna", [
+        { buyerHint: "sehnazsenerergun" },
+      ]),
+    ).toBe("sehnazsenerergun");
+  });
+
+  test("güle güle takın hepsini + aldım geldi are verbal wins", () => {
+    expect(isVerbalWinPhrase("Güle güle takın hepsini.")).toBe(true);
+    expect(isVerbalWinPhrase("Güle güle kullan değişik.")).toBe(false);
+    expect(isVerbalWinPhrase("Şeyhna zavallıdan bir aldım geldi.")).toBe(
+      true,
+    );
+    expect(
+      parseSpokenBuyerName("Şeyhna zavallıdan bir aldım geldi."),
+    ).toBe("Şeyhna");
+    const g = parseAuctionText("Güle güle takın hepsini.", {
+      source: "transcript",
+    });
+    expect(g?.eventType).toBe("sold");
+    expect(g?.reason).toBe("verbal_win_bare");
+  });
+
+  test("question aldım does not claim; dotted thousands + no mutlaka-TL", () => {
+    expect(
+      parseAuctionText("Acaba senden mi aldım ?", { source: "comment" }),
+    ).toBeNull();
+    expect(parsePriceTry("Bunlar da satış fiyatımız 3.500 lira.")).toBe(
+      3500,
+    );
+    expect(
+      parsePriceTry("Yani neredeyse 18-20 bin liradan başlıyor."),
+    ).toBeUndefined();
+    expect(
+      parseAuctionText("Bunlar da fiyatlar 300 poundan.", {
+        source: "transcript",
+      }),
+    ).toBeNull();
+    expect(
+      isSellerAcceptPhrase("Tamam tek sıra gelirim ya mutlaka."),
+    ).toBe(false);
+    expect(
+      parseAuctionText("satildi mi", { source: "comment" }),
+    ).toBeNull();
+    expect(
+      parseAuctionText("satıldı mı?", { source: "transcript" }),
+    ).toBeNull();
   });
 });
 
