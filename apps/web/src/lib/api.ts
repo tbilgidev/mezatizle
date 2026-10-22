@@ -386,6 +386,19 @@ export const api = {
     }>(`/api/sales/${id}/evidence`),
   /** Muxed recording MP4 (range-request friendly). */
   mediaUrl: (recordingId: string) => url(`/api/recordings/${recordingId}/media`),
+  /** Timed live/export comments for in-app review overlay (always DB, not burn-in). */
+  comments: (recordingId: string) =>
+    request<{
+      comments: Array<{
+        id?: string;
+        offset_ms?: number | null;
+        offsetMs?: number | null;
+        author_username?: string | null;
+        authorUsername?: string | null;
+        body?: string | null;
+        source?: string | null;
+      }>;
+    }>(`/api/comments/${recordingId}`),
   reviewSale: (id: string, status: string) =>
     request(`/api/sales/${id}/review`, {
       method: "PATCH",
