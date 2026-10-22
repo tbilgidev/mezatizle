@@ -367,11 +367,12 @@ export async function reconcileSales(
 
     const decisionKey = `${Math.floor(offsetMs / 15_000)}|${(buyer ?? "").toLowerCase()}|${spoken}|${amountCents != null ? Math.round(amountCents / 100) : "_"}`;
     const preserved = decisionByKey.get(decisionKey);
-    // Auto-confirm confident sales; uncertain stay needs_review until operator acts.
+    // Auto-confirm only with buyer + price; amount-unknown → needs_review
+    // (never KPI-inflate a null TRY sale from bare verbal packing).
     let status =
       preserved === "confirmed" || preserved === "rejected"
         ? preserved
-        : wantsReview || !hasBuyer
+        : wantsReview || !hasBuyer || amountCents == null
           ? "needs_review"
           : "confirmed";
 

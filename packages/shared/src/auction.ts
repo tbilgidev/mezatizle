@@ -102,7 +102,7 @@ const VERBAL_WIN_HAYIRLI_RE = /hay[ıi]rl[ıi]\s+olsun/i;
 const VERBAL_WIN_BRAVO_RE =
   /\bbravo\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\b/i;
 const VERBAL_WIN_GULE_RE =
-  /g[uü]le\s+g[uü]le\s+(?:kullan|tak[ıi]n?|giy)/i;
+  /g[uü]le\s+g[uü]le\s+(?:iyi\s+g[uü]nlerde\s+)?(?:kullan|tak[ıi]n?|giy)/i;
 
 /**
  * Seller announces a named follower aldım arrived
@@ -116,9 +116,22 @@ const VERBAL_WIN_ALDIM_GELDI_RE = new RegExp(
   "i",
 );
 
+/**
+ * «Çiğdem Hanım siz bunu aldınız / aldın» — seller confirms the follower’s claim.
+ * Must not use the bare «X aldı» pattern (matches «bunu aldı»).
+ */
+const VERBAL_WIN_SIZ_BUNU_ALDI_RE = new RegExp(
+  `${TR_NAME_LEAD}${TR_NAME}\\s+(?:${HONORIFIC})\\s+siz\\s+(?:bunu|bunları|onu)\\s+ald[ıi](?:n[ıi]z|n)?\\b`,
+  "i",
+);
+
+/** «ikisi de sizin olacak» / «sizin olacak» packing confirm. */
+const VERBAL_WIN_SIZIN_OLACAK_RE =
+  /\b(?:ikisi\s+de\s+)?sizin\s+olacak\b/i;
+
 /** Soft confirm without a spoken name — only closes a lot that already has an aldım/bid. */
 const VERBAL_WIN_BARE_RE =
-  /^(?:tamam[,.]?\s+)?(?:hay[ıi]rl[ıi]\s+olsun(?:\s+can[ıi]m)?|g[uü]le\s+g[uü]le\s+(?:kullan|tak[ıi]n?|giy)(?:\s+\S+){0,3})[.!?…]*$/i;
+  /^(?:tamam[,.]?\s+)?(?:hay[ıi]rl[ıi]\s+olsun(?:\s+can[ıi]m)?|g[uü]le\s+g[uü]le\s+(?:iyi\s+g[uü]nlerde\s+)?(?:kullan|tak[ıi]n?|giy)(?:\s+\S+){0,6}|ikisi\s+de\s+sizin\s+olacak|sizin\s+olacak)[.!?…]*$/i;
 
 /** Foreign currency chatter must not open a TRY lot. */
 const FOREIGN_CURRENCY_RE =
@@ -412,6 +425,9 @@ const SPOKEN_NAME_STOP = new Set(
     "arkadaslar",
     "evet",
     "bu",
+    "bunu",
+    "bunlar",
+    "bunun",
     "da",
     "de",
     "bir",
@@ -487,20 +503,19 @@ export function isVerbalWinPhrase(text: string): boolean {
   if (VERBAL_WIN_NAME_ONLY_SIZDE_RE.test(t)) return true;
   if (VERBAL_WIN_BRAVO_RE.test(t)) return true;
   if (VERBAL_WIN_ALDIM_GELDI_RE.test(t)) return true;
+  if (VERBAL_WIN_SIZ_BUNU_ALDI_RE.test(t)) return true;
+  if (VERBAL_WIN_SIZIN_OLACAK_RE.test(t) && t.length <= 80) return true;
   if (VERBAL_WIN_HAYIRLI_RE.test(t)) {
     // Named confirm, or short bare «(Tamam) hayırlı olsun (canım / güle güle…)»
     if (parseSpokenBuyerName(t)) return true;
     if (t.length <= 56) return true;
     return false;
   }
-  // Güle güle: packing-style confirms («güle güle takın hepsini»), not long chatter
+  // Güle güle: packing confirms («güle güle kullan», «güle güle … X hanımcığım»)
   if (
     VERBAL_WIN_GULE_RE.test(t) &&
-    t.length <= 56 &&
-    /^(?:tamam[,.]?\s+)?g[uü]le\s+g[uü]le\s+(?:kullan|tak[ıi]n?|giy)\b/i.test(
-      t,
-    ) &&
-    !/de[gğ]i[sş]ik|ama\b|fakat\b|ama\s/i.test(t)
+    t.length <= 100 &&
+    !/de[gğ]i[sş]ik|ama\b|fakat\b/i.test(t)
   ) {
     return true;
   }
@@ -520,6 +535,7 @@ export function parseSpokenBuyerName(text: string): string | undefined {
   if (parseBuyerHint(text)) return undefined;
   const patterns = [
     VERBAL_WIN_ALDIM_GELDI_RE,
+    VERBAL_WIN_SIZ_BUNU_ALDI_RE,
     new RegExp(
       `\\b([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\\s+(?:${HONORIFIC})\\s+(?:sizindir|sizin\\s*dir|sizde)\\b`,
       "i",
@@ -533,8 +549,17 @@ export function parseSpokenBuyerName(text: string): string | undefined {
     /\bbravo\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\b/i,
     /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\s+de\s+sizin(?:dir|\s+hay)/i,
     /^([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\s+sizde[.!?…]*$/i,
+    // «güle güle … kullanınız güneş hanımcığım»
+    new RegExp(
+      `g[uü]le\\s+g[uü]le[\\s\\S]{0,60}?\\b([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\\s+(?:${HONORIFIC})\\b`,
+      "i",
+    ),
     /(?:sat[ıi]ld[ıi]|sold(?:\s+to)?)\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})(?=\s|$|,|\d)/i,
-    /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\s+ald[ıi](?!\s*m)\b/i,
+    // Named «X aldı» — honorific required so «bunu aldı» never matches
+    new RegExp(
+      `\\b([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\\s+(?:${HONORIFIC})\\s+ald[ıi](?!\\s*m)\\b`,
+      "i",
+    ),
     /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})['']?da\s+kald[ıi]/i,
   ];
   for (const re of patterns) {
@@ -1164,6 +1189,14 @@ export const SALE_DEDUP_WINDOW_MS = 180_000;
 type LotWindow = {
   openMs: number;
   askAmount?: number;
+  /** First sane ask when the lot opened — never overwritten by pey/OCR crumbs. */
+  openingAskTry?: number;
+  /**
+   * Ask frozen at the moment a follower «aldım» claimed the lot.
+   * Sold price for aldim_first_comment MUST use this — later «700 TL» /
+   * «190 TL» chatter must not rewrite the sale.
+   */
+  claimAskTry?: number;
   productHint?: string;
   openEventIds: string[];
   /** First OCR «aldım» claimer after ask. */
@@ -1185,6 +1218,36 @@ type LotWindow = {
     reason: string;
   };
 };
+
+/** Sale price for a claimed fixed-ask lot (never a later crumb below ask). */
+function lotSaleAsk(win: LotWindow): number | undefined {
+  return win.claimAskTry ?? win.askAmount ?? win.openingAskTry;
+}
+
+/**
+ * Reject ASR/OCR amounts that are absurdly below the lot ask unless the
+ * seller explicitly accepted a counter at that price.
+ */
+function resolveSaleAmountTry(opts: {
+  askTry?: number;
+  eventAmountTry?: number;
+  method: SaleMethod;
+}): number | undefined {
+  const { askTry, eventAmountTry, method } = opts;
+  if (method === "counter_accept" && eventAmountTry != null) {
+    return eventAmountTry;
+  }
+  if (askTry == null) return eventAmountTry;
+  if (eventAmountTry == null) return askTry;
+  // Fixed-ask aldım: sold price is the claim/opening ask, not OCR chatter
+  if (method === "aldim_first_comment") return askTry;
+  // Bidding up (or equal) is fine
+  if (eventAmountTry >= askTry) return eventAmountTry;
+  // Same ballpark below ask (ASR jitter) → prefer ask
+  if (amountsNear(eventAmountTry, askTry)) return askTry;
+  // Far below ask without counter-accept → keep the ask (never sell 2200→700)
+  return askTry;
+}
 
 /**
  * ASR sometimes concatenates repeated «bin beş yüz» into absurd TRY amounts
@@ -1290,10 +1353,11 @@ export function reconcileMezatWindows(
     // Number crumbs in chat must not block aldım-first mezats (afra); only an
     // explicit counter-offer means the lot left fixed-ask mode.
     const hasCounter = win.bids.some((b) => b.reason === "counter_offer");
-    if (win.aldimClaim && win.askAmount != null && !hasCounter) {
+    const saleAsk = lotSaleAsk(win);
+    if (win.aldimClaim && saleAsk != null && !hasCounter) {
       sales.push({
         offsetMs: win.aldimClaim.offsetMs,
-        amountTry: win.askAmount,
+        amountTry: saleAsk,
         buyerUsername: win.aldimClaim.buyer,
         confidence: 0.88,
         reason: "aldim_first_comment+ask_price",
@@ -1303,8 +1367,8 @@ export function reconcileMezatWindows(
           win.aldimClaim.eventId,
         ],
         productHint: win.productHint,
-        askAmountTry: win.askAmount,
-        evidenceQuote: `@${win.aldimClaim.buyer} aldım → ${win.askAmount} TRY`,
+        askAmountTry: win.openingAskTry ?? saleAsk,
+        evidenceQuote: `@${win.aldimClaim.buyer} aldım → ${saleAsk} TRY`,
       });
       win.namedMissReview = undefined;
     } else {
@@ -1333,6 +1397,7 @@ export function reconcileMezatWindows(
     ) {
       win.aldimClaim = { ...carryClaim };
       carryClaim = null;
+      freezeClaimAsk();
       return;
     }
     // Orphan aldım shortly before (or tiny after) this ask
@@ -1342,11 +1407,13 @@ export function reconcileMezatWindows(
       if (dt >= 0 && dt <= ALDIM_PRE_ASK_MS) {
         win.aldimClaim = { ...o };
         orphanClaims.splice(i, 1);
+        freezeClaimAsk();
         return;
       }
       if (dt < 0 && o.offsetMs - openMs <= 5_000) {
         win.aldimClaim = { ...o };
         orphanClaims.splice(i, 1);
+        freezeClaimAsk();
         return;
       }
     }
@@ -1354,9 +1421,11 @@ export function reconcileMezatWindows(
 
   const openLot = (ev: TimelineEvent, ask?: number) => {
     flushAldimIfClaimed(ev.offsetMs);
+    const opening = saneAsk(ask ?? ev.amountTry);
     win = {
       openMs: ev.offsetMs,
-      askAmount: saneAsk(ask ?? ev.amountTry),
+      askAmount: opening,
+      openingAskTry: opening,
       productHint: ev.productHint ?? ev.matched.slice(0, 120),
       openEventIds: [ev.id],
       bids: [],
@@ -1365,22 +1434,36 @@ export function reconcileMezatWindows(
     attachPendingClaim(ev.offsetMs);
   };
 
+  const freezeClaimAsk = () => {
+    if (!win || win.claimAskTry != null) return;
+    const a = win.askAmount ?? win.openingAskTry;
+    if (a != null) win.claimAskTry = a;
+  };
+
   for (const ev of sorted) {
     const reason = ev.reason ?? "";
 
     if (ev.eventType === "pass") {
       if (win && !win.closed) {
-        // Correction voiding a bad ask: keep the follower claim for the restated price.
-        if (win.aldimClaim && reason === "correction_or_void") {
+        // Early correction of a bad ask (claim still hot) → re-attach to restated
+        // price. Late «özür / yanlış söyledim» about a *different* item must not
+        // erase an already-frozen aldım sale (glam trifari apology vs bilezik).
+        const claimAgeMs = win.aldimClaim
+          ? ev.offsetMs - win.aldimClaim.offsetMs
+          : Number.POSITIVE_INFINITY;
+        if (
+          win.aldimClaim &&
+          reason === "correction_or_void" &&
+          claimAgeMs <= ALDIM_CARRY_AFTER_CORRECTION_MS
+        ) {
           carryClaim = { ...win.aldimClaim };
-          // Named miss on a voided ask is stale — drop it with the correction.
           win.namedMissReview = undefined;
+          win.closed = true;
+          win = null;
         } else {
-          carryClaim = null;
-          flushNamedMissIfPending();
+          // Claimed lot → emit sale at frozen ask; unclaimed → named-miss only.
+          flushAldimIfClaimed(ev.offsetMs);
         }
-        win.closed = true;
-        win = null;
       }
       continue;
     }
@@ -1396,19 +1479,38 @@ export function reconcileMezatWindows(
         reason === "price_mention" ||
         (ev.eventType === "item_intro" && askAmt != null);
 
-      // No open window → any priced ask (incl. «X bin ile mezat olsun») opens a lot
+      // No open window → only a *sane* ask opens a lot (refuse «190 TL» crumbs)
       if (!win || win.closed) {
-        if (askAmt != null || strongAsk || ev.eventType === "item_intro") {
+        const openingAmt = saneAsk(askAmt);
+        if (
+          openingAmt != null ||
+          (ev.eventType === "item_intro" && askAmt == null)
+        ) {
           openLot(ev, askAmt);
         }
         continue;
       }
 
       const dtSinceOpen = ev.offsetMs - win.openMs;
+      const saneAmt = saneAsk(askAmt);
+      // Lot opened without a usable ask (legacy) — adopt the first sane price
+      if (win.askAmount == null && saneAmt != null) {
+        win.askAmount = saneAmt;
+        win.openingAskTry = saneAmt;
+        win.openEventIds.push(ev.id);
+        continue;
+      }
       const near =
         askAmt != null &&
         win.askAmount != null &&
         amountsNear(askAmt, win.askAmount);
+      const opening = win.openingAskTry ?? win.askAmount;
+      const farBelowOpening =
+        saneAmt != null &&
+        opening != null &&
+        saneAmt < opening &&
+        !amountsNear(saneAmt, opening) &&
+        saneAmt / opening < 0.55;
 
       // Re-show / restatement of same or similar ask → stay on this lot
       if (near && dtSinceOpen <= LOT_RESHOW_MERGE_MS) {
@@ -1427,14 +1529,50 @@ export function reconcileMezatWindows(
         continue;
       }
 
+      // After a follower claimed the lot, never rewrite the ask from later crumbs
+      // («700 TL.» / «anlaşmalı 190 TL») — that is the glam 2200→700 / 2000→190 bug.
+      // A sane different ask (≥55% of opening, or product-cued) starts the next lot
+      // so the next buyer’s aldım is not orphaned on the sold window.
+      if (win.aldimClaim || win.claimAskTry != null) {
+        if (
+          saneAmt != null &&
+          win.askAmount != null &&
+          !near &&
+          dtSinceOpen >= LOT_MIN_NEW_MS &&
+          (!farBelowOpening || strongAsk || isLotOpeningPriceLine(ev.matched))
+        ) {
+          openLot(ev, saneAmt);
+          continue;
+        }
+        if (askAmt != null) win.openEventIds.push(ev.id);
+        continue;
+      }
+
       // Weak price-line early revise on the same product — keep window
+      // (only sane amounts; refuse pey crumbs below offer floor).
       if (
         reason === "seller_price_line" &&
-        askAmt != null &&
-        dtSinceOpen <= LOT_EARLY_REVISE_MS
+        saneAmt != null &&
+        dtSinceOpen <= LOT_EARLY_REVISE_MS &&
+        !farBelowOpening
       ) {
-        win.askAmount = askAmt;
+        win.askAmount = saneAmt;
+        if (win.openingAskTry == null) win.openingAskTry = saneAmt;
         win.openEventIds.push(ev.id);
+        continue;
+      }
+
+      // Far-below crumb without product cue → ignore (do not sell 2200 at 700).
+      // With product cue + min gap → next lot.
+      if (farBelowOpening) {
+        if (
+          dtSinceOpen >= LOT_MIN_NEW_MS &&
+          (strongAsk || isLotOpeningPriceLine(ev.matched))
+        ) {
+          openLot(ev, saneAmt);
+          continue;
+        }
+        if (askAmt != null) win.openEventIds.push(ev.id);
         continue;
       }
 
@@ -1442,13 +1580,13 @@ export function reconcileMezatWindows(
       // update ask in place rather than inventing a phantom next lot.
       if (
         reason === "seller_price_line" &&
-        askAmt != null &&
+        saneAmt != null &&
         win.askAmount != null &&
         !near &&
         dtSinceOpen <= 5 * 60_000 &&
         !isLotOpeningPriceLine(ev.matched)
       ) {
-        win.askAmount = askAmt;
+        win.askAmount = saneAmt;
         win.openEventIds.push(ev.id);
         continue;
       }
@@ -1456,13 +1594,13 @@ export function reconcileMezatWindows(
       // Clear new product after min gap (price-line style lives) — only with product cue
       if (
         reason === "seller_price_line" &&
-        askAmt != null &&
+        saneAmt != null &&
         win.askAmount != null &&
         !near &&
         dtSinceOpen >= LOT_MIN_NEW_MS &&
         isLotOpeningPriceLine(ev.matched)
       ) {
-        openLot(ev, askAmt);
+        openLot(ev, saneAmt);
         continue;
       }
 
@@ -1500,6 +1638,7 @@ export function reconcileMezatWindows(
             offsetMs: ev.offsetMs,
             eventId: ev.id,
           };
+          freezeClaimAsk();
         } else if (
           win.aldimClaim &&
           win.aldimClaim.buyer !== ev.buyerHint
@@ -1541,11 +1680,12 @@ export function reconcileMezatWindows(
       const openWin = win && !win.closed ? win : null;
       /** Named verbal confirm that did not match any commenter handle. */
       let verbalNameMiss = false;
+      const lotAsk = openWin ? lotSaleAsk(openWin) : undefined;
 
       if (openWin) {
         evidence.push(...openWin.openEventIds);
-        if (openWin.askAmount != null && amount == null) {
-          amount = openWin.askAmount;
+        if (lotAsk != null && amount == null) {
+          amount = lotAsk;
         }
 
         // Counter-accept: take latest counter bid amount + buyer
@@ -1593,7 +1733,17 @@ export function reconcileMezatWindows(
           }
         }
 
-        // Win confirm after bids (classic satıldı / lookback)
+        // Aldım claim + seller later confirms (incl. bare «hayırlı olsun»)
+        // Prefer the frozen claimer over later chat bids (glam: «ikisi de sizin»
+        // must not steal @iyiymis via @gnshsgl arithmetic chatter).
+        if (!buyer && !verbalNameMiss && openWin.aldimClaim) {
+          buyer = openWin.aldimClaim.buyer;
+          amount = amount ?? lotAsk;
+          evidence.push(openWin.aldimClaim.eventId);
+          method = isVerbal ? "verbal_win_confirm" : "aldim_first_comment";
+        }
+
+        // Win confirm after bids (classic satıldı / lookback) — only if no aldım claim
         if (!buyer && !verbalNameMiss && openWin.bids.length) {
           const enriched = enrichSoldFromBids(
             {
@@ -1616,13 +1766,12 @@ export function reconcileMezatWindows(
           }
         }
 
-        // Aldım claim + seller later confirms (incl. bare «hayırlı olsun»)
-        if (!buyer && !verbalNameMiss && openWin.aldimClaim) {
-          buyer = openWin.aldimClaim.buyer;
-          amount = amount ?? openWin.askAmount;
-          evidence.push(openWin.aldimClaim.eventId);
-          method = isVerbal ? "verbal_win_confirm" : "aldim_first_comment";
-        }
+        // Pin sold price to lot ask unless counter-accept explicitly took a lower bid
+        amount = resolveSaleAmountTry({
+          askTry: lotAsk,
+          eventAmountTry: amount,
+          method,
+        });
       }
 
       // Gate: need buyer comment OR @ on confirmation; price preferred
@@ -1665,7 +1814,7 @@ export function reconcileMezatWindows(
           saleMethod: method,
           evidenceEventIds: [...new Set(evidence)],
           productHint: ev.productHint ?? ev.matched.slice(0, 120),
-          askAmountTry: amount,
+          askAmountTry: lotAsk ?? amount,
           evidenceQuote: ev.matched.slice(0, 200),
         });
         continue;
@@ -1678,7 +1827,7 @@ export function reconcileMezatWindows(
         openWin.namedMissReview = {
           offsetMs: ev.offsetMs,
           spokenBuyerName: ev.spokenBuyerName,
-          amountTry: amount ?? openWin.askAmount,
+          amountTry: amount ?? lotAsk,
           evidenceEventIds: [...new Set(evidence)],
           evidenceQuote: ev.matched.slice(0, 200),
           productHint: ev.productHint ?? ev.matched.slice(0, 120),

@@ -398,6 +398,141 @@ describe("mezat window reconcile", () => {
     expect(sales[0]!.saleMethod).toBe("aldim_first_comment");
   });
 
+  test("glam: later seller_price_line crumb must not rewrite claimed ask", () => {
+    // 2200 ask + aldım, then unrelated «700 TL.» → still sold at 2200
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 156_000,
+        eventType: "price_mention",
+        matched: "2200 TL bu broş şumuzun fiyatı.",
+        amountTry: 2200,
+        reason: "price_mention",
+      }),
+      ev({
+        id: "c",
+        offsetMs: 166_000,
+        eventType: "bid",
+        matched: "2200 aldım",
+        buyerHint: "aylinbakay",
+        reason: "aldim_claim",
+        source: "comment",
+        confidence: 0.65,
+      }),
+      ev({
+        id: "crumb",
+        offsetMs: 221_000,
+        eventType: "price_mention",
+        matched: "700 TL.",
+        amountTry: 700,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "next",
+        offsetMs: 351_000,
+        eventType: "price_mention",
+        matched: "Bu broşumuz 3000 TL.",
+        amountTry: 3000,
+        reason: "seller_price_line",
+      }),
+    ]);
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.buyerUsername).toBe("aylinbakay");
+    expect(sales[0]!.amountTry).toBe(2200);
+    expect(sales[0]!.askAmountTry).toBe(2200);
+  });
+
+  test("glam: anlaşmalı 190 crumb must not sell a 2000 claimed lot", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 1_810_000,
+        eventType: "price_mention",
+        matched: "Bunun fiyatı da 2000 TL",
+        amountTry: 2000,
+        reason: "price_mention",
+      }),
+      ev({
+        id: "c",
+        offsetMs: 1_823_000,
+        eventType: "bid",
+        matched: "Aldım 2000",
+        buyerHint: "cig.mut",
+        reason: "aldim_claim",
+        source: "comment",
+      }),
+      ev({
+        id: "crumb",
+        offsetMs: 2_036_000,
+        eventType: "price_mention",
+        matched: "anlaşmalı 190 TL",
+        amountTry: 190,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "next",
+        offsetMs: 2_144_000,
+        eventType: "price_mention",
+        matched: "bunun fiyatı 3000 TL",
+        amountTry: 3000,
+        reason: "price_mention",
+      }),
+    ]);
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.buyerUsername).toBe("cig.mut");
+    expect(sales[0]!.amountTry).toBe(2000);
+  });
+
+  test("claimed aldım survives correction_or_void pass (flush at claim ask)", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 2_144_000,
+        eventType: "price_mention",
+        matched: "bunun fiyatı 3000 TL",
+        amountTry: 3000,
+        reason: "price_mention",
+      }),
+      ev({
+        id: "c",
+        offsetMs: 2_159_000,
+        eventType: "bid",
+        matched: "Aldim 3bin tl",
+        buyerHint: "iyiymis",
+        reason: "aldim_claim",
+        source: "comment",
+      }),
+      ev({
+        id: "pass",
+        offsetMs: 2_663_000,
+        eventType: "pass",
+        matched: "bu trifariyı ben yanlış söyledim",
+        reason: "correction_or_void",
+      }),
+    ]);
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.buyerUsername).toBe("iyiymis");
+    expect(sales[0]!.amountTry).toBe(3000);
+  });
+
+  test("verbal: siz bunu aldınız + güle güle named packing", () => {
+    expect(
+      parseAuctionText("Çiğdem Hanım siz bunu aldınız.", {
+        source: "transcript",
+      })?.spokenBuyerName,
+    ).toBe("Çiğdem");
+    expect(
+      parseAuctionText(
+        "güle güle iyi günlerde kullanınız güneş hanımcığım",
+        { source: "transcript" },
+      )?.spokenBuyerName,
+    ).toBe("güneş");
+    expect(
+      parseAuctionText("ikisi de sizin olacak", { source: "transcript" })
+        ?.eventType,
+    ).toBe("sold");
+  });
+
   test("bid then seller confirm correlates OCR buyer", () => {
     const sales = reconcileMezatWindows([
       ev({
