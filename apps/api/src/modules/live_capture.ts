@@ -154,6 +154,16 @@ export async function persistLiveComments(
         LIMIT 1
       `;
       if (dup) continue;
+    } else if (offsetMs == null) {
+      // Avoid `${null} IS NOT NULL` — postgres cannot infer parameter type ($5).
+      const [dup] = await sql<{ id: string }[]>`
+        SELECT id FROM observed_comments
+        WHERE recording_id = ${recordingId}
+          AND source IN ('live_api', 'live_dom')
+          AND raw_json->>'fp' = ${fp}
+        LIMIT 1
+      `;
+      if (dup) continue;
     } else {
       const [dup] = await sql<{ id: string }[]>`
         SELECT id FROM observed_comments
@@ -165,8 +175,7 @@ export async function persistLiveComments(
               lower(coalesce(author_username, '')) = ${author ?? ""}
               AND lower(body) = ${body.toLowerCase()}
               AND offset_ms IS NOT NULL
-              AND ${offsetMs} IS NOT NULL
-              AND abs(offset_ms - ${offsetMs}) < 8000
+              AND abs(offset_ms - ${offsetMs}::int) < 8000
             )
           )
         LIMIT 1
@@ -181,7 +190,7 @@ export async function persistLiveComments(
         ${body},
         ${author},
         ${source},
-        ${offsetMs},
+        ${offsetMs}::int,
         ${observedAt},
         ${sql.json({
           pk: h.pk,
@@ -530,6 +539,56 @@ export async function probePublicLive(
   };
 }
 
+/** Serialize createLiveCapture across concurrent POSTs (in-process). */
+let createLiveCaptureTail: Promise<unknown> = Promise.resolve();
+
+/** Postgres advisory lock — serialize create across double-POST / auto-follow races. */
+const CREATE_LIVE_CAPTURE_LOCK = 0x4d455a41; // 'MEZA'
+
+export type ActiveCaptureDupRow = {
+  recording_id: string;
+  username: string;
+  watch_url: string | null;
+  source_url: string | null;
+  capture_status: string | null;
+  max_duration_minutes: number | null;
+  last_probe_detail: string | null;
+  capture_error: string | null;
+};
+
+/**
+ * Hard rule: at most ONE active capture globally.
+ * Prefer same username / same broadcast_id; otherwise reuse any
+ * bekleniyor/kaydediliyor row so a second seller cannot start.
+ */
+export function findActiveCaptureConflict(
+  rows: ActiveCaptureDupRow[],
+  usernameLc: string,
+  wantBid: string | null,
+): ActiveCaptureDupRow | undefined {
+  if (!rows.length) return undefined;
+  const bidFromProbeDetail = (
+    detail: string | null | undefined,
+  ): string | null => {
+    if (!detail) return null;
+    const m = detail.match(/\bbid[=:]?\s*(\d{5,})\b/i);
+    return m?.[1] ?? null;
+  };
+  const exact = rows.find((row) => {
+    const u = String(row.username || "").toLowerCase();
+    if (u === usernameLc) return true;
+    if (!wantBid) return false;
+    const bid =
+      extractBroadcastIdFromUrl(row.watch_url || "") ||
+      extractBroadcastIdFromUrl(row.source_url || "") ||
+      bidFromProbeDetail(row.last_probe_detail);
+    return bid != null && bid === wantBid;
+  });
+  if (exact) return exact;
+  // Global single-flight: block second seller while any capture is active.
+  return rows[0];
+}
+
 export async function createLiveCapture(
   sql: Sql,
   env: AppEnv,
@@ -538,6 +597,44 @@ export async function createLiveCapture(
     displayName?: string;
     notes?: string;
     /** Empty/0 = entire live until it ends. */
+    maxDurationMinutes?: number | null;
+  },
+) {
+  const run = createLiveCaptureTail.then(() =>
+    createLiveCaptureLocked(sql, env, opts),
+  );
+  createLiveCaptureTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+async function createLiveCaptureLocked(
+  sql: Sql,
+  env: AppEnv,
+  opts: {
+    input: string;
+    displayName?: string;
+    notes?: string;
+    maxDurationMinutes?: number | null;
+  },
+) {
+  await sql`SELECT pg_advisory_lock(${CREATE_LIVE_CAPTURE_LOCK})`;
+  try {
+    return await createLiveCaptureBody(sql, env, opts);
+  } finally {
+    await sql`SELECT pg_advisory_unlock(${CREATE_LIVE_CAPTURE_LOCK})`;
+  }
+}
+
+async function createLiveCaptureBody(
+  sql: Sql,
+  env: AppEnv,
+  opts: {
+    input: string;
+    displayName?: string;
+    notes?: string;
     maxDurationMinutes?: number | null;
   },
 ) {
@@ -563,19 +660,11 @@ export async function createLiveCapture(
     );
   }
 
-  // Hard dedupe: never start a second capture for the same seller or broadcast
-  // (manual double-click / auto-follow race). Return the healthy in-flight one.
+  // Hard dedupe: at most ONE active capture globally (any seller), plus
+  // same-username / same-broadcast reuse. Concurrent POST / auto-follow safe
+  // under advisory + in-process lock above.
   const wantBid = extractBroadcastIdFromUrl(parsed.watchUrl);
-  const activeDup = await sql<{
-    recording_id: string;
-    username: string;
-    watch_url: string | null;
-    source_url: string | null;
-    capture_status: string | null;
-    max_duration_minutes: number | null;
-    last_probe_detail: string | null;
-    capture_error: string | null;
-  }[]>`
+  const activeDup = await sql<ActiveCaptureDupRow[]>`
     SELECT lc.recording_id, s.instagram_username AS username,
            lc.watch_url, r.source_url, r.capture_status,
            lc.max_duration_minutes, lc.last_probe_detail, r.capture_error
@@ -585,35 +674,39 @@ export async function createLiveCapture(
     WHERE lc.status IN ('pending', 'waiting', 'recording', 'finalizing')
        OR r.capture_status IN ('bekleniyor', 'kaydediliyor')
        OR r.status IN ('awaiting_live', 'recording')
+    ORDER BY
+      CASE WHEN r.capture_status = 'kaydediliyor' THEN 0
+           WHEN lc.status = 'recording' THEN 0
+           ELSE 1 END,
+      lc.created_at ASC
   `;
   const usernameLc = parsed.username.toLowerCase();
-  const hit = activeDup.find((row) => {
-    const u = String(row.username || "").toLowerCase();
-    if (u === usernameLc) return true;
-    if (!wantBid) return false;
-    const bid =
-      extractBroadcastIdFromUrl(row.watch_url || "") ||
-      extractBroadcastIdFromUrl(row.source_url || "");
-    return bid != null && bid === wantBid;
-  });
+  const hit = findActiveCaptureConflict(activeDup, usernameLc, wantBid);
   if (hit) {
+    const hitUser = String(hit.username || "").toLowerCase();
+    const sameSeller = hitUser === usernameLc;
     console.warn(
-      `[live-capture] dedupe reuse ${hit.recording_id} for @${parsed.username}` +
-        (wantBid ? ` bid=${wantBid}` : ""),
+      `[live-capture] dedupe reuse ${hit.recording_id} (@${hitUser || "?"})` +
+        ` for request @${parsed.username}` +
+        (wantBid ? ` bid=${wantBid}` : "") +
+        (sameSeller ? "" : " [global-single]"),
     );
+    const detail = sameSeller
+      ? hit.last_probe_detail ||
+        "Aynı kullanıcı/broadcast zaten kaydediliyor — yeni kayıt açılmadı."
+      : `Başka bir kayıt zaten sürüyor (@${hitUser || "?"}) — aynı anda tek canlı kayıt. Yeni kayıt açılmadı.`;
     return {
       recordingId: hit.recording_id,
       username: String(hit.username || parsed.username),
       watchUrl: hit.watch_url || parsed.watchUrl,
       captureStatus: hit.capture_status || "kaydediliyor",
       lastError: hit.capture_error,
-      lastProbeDetail:
-        hit.last_probe_detail ||
-        "Aynı kullanıcı/broadcast zaten kaydediliyor — yeni kayıt açılmadı.",
+      lastProbeDetail: detail,
       maxDurationMinutes: hit.max_duration_minutes,
       quality: CAPTURE_QUALITY,
       policy: LIVE_CAPTURE_POLICY,
       deduped: true as const,
+      globalSingle: !sameSeller,
     };
   }
 
