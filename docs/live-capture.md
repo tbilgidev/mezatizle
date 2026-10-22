@@ -52,7 +52,7 @@ See also: `docs/ready-for-10min-test.md` (operator checklist + smoke timings).
 
 ## Auto-follow lives (watcher following list)
 
-When **Ayarlar → Takip canlıları otomatik kaydet** is açık, the API polls the watcher IG following tray every **~5–6 minutes** (jitter) and starts the same live pipeline for a followed account that goes live — at most one concurrent auto recording; the IG scan pauses while any capture is `bekleniyor` / `kaydediliyor`. Manual **Canlı yayın ekle** still works. See Funnel settings `#auto-follow-live` and project store doc `auto-follow-live.md`. Env: `AUTO_FOLLOW_LIVE`, `AUTO_FOLLOW_LIVE_POLL_MS`.
+When **Ayarlar → Takip canlıları otomatik kaydet** is açık, the API prefers `reels_tray` every **~5–6 minutes** (jitter), then rotates ban-safe profile probes across the **full persisted following list** (not a hardcoded priority subset) so every followed seller is covered within one sweep window — at most one concurrent auto recording; the IG scan pauses while any capture is `bekleniyor` / `kaydediliyor`. Settings shows following count + last full sweep. Manual **Canlı yayın ekle** still works. See Funnel settings `#auto-follow-live` and project store doc `auto-follow-live.md`. Env: `AUTO_FOLLOW_LIVE`, `AUTO_FOLLOW_LIVE_POLL_MS`, `AUTO_FOLLOW_PROBE_BATCH`.
 
 ## Screenshots
 
