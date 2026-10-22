@@ -34,9 +34,14 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
              lc.last_probe_at, lc.last_probe_detail AS last_error,
              lc.comments_warning,
              (SELECT COUNT(*)::int FROM observed_comments oc
-               WHERE oc.recording_id = r.id AND oc.source = 'live_api') AS live_comment_count,
+               WHERE oc.recording_id = r.id
+                 AND oc.source IN ('live_api', 'live_dom')) AS live_comment_count,
              (SELECT COUNT(*)::int FROM observed_comments oc
-               WHERE oc.recording_id = r.id) AS comment_count
+               WHERE oc.recording_id = r.id) AS comment_count,
+             (SELECT EXTRACT(EPOCH FROM (now() - MAX(coalesce(oc.observed_at, oc.created_at))))::int
+               FROM observed_comments oc
+               WHERE oc.recording_id = r.id
+                 AND oc.source IN ('live_api', 'live_dom')) AS last_comment_age_sec
       FROM recordings r
       JOIN sellers s ON s.id = r.seller_id
       LEFT JOIN live_captures lc ON lc.recording_id = r.id

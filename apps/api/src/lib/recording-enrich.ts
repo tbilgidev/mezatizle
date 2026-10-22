@@ -232,6 +232,11 @@ export async function enrichRecordingRow(
   const commentCount = Number(row.comment_count ?? liveCommentCount);
   const captureStatus = String(row.capture_status ?? "");
   const isLive = String(row.source_type) === "live";
+  const lastCommentAgeSecRaw = row.last_comment_age_sec;
+  const lastCommentAgeSec =
+    lastCommentAgeSecRaw != null && Number.isFinite(Number(lastCommentAgeSecRaw))
+      ? Math.max(0, Number(lastCommentAgeSecRaw))
+      : null;
   // Prefer DB drought flag; for finished lives with 0 comments always surface.
   const commentsWarning =
     row.comments_warning != null && String(row.comments_warning).trim()
@@ -255,8 +260,11 @@ export async function enrichRecordingRow(
     analysisStage,
     liveCommentCount,
     commentCount,
+    lastCommentAgeSec,
     commentsWarning,
-    commentsMissing: Boolean(commentsWarning),
+    commentsMissing: Boolean(
+      commentsWarning && /yorum yok/i.test(commentsWarning),
+    ),
     mediaPurged,
     mediaAvailable: !mediaPurged && fileSizeBytes >= 64_000,
     mediaPurgedAt: mediaPurged

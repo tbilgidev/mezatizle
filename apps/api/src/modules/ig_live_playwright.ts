@@ -7,6 +7,16 @@
 import { access, readFile } from "node:fs/promises";
 import type { AppEnv } from "../lib/env.ts";
 import { resolveCookiesPath, setIgSessionCookieUsername } from "./ig_session.ts";
+import {
+  COMMENT_CATCHUP_EVERY_MS,
+  COMMENT_SOFT_REFRESH_COOLDOWN_MIN,
+  catchupCommentTs,
+  isCommentFreeze,
+  nextApiPollDelayMs,
+  nextCommentBackoffMs,
+  nextDomScrapeDelayMs,
+  ratePolicySummaryTr,
+} from "./live_comment_capture.ts";
 
 export type LiveResolveOk = {
   ok: true;
@@ -542,6 +552,11 @@ export type LiveViewerPresenceHealth = {
   lastCommentPollDetail: string;
   commentHitTotal: number;
   commentPollCount: number;
+  /** Wall clock of last newly-accepted comment (API or DOM). */
+  lastCommentHitAt: number;
+  domScrapeCount: number;
+  apiBackoffUntil: number;
+  softRefreshCount: number;
   /**
    * True when IG heartbeat says the broadcast is no longer active
    * (or returns 400/404). Capture supervisor should finalize promptly.
@@ -597,8 +612,10 @@ export function getLiveViewerPresenceHealth() {
         startedAt: s.startedAt,
         commentHitTotal: h.commentHitTotal,
         commentPollCount: h.commentPollCount,
+        lastCommentHitAt: h.lastCommentHitAt,
         lastCommentPollDetail: h.lastCommentPollDetail,
         lastHeartbeatOk: h.lastHeartbeatOk,
+        softRefreshCount: h.softRefreshCount,
       };
     }),
   };
@@ -651,6 +668,8 @@ export type LiveCommentHit = {
   text: string;
   createdAtMs: number | null;
   pk: string | null;
+  /** Capture channel — used for persist source + diagnostics. */
+  channel?: "live_api" | "live_dom";
 };
 
 /**
@@ -774,77 +793,187 @@ export async function startLiveViewerPresence(
   let cookieUsername: string | null = null;
   let stopped = false;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  let commentTimer: ReturnType<typeof setInterval> | null = null;
+  let commentTimer: ReturnType<typeof setTimeout> | null = null;
+  let domTimer: ReturnType<typeof setTimeout> | null = null;
   let lastHeartbeatOk = false;
   let lastHeartbeatDetail = "starting";
   let lastHeartbeatAt = Date.now();
   let lastCommentTs = 0;
   const seenCommentPks = new Set<string>();
+  const seenFingerprints = new Set<string>();
   let commentPollCount = 0;
   let commentHitTotal = 0;
+  let domScrapeCount = 0;
+  let softRefreshCount = 0;
+  let lastSoftRefreshAt = 0;
+  let lastCatchupAt = 0;
   let lastCommentPollDetail = "not_started";
   let lastCommentPollAt = 0;
+  let lastCommentHitAt = Date.now();
+  let apiBackoffUntil = 0;
+  let apiBackoffMs = 0;
+  let pendingCatchup = false;
+  let pageActionChain: Promise<void> = Promise.resolve();
+  const sessionStartedAt = Date.now();
+  let broadcastEnded = false;
+  let broadcastStatus: string | null = null;
+  let endedStreak = 0;
 
-  const pollCommentsOnce = async () => {
+  /** Serialize Playwright page actions — single viewer, never pile up. */
+  const withPageLock = <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = pageActionChain.then(fn, fn);
+    pageActionChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+
+  const acceptHits = async (hits: LiveCommentHit[]) => {
+    if (!hits.length || !opts.onComments) return 0;
+    const fresh: LiveCommentHit[] = [];
+    for (const h of hits) {
+      if (h.pk) {
+        if (seenCommentPks.has(h.pk)) continue;
+        seenCommentPks.add(h.pk);
+      } else {
+        const fp = `${(h.username ?? "").toLowerCase()}|${h.text.trim().toLowerCase()}|${
+          h.createdAtMs != null ? Math.floor(h.createdAtMs / 5000) : "na"
+        }`;
+        if (seenFingerprints.has(fp)) continue;
+        seenFingerprints.add(fp);
+      }
+      fresh.push(h);
+    }
+    if (!fresh.length) return 0;
+    commentHitTotal += fresh.length;
+    lastCommentHitAt = Date.now();
+    await opts.onComments(fresh);
+    return fresh.length;
+  };
+
+  const softRefreshViewer = async (why: string) => {
+    if (stopped) return;
+    const cooldownMs = COMMENT_SOFT_REFRESH_COOLDOWN_MIN * 60_000;
+    if (Date.now() - lastSoftRefreshAt < cooldownMs) return;
+    lastSoftRefreshAt = Date.now();
+    softRefreshCount += 1;
+    console.warn(
+      `[live-comments] ${opts.recordingId} soft-refresh #${softRefreshCount}: ${why} (ffmpeg untouched)`,
+    );
+    await withPageLock(async () => {
+      const liveUrl = `https://www.instagram.com/${username}/live/?broadcast_id=${broadcastId}`;
+      try {
+        const nav = await page.goto(liveUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 30_000,
+        });
+        if (nav && nav.status() === 429) {
+          apiBackoffMs = nextCommentBackoffMs(apiBackoffMs);
+          apiBackoffUntil = Date.now() + apiBackoffMs;
+          lastCommentPollDetail = `soft_refresh_429 backoff=${apiBackoffMs}`;
+          await page
+            .goto("https://www.instagram.com/", {
+              waitUntil: "domcontentloaded",
+              timeout: 30_000,
+            })
+            .catch(() => undefined);
+          return;
+        }
+        await page.waitForTimeout(1500);
+      } catch (err) {
+        lastCommentPollDetail = `soft_refresh_err ${
+          err instanceof Error ? err.message.slice(0, 80) : String(err)
+        }`;
+      }
+      // Rewind cursor so next API poll re-walks a recent window
+      const nowSec = Math.floor(Date.now() / 1000);
+      lastCommentTs = catchupCommentTs(lastCommentTs, nowSec);
+      lastCatchupAt = Date.now();
+    });
+  };
+
+  const pollCommentsOnce = async (mode: "normal" | "catchup" = "normal") => {
     if (stopped || !opts.onComments) return;
+    if (Date.now() < apiBackoffUntil) {
+      lastCommentPollAt = Date.now();
+      lastCommentPollDetail = `backoff_until=${apiBackoffUntil}`;
+      return;
+    }
     commentPollCount += 1;
     lastCommentPollAt = Date.now();
+    let pollTs = lastCommentTs;
+    if (mode === "catchup") {
+      pollTs = catchupCommentTs(lastCommentTs, Math.floor(Date.now() / 1000));
+      lastCatchupAt = Date.now();
+    }
     try {
-      const r = await page.evaluate(
-        async ({ broadcastId, lastCommentTs }) => {
-          const csrf =
-            document.cookie
-              .split(";")
-              .map((s) => s.trim())
-              .find((s) => s.startsWith("csrftoken="))
-              ?.split("=")[1] || "";
-          const url =
-            `https://www.instagram.com/api/v1/live/${broadcastId}/get_comment/` +
-            `?last_comment_ts=${lastCommentTs || 0}`;
-          const res = await fetch(url, {
-            credentials: "include",
-            headers: {
-              "X-IG-App-ID": "936619743392459",
-              "X-Requested-With": "XMLHttpRequest",
-              "X-CSRFToken": csrf,
-              Accept: "*/*",
-            },
-          });
-          const text = await res.text();
-          let comments: Array<{
-            pk?: string | number;
-            user?: { username?: string };
-            text?: string;
-            created_at?: number;
-            created_time?: number;
-          }> = [];
-          let nextTs = lastCommentTs;
-          let message = "";
-          try {
-            const j = JSON.parse(text) as {
-              comments?: typeof comments;
-              last_comment_ts?: number;
-              message?: string;
+      const r = await withPageLock(() =>
+        page.evaluate(
+          async ({ broadcastId, lastCommentTs }) => {
+            const csrf =
+              document.cookie
+                .split(";")
+                .map((s) => s.trim())
+                .find((s) => s.startsWith("csrftoken="))
+                ?.split("=")[1] || "";
+            const url =
+              `https://www.instagram.com/api/v1/live/${broadcastId}/get_comment/` +
+              `?last_comment_ts=${lastCommentTs || 0}`;
+            const res = await fetch(url, {
+              credentials: "include",
+              headers: {
+                "X-IG-App-ID": "936619743392459",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-CSRFToken": csrf,
+                Accept: "*/*",
+              },
+            });
+            const text = await res.text();
+            let comments: Array<{
+              pk?: string | number;
+              user?: { username?: string };
+              text?: string;
+              created_at?: number;
+              created_time?: number;
+            }> = [];
+            let nextTs = lastCommentTs;
+            let message = "";
+            try {
+              const j = JSON.parse(text) as {
+                comments?: typeof comments;
+                last_comment_ts?: number;
+                message?: string;
+              };
+              comments = Array.isArray(j.comments) ? j.comments : [];
+              if (typeof j.last_comment_ts === "number")
+                nextTs = j.last_comment_ts;
+              message = String(j.message || "");
+            } catch {
+              message = "non_json";
+            }
+            return {
+              status: res.status,
+              comments,
+              nextTs,
+              message,
+              raw: text.slice(0, 120),
             };
-            comments = Array.isArray(j.comments) ? j.comments : [];
-            if (typeof j.last_comment_ts === "number") nextTs = j.last_comment_ts;
-            message = String(j.message || "");
-          } catch {
-            message = "non_json";
-          }
-          return {
-            status: res.status,
-            comments,
-            nextTs,
-            message,
-            raw: text.slice(0, 120),
-          };
-        },
-        { broadcastId: broadcastId!, lastCommentTs },
+          },
+          { broadcastId: broadcastId!, lastCommentTs: pollTs },
+        ),
       );
+      if (r.status === 429 || /challenge|checkpoint|rate.?limit/i.test(r.message)) {
+        apiBackoffMs = nextCommentBackoffMs(apiBackoffMs);
+        apiBackoffUntil = Date.now() + apiBackoffMs;
+        lastCommentPollDetail = `http_${r.status} backoff=${apiBackoffMs}ms ${r.message.slice(0, 40)}`;
+        console.warn(
+          `[live-comments] ${opts.recordingId} rate-limit → backoff ${apiBackoffMs}ms`,
+        );
+        return;
+      }
       if (r.status !== 200) {
         lastCommentPollDetail = `http_${r.status}${r.message ? ` ${r.message.slice(0, 60)}` : ""}`;
-        // Log first failure + every ~60s (12 polls @ 5s)
         if (commentPollCount === 1 || commentPollCount % 12 === 0) {
           console.warn(
             `[live-comments] ${opts.recordingId} poll#${commentPollCount} ${lastCommentPollDetail}`,
@@ -852,12 +981,14 @@ export async function startLiveViewerPresence(
         }
         return;
       }
-      lastCommentTs = r.nextTs || lastCommentTs;
+      // Success clears backoff ladder
+      apiBackoffMs = 0;
+      apiBackoffUntil = 0;
+      // Advance cursor to the max of prior / response (catch-up must not regress forever)
+      lastCommentTs = Math.max(lastCommentTs, r.nextTs || 0, pollTs);
       const hits: LiveCommentHit[] = [];
       for (const c of r.comments) {
         const pk = c.pk != null ? String(c.pk) : null;
-        if (pk && seenCommentPks.has(pk)) continue;
-        if (pk) seenCommentPks.add(pk);
         const text = String(c.text ?? "").trim();
         if (text.length < 1) continue;
         const username =
@@ -874,16 +1005,33 @@ export async function startLiveViewerPresence(
                 ? c.created_time * 1000
                 : null,
           pk,
+          channel: "live_api",
         });
       }
-      lastCommentPollDetail = `ok batch=${hits.length} total=${commentHitTotal + hits.length} ts=${lastCommentTs}`;
-      if (hits.length) {
-        commentHitTotal += hits.length;
-        await opts.onComments(hits);
-      } else if (commentPollCount === 1 || commentPollCount % 24 === 0) {
+      const n = await acceptHits(hits);
+      lastCommentPollDetail = `ok mode=${mode} batch=${n}/${hits.length} total=${commentHitTotal} ts=${lastCommentTs}`;
+      if (!n && (commentPollCount === 1 || commentPollCount % 24 === 0)) {
         console.log(
           `[live-comments] ${opts.recordingId} poll#${commentPollCount} empty (waiting for followers)`,
         );
+      }
+
+      // Freeze while live → soft refresh (no new browser, ffmpeg untouched)
+      if (
+        lastHeartbeatOk &&
+        !broadcastEnded &&
+        isCommentFreeze(lastCommentHitAt, Date.now(), {
+          sessionStartedAt,
+        })
+      ) {
+        await softRefreshViewer("freeze_0_new_while_live");
+        pendingCatchup = true;
+      } else if (
+        Date.now() - lastCatchupAt >= COMMENT_CATCHUP_EVERY_MS &&
+        lastHeartbeatOk
+      ) {
+        // Periodic recent-window re-walk on next tick (dedupe absorbs overlaps)
+        pendingCatchup = true;
       }
     } catch (err) {
       lastCommentPollDetail =
@@ -892,12 +1040,116 @@ export async function startLiveViewerPresence(
         `[live-comments] ${opts.recordingId}:`,
         lastCommentPollDetail,
       );
+      if (/Target page|browser has been closed/i.test(lastCommentPollDetail)) {
+        // Mark unhealthy so ensureLiveViewerPresence can restart later
+        lastCommentPollAt = Date.now() - 120_000;
+      }
     }
   };
 
-  let broadcastEnded = false;
-  let broadcastStatus: string | null = null;
-  let endedStreak = 0;
+  /** Secondary channel: scrape visible live comment list from the viewer DOM. */
+  const scrapeDomCommentsOnce = async () => {
+    if (stopped || !opts.onComments) return;
+    if (Date.now() < apiBackoffUntil) return;
+    domScrapeCount += 1;
+    try {
+      const rows = await withPageLock(() =>
+        page.evaluate(() => {
+          const out: Array<{ username: string | null; text: string }> = [];
+          const skip = new Set([
+            "reel",
+            "p",
+            "stories",
+            "explore",
+            "direct",
+            "accounts",
+            "about",
+            "legal",
+            "privacy",
+            "live",
+          ]);
+          const push = (username: string | null, text: string) => {
+            const t = text.trim().replace(/\s+/g, " ");
+            if (t.length < 1 || t.length > 500) return;
+            if (username && skip.has(username)) return;
+            // Drop chrome chrome / CTA noise
+            if (/^(follow|takip|like|beğen|share|paylaş)$/i.test(t)) return;
+            out.push({ username, text: t });
+          };
+          // Profile links near comment text (live chat list)
+          for (const a of Array.from(
+            document.querySelectorAll('a[href^="/"]'),
+          ).slice(0, 80)) {
+            const href = a.getAttribute("href") || "";
+            const m = href.match(/^\/([A-Za-z0-9._]{2,30})\/?$/);
+            if (!m) continue;
+            const username = m[1].toLowerCase();
+            if (skip.has(username)) continue;
+            const root =
+              a.closest('[role="listitem"], li, div') || a.parentElement;
+            if (!root) continue;
+            const raw = (root.textContent || "").replace(/\s+/g, " ").trim();
+            if (!raw) continue;
+            // Strip leading @username from blob
+            const stripped = raw
+              .replace(new RegExp(`^@?${username}\\s*`, "i"), "")
+              .trim();
+            if (stripped.length < 1) continue;
+            push(username, stripped.slice(0, 400));
+          }
+          // Dedupe within this scrape
+          const seen = new Set<string>();
+          return out.filter((r) => {
+            const k = `${r.username}|${r.text}`;
+            if (seen.has(k)) return false;
+            seen.add(k);
+            return true;
+          }).slice(0, 40);
+        }),
+      );
+      const hits: LiveCommentHit[] = rows.map((r) => ({
+        username: r.username,
+        text: r.text,
+        createdAtMs: Date.now(),
+        pk: null,
+        channel: "live_dom" as const,
+      }));
+      const n = await acceptHits(hits);
+      if (n > 0) {
+        console.log(
+          `[live-comments] ${opts.recordingId} dom +${n} (scrape#${domScrapeCount})`,
+        );
+      }
+    } catch (err) {
+      if (domScrapeCount === 1 || domScrapeCount % 10 === 0) {
+        console.warn(
+          `[live-comments] ${opts.recordingId} dom scrape:`,
+          err instanceof Error ? err.message.slice(0, 100) : err,
+        );
+      }
+    }
+  };
+
+  const scheduleApiPoll = () => {
+    if (stopped || !opts.onComments) return;
+    const delay = nextApiPollDelayMs({
+      rateLimited: Date.now() < apiBackoffUntil,
+      backoffMs: Math.max(0, apiBackoffUntil - Date.now()),
+    });
+    commentTimer = setTimeout(() => {
+      const mode = pendingCatchup ? "catchup" : "normal";
+      pendingCatchup = false;
+      void pollCommentsOnce(mode).finally(() => scheduleApiPoll());
+    }, delay);
+  };
+
+  const scheduleDomScrape = () => {
+    if (stopped || !opts.onComments) return;
+    const delay = nextDomScrapeDelayMs();
+    domTimer = setTimeout(() => {
+      void scrapeDomCommentsOnce().finally(() => scheduleDomScrape());
+    }, delay);
+  };
 
   const heartbeatOnce = async () => {
     if (stopped) return;
@@ -1039,10 +1291,15 @@ export async function startLiveViewerPresence(
       void heartbeatOnce();
     }, 12_000);
     if (opts.onComments) {
-      await pollCommentsOnce();
-      commentTimer = setInterval(() => {
-        void pollCommentsOnce();
-      }, 5_000);
+      console.log(
+        `[live-comments] ${opts.recordingId} policy: ${ratePolicySummaryTr()}`,
+      );
+      await pollCommentsOnce("normal");
+      scheduleApiPoll();
+      // DOM secondary starts after a short settle so we don't pile onto first nav
+      domTimer = setTimeout(() => {
+        void scrapeDomCommentsOnce().finally(() => scheduleDomScrape());
+      }, nextDomScrapeDelayMs());
     }
   } catch (err) {
     try {
@@ -1072,6 +1329,10 @@ export async function startLiveViewerPresence(
       lastCommentPollDetail,
       commentHitTotal,
       commentPollCount,
+      lastCommentHitAt,
+      domScrapeCount,
+      apiBackoffUntil,
+      softRefreshCount,
       broadcastEnded,
       broadcastStatus,
     }),
@@ -1080,8 +1341,10 @@ export async function startLiveViewerPresence(
       stopped = true;
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       heartbeatTimer = null;
-      if (commentTimer) clearInterval(commentTimer);
+      if (commentTimer) clearTimeout(commentTimer);
       commentTimer = null;
+      if (domTimer) clearTimeout(domTimer);
+      domTimer = null;
       viewerSessions.delete(opts.recordingId);
       try {
         await browser.close();
@@ -1089,7 +1352,7 @@ export async function startLiveViewerPresence(
         /* ignore */
       }
       console.log(
-        `[live-viewer] stopped ${opts.recordingId} last=${lastHeartbeatDetail} comments=${commentHitTotal}`,
+        `[live-viewer] stopped ${opts.recordingId} last=${lastHeartbeatDetail} comments=${commentHitTotal} softRefresh=${softRefreshCount} dom=${domScrapeCount}`,
       );
     },
   };

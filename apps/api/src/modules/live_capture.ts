@@ -43,6 +43,10 @@ import {
   commentsAssPath,
   COMMENT_DROUGHT_MINUTES,
 } from "./comment_burnin.ts";
+import {
+  COMMENT_FREEZE_MINUTES,
+  commentFingerprint,
+} from "./live_comment_capture.ts";
 import { access } from "node:fs/promises";
 import { resolve } from "node:path";
 
@@ -101,7 +105,7 @@ function attachViewerPresence(
     });
 }
 
-/** Persist live API comments (DASH video has no comment overlay for OCR). */
+/** Persist live comments from API and/or DOM (DASH has no comment overlay). */
 export async function persistLiveComments(
   sql: Sql,
   env: AppEnv,
@@ -134,13 +138,37 @@ export async function persistLiveComments(
     }
     const observedAt =
       h.createdAtMs != null ? new Date(h.createdAtMs) : new Date(now);
-    // Dedupe by IG comment pk when present
+    const source = h.channel === "live_dom" ? "live_dom" : "live_api";
+    const fp = commentFingerprint({
+      username: author,
+      text: body,
+      createdAtMs: h.createdAtMs ?? now,
+    });
+    // Dedupe by IG pk (any live_* source) OR fingerprint (user+text+~5s bucket)
     if (h.pk) {
       const [dup] = await sql<{ id: string }[]>`
         SELECT id FROM observed_comments
         WHERE recording_id = ${recordingId}
-          AND source = 'live_api'
+          AND source IN ('live_api', 'live_dom')
           AND raw_json->>'pk' = ${h.pk}
+        LIMIT 1
+      `;
+      if (dup) continue;
+    } else {
+      const [dup] = await sql<{ id: string }[]>`
+        SELECT id FROM observed_comments
+        WHERE recording_id = ${recordingId}
+          AND source IN ('live_api', 'live_dom')
+          AND (
+            raw_json->>'fp' = ${fp}
+            OR (
+              lower(coalesce(author_username, '')) = ${author ?? ""}
+              AND lower(body) = ${body.toLowerCase()}
+              AND offset_ms IS NOT NULL
+              AND ${offsetMs} IS NOT NULL
+              AND abs(offset_ms - ${offsetMs}) < 8000
+            )
+          )
         LIMIT 1
       `;
       if (dup) continue;
@@ -152,11 +180,13 @@ export async function persistLiveComments(
         ${recordingId},
         ${body},
         ${author},
-        ${"live_api"},
+        ${source},
         ${offsetMs},
         ${observedAt},
         ${sql.json({
           pk: h.pk,
+          fp,
+          channel: source,
           createdAtMs: h.createdAtMs,
           username: h.username,
         })}
@@ -178,7 +208,7 @@ export async function persistLiveComments(
     }
   }
   if (inserted) {
-    // Clear drought warning once comments flow
+    // Clear drought / freeze warning once comments flow
     try {
       await sql`
         UPDATE live_captures
@@ -1096,7 +1126,8 @@ async function forceCompleteStuckFinalize(
   }
   const [cCount] = await sql<{ n: string }[]>`
     SELECT COUNT(*)::text AS n FROM observed_comments
-    WHERE recording_id = ${recordingId} AND source = 'live_api'
+    WHERE recording_id = ${recordingId}
+      AND source IN ('live_api', 'live_dom')
   `;
   const liveApiN = Number(cCount?.n ?? 0);
   const probeDetail = `${syncDetail} · comments=${liveApiN} · ${why}`;
@@ -1767,14 +1798,15 @@ async function finalizeRecordingUnlocked(
   }
   const [cCount] = await sql<{ n: string }[]>`
     SELECT COUNT(*)::text AS n FROM observed_comments
-    WHERE recording_id = ${recordingId} AND source = 'live_api'
+    WHERE recording_id = ${recordingId}
+      AND source IN ('live_api', 'live_dom')
   `;
   const liveApiN = Number(cCount?.n ?? 0);
   const commentsWarning =
     liveApiN === 0 ? "Yorum yok" : null;
   if (liveApiN === 0) {
     console.error(
-      `[live-comments] ${recordingId} finalized with 0 live_api comments — cannot backfill after live ends`,
+      `[live-comments] ${recordingId} finalized with 0 live comments — cannot backfill after live ends`,
     );
   }
   const probeDetail = `${syncDetail} · comments=${liveApiN} · ${burnDetail}`;
@@ -1969,8 +2001,9 @@ export async function liveCaptureLoop(sql: Sql, env: AppEnv) {
 }
 
 /**
- * Loud warning when kaydediliyor for N+ minutes with 0 live_api comments.
- * Sets live_captures.comments_warning for UI "Yorum yok" badge.
+ * Loud warning when kaydediliyor for N+ minutes with 0 live comments,
+ * or when comments freeze (0 new for COMMENT_FREEZE_MINUTES while live).
+ * Sets live_captures.comments_warning for UI badges.
  */
 export async function warnCommentDroughtIfNeeded(
   sql: Sql,
@@ -1982,30 +2015,72 @@ export async function warnCommentDroughtIfNeeded(
   if (!Number.isFinite(startedMs)) return false;
   const elapsedMin = (Date.now() - startedMs) / 60_000;
   if (elapsedMin < COMMENT_DROUGHT_MINUTES) return false;
-  const [row] = await sql<{ n: string }[]>`
-    SELECT COUNT(*)::text AS n FROM observed_comments
-    WHERE recording_id = ${recordingId} AND source = 'live_api'
+
+  const [row] = await sql<{ n: string; last_at: Date | string | null }[]>`
+    SELECT COUNT(*)::text AS n,
+           MAX(coalesce(observed_at, created_at)) AS last_at
+    FROM observed_comments
+    WHERE recording_id = ${recordingId}
+      AND source IN ('live_api', 'live_dom')
   `;
   const n = Number(row?.n ?? 0);
-  if (n > 0) return false;
-  const msg = `Yorum yok — ${Math.floor(elapsedMin)}dk kaydediliyor, live_api=0 (viewer/poll kontrol et)`;
-  console.error(`[live-comments] DROUGHT ${recordingId}: ${msg}`);
-  try {
-    await sql`
-      UPDATE live_captures
-      SET comments_warning = ${"Yorum yok"},
-          last_probe_detail = ${msg},
-          updated_at = now()
-      WHERE recording_id = ${recordingId}
-        AND status IN ('recording', 'finalizing')
-    `;
-  } catch (err) {
-    console.warn(
-      `[live-comments] drought update failed:`,
-      err instanceof Error ? err.message : err,
-    );
+  const viewer = getLiveViewerSession(recordingId)?.getHealth();
+  const lastHitAt =
+    viewer?.lastCommentHitAt ??
+    (row?.last_at ? new Date(row.last_at).getTime() : null);
+
+  if (n === 0) {
+    const msg = `Yorum yok — ${Math.floor(elapsedMin)}dk kaydediliyor, live=0 (viewer/poll kontrol et)`;
+    console.error(`[live-comments] DROUGHT ${recordingId}: ${msg}`);
+    try {
+      await sql`
+        UPDATE live_captures
+        SET comments_warning = ${"Yorum yok"},
+            last_probe_detail = ${msg},
+            updated_at = now()
+        WHERE recording_id = ${recordingId}
+          AND status IN ('recording', 'finalizing')
+      `;
+    } catch (err) {
+      console.warn(
+        `[live-comments] drought update failed:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+    return true;
   }
-  return true;
+
+  // Tighten: comments existed but froze while still live
+  if (
+    lastHitAt != null &&
+    Number.isFinite(lastHitAt) &&
+    (Date.now() - lastHitAt) / 60_000 >= COMMENT_FREEZE_MINUTES &&
+    viewer &&
+    viewer.lastHeartbeatOk &&
+    !viewer.broadcastEnded
+  ) {
+    const ageMin = Math.floor((Date.now() - lastHitAt) / 60_000);
+    const warn = `Yorum durgun — son yorum ${ageMin}dk önce (${n} toplam)`;
+    console.warn(`[live-comments] FREEZE ${recordingId}: ${warn}`);
+    try {
+      await sql`
+        UPDATE live_captures
+        SET comments_warning = ${warn},
+            last_probe_detail = ${warn},
+            updated_at = now()
+        WHERE recording_id = ${recordingId}
+          AND status IN ('recording', 'finalizing')
+      `;
+    } catch (err) {
+      console.warn(
+        `[live-comments] freeze warn failed:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+    return true;
+  }
+
+  return false;
 }
 
 async function tickRecordingWatchdogs(

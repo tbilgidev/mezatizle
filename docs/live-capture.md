@@ -31,7 +31,7 @@ Pipeline: Playwright/yt-dlp resolve → **ffmpeg** encode (fragmented part) → 
 
 Override via env: `LIVE_MAX_HEIGHT`, `LIVE_FPS`, `LIVE_CRF`, `LIVE_MAXRATE_K`, `LIVE_AUDIO_K`, `LIVE_YTDLP_FORMAT`.
 
-**Comments (required):** Playwright viewer polls `get_comment` ~5s for the full capture → `observed_comments` (`live_api`), `offset_ms = comment_wall_ms − capture_started_at`. Same cues → ASS sidecar → finalize **burn-in HUD** on the master MP4 (Video open). If 0 comments after ~2 min kaydediliyor → log + UI **Yorum yok**. Ended lives cannot be backfilled. Watchdog must **not** restart a healthy viewer (that bug zeroed Yeşilköy comments).
+**Comments (required, ban-safe):** Single Playwright viewer — primary `get_comment` poll **3–5s jitter**, secondary DOM scrape **8–15s**, merge by pk / fingerprint into `observed_comments` (`live_api` + `live_dom`). Periodic ~120s cursor catch-up; freeze (0 new ~3 min while live) → soft page refresh **without** killing ffmpeg. On 429 → exponential backoff up to ~12 min. UI: count + last-comment age while kaydediliyor; drought **Yorum yok** / freeze **Yorum durgun**. Ended lives cannot be backfilled. See `docs/live-comments-dual-capture.md` and project store `comment-capture-completeness.md`.
 
 ## Analysis (LOCAL, no mocks)
 

@@ -37,3 +37,16 @@ Supervisor `tickRecordingWatchdogs` called `startLiveViewerPresence` **every ~20
 3. Report still uses `observed_comments` for analysis (burn-in is human QC only).
 
 Env: `LIVE_COMMENT_DROUGHT_MIN` (default `2`).
+
+## Completeness v2 (ban-safe — 2026-10)
+
+| Lever | Behavior |
+|-------|----------|
+| API poll | **3–5s jitter** (not fixed 5s / not sub-second) |
+| DOM scrape | Same viewer page, **8–15s jitter** → `live_dom`, merged with API |
+| Catch-up | ~90s: rewind `last_comment_ts` ~120s; dedupe absorbs overlap |
+| Freeze | 0 new ~3 min while heartbeat live → soft refresh (ffmpeg untouched) |
+| 429 | Backoff 30s → ≤12 min (auto-follow spirit) |
+| UI | `N yorum · age` while kaydediliyor; **Yorum durgun** on freeze |
+
+Honest limit: IG may not expose every on-screen comment. We maximize catch rate within polite limits — see store doc `comment-capture-completeness.md`.

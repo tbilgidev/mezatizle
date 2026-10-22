@@ -572,26 +572,73 @@ export function RecordingsPage() {
                         <TD>
                           <div className="flex flex-wrap items-center gap-1.5">
                             {statusBadge(r)}
-                            {r.commentsMissing || r.commentsWarning || r.comments_warning ? (
-                              <Badge
-                                variant="danger"
-                                title={String(
-                                  r.commentsWarning ??
-                                    r.comments_warning ??
-                                    "Canlı API yorumu yok — analiz/QC için yorum şart",
-                                )}
-                              >
-                                Yorum yok
-                              </Badge>
-                            ) : Number(r.liveCommentCount ?? r.live_comment_count ?? 0) >
-                              0 ? (
-                              <Badge
-                                variant="ok"
-                                title={`live_api yorum: ${Number(r.liveCommentCount ?? r.live_comment_count)}`}
-                              >
-                                {Number(r.liveCommentCount ?? r.live_comment_count)} yorum
-                              </Badge>
-                            ) : null}
+                            {(() => {
+                              const warn = String(
+                                r.commentsWarning ??
+                                  r.comments_warning ??
+                                  "",
+                              ).trim();
+                              const n = Number(
+                                r.liveCommentCount ?? r.live_comment_count ?? 0,
+                              );
+                              const ageSec =
+                                r.lastCommentAgeSec != null
+                                  ? Number(r.lastCommentAgeSec)
+                                  : r.last_comment_age_sec != null
+                                    ? Number(r.last_comment_age_sec)
+                                    : null;
+                              const ageLabel =
+                                ageSec != null && Number.isFinite(ageSec)
+                                  ? ageSec < 60
+                                    ? `${ageSec}sn önce`
+                                    : `${Math.floor(ageSec / 60)}dk önce`
+                                  : null;
+                              const isKaydediliyor =
+                                String(r.capture_status ?? "") ===
+                                "kaydediliyor";
+                              if (warn && /yorum yok/i.test(warn) && n === 0) {
+                                return (
+                                  <Badge
+                                    variant="danger"
+                                    title={
+                                      warn ||
+                                      "Canlı yorum yok — analiz/QC için yorum şart"
+                                    }
+                                  >
+                                    Yorum yok
+                                  </Badge>
+                                );
+                              }
+                              if (warn && /durgun/i.test(warn)) {
+                                return (
+                                  <Badge variant="warn" title={warn}>
+                                    Yorum durgun
+                                    {ageLabel ? ` · ${ageLabel}` : ""}
+                                  </Badge>
+                                );
+                              }
+                              if (n > 0) {
+                                return (
+                                  <Badge
+                                    variant="ok"
+                                    title={`Canlı yorum: ${n}${ageLabel ? ` · son ${ageLabel}` : ""}`}
+                                  >
+                                    {n} yorum
+                                    {isKaydediliyor && ageLabel
+                                      ? ` · ${ageLabel}`
+                                      : ""}
+                                  </Badge>
+                                );
+                              }
+                              if (warn) {
+                                return (
+                                  <Badge variant="danger" title={warn}>
+                                    Yorum yok
+                                  </Badge>
+                                );
+                              }
+                              return null;
+                            })()}
                           </div>
                         </TD>
                         <TD>
