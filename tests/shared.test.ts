@@ -18,6 +18,7 @@ import {
   reconcileMezatWindows,
   buildProductLots,
   summarizeOfferWindows,
+  isDualAldimClaimText,
   resolveProfile,
   SALE_MIN_CONFIDENCE,
   type TimelineEvent,
@@ -350,17 +351,22 @@ describe("mezat window reconcile", () => {
       }),
       ev({
         id: "next",
-        offsetMs: 30000,
+        // Within ALDIM_PRE_ASK_MS of the orphaned second claim (5s → 18s).
+        offsetMs: 18_000,
         eventType: "price_mention",
         matched: "aldım 5000 lira",
         amountTry: 5000,
         reason: "seller_aldim_ask",
       }),
     ]);
-    expect(sales.length).toBe(1);
-    expect(sales[0]!.buyerUsername).toBe("ayse_demo");
-    expect(sales[0]!.amountTry).toBe(20000);
-    expect(sales[0]!.saleMethod).toBe("aldim_first_comment");
+    // First claimer wins the open ask; second aldım orphans onto the next ask.
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBe(2);
+    expect(confirmed[0]!.buyerUsername).toBe("ayse_demo");
+    expect(confirmed[0]!.amountTry).toBe(20000);
+    expect(confirmed[0]!.saleMethod).toBe("aldim_first_comment");
+    expect(confirmed[1]!.buyerUsername).toBe("late_bidder");
+    expect(confirmed[1]!.amountTry).toBe(5000);
   });
 
   test("late follower aldım (minutes after ask) still claims open lot", () => {
@@ -440,6 +446,138 @@ describe("mezat window reconcile", () => {
     expect(sales[0]!.buyerUsername).toBe("aylinbakay");
     expect(sales[0]!.amountTry).toBe(2200);
     expect(sales[0]!.askAmountTry).toBe(2200);
+  });
+
+  test("glam: product-cued elimdeki / bu da open distinct lots (recall)", () => {
+    const lots = summarizeOfferWindows([
+      ev({
+        id: "a1",
+        offsetMs: 569_000,
+        eventType: "price_mention",
+        matched: "2200 TL bu da.",
+        amountTry: 2200,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "a2",
+        offsetMs: 614_000,
+        eventType: "price_mention",
+        matched: "Bu elimdeki 2400 TL.",
+        amountTry: 2400,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "a3",
+        offsetMs: 769_000,
+        eventType: "price_mention",
+        matched: "Bu elimdeki 2000 TL.",
+        amountTry: 2000,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "a4",
+        offsetMs: 2_252_000,
+        eventType: "price_mention",
+        matched: "bunun fiyatı 2500 TL'ymiş",
+        amountTry: 2500,
+        reason: "price_mention",
+      }),
+      ev({
+        id: "a5",
+        offsetMs: 2_366_000,
+        eventType: "price_mention",
+        matched: "2000 TL'ymiş",
+        amountTry: 2000,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "a6",
+        offsetMs: 2_450_000,
+        eventType: "price_mention",
+        matched: "bu da 2500 TL",
+        amountTry: 2500,
+        reason: "seller_price_line",
+      }),
+    ]);
+    // 2200 / 2400 elimdeki / 2000 elimdeki / 2500 fiyat / 2000 / 2500 bu da
+    expect(lots.productsOffered).toBeGreaterThanOrEqual(5);
+    expect(lots.lots.map((l) => l.openingAskTry)).toEqual(
+      expect.arrayContaining([2200, 2400, 2000, 2500]),
+    );
+  });
+
+  test("glam: dual claim sum → needs_review second item (not silent 0)", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 2_366_000,
+        eventType: "price_mention",
+        matched: "2000 TL'ymiş",
+        amountTry: 2000,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "c1",
+        offsetMs: 2_366_644,
+        eventType: "bid",
+        matched: "Aldim",
+        buyerHint: "gnshsgl",
+        reason: "aldim_claim",
+        source: "comment",
+      }),
+      ev({
+        id: "c2",
+        offsetMs: 2_445_644,
+        eventType: "bid",
+        matched: "İkisini de aldim",
+        buyerHint: "gnshsgl",
+        reason: "aldim_claim",
+        source: "comment",
+      }),
+      ev({
+        id: "ask2",
+        offsetMs: 2_450_670,
+        eventType: "price_mention",
+        matched: "bu da 2500 TL",
+        amountTry: 2500,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "sum",
+        offsetMs: 2_475_644,
+        eventType: "bid",
+        matched: "2000+ 2500 = 4500",
+        buyerHint: "gnshsgl",
+        reason: "bid_phrase",
+        source: "comment",
+        amountTry: 9000,
+      }),
+      ev({
+        id: "vw",
+        offsetMs: 2_475_630,
+        eventType: "sold",
+        matched: "ikisi de sizin olacak",
+        reason: "verbal_win_bare",
+        confidence: 0.62,
+      }),
+    ]);
+    const confirmed = sales.filter((s) => !s.needsReview);
+    const review = sales.filter((s) => s.needsReview);
+    expect(confirmed.length).toBeGreaterThanOrEqual(1);
+    expect(confirmed.some((s) => s.buyerUsername === "gnshsgl" && s.amountTry === 2000)).toBe(
+      true,
+    );
+    expect(review.length).toBeGreaterThanOrEqual(1);
+    expect(
+      review.some(
+        (s) => s.buyerUsername === "gnshsgl" && s.amountTry === 2500,
+      ),
+    ).toBe(true);
+  });
+
+  test("İkisini de aldım folds Turkish İ", () => {
+    expect(isDualAldimClaimText("İkisini de aldim")).toBe(true);
+    expect(isDualAldimClaimText("ikisini de aldım")).toBe(true);
   });
 
   test("glam: anlaşmalı 190 crumb must not sell a 2000 claimed lot", () => {

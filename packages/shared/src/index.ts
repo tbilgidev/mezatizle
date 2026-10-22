@@ -93,6 +93,8 @@ export {
   isVerbalWinPhrase,
   isBareVerbalWin,
   isFollowerAldimClaimText,
+  isDualAldimClaimText,
+  parseDualClaimSum,
   matchSpokenNameToBuyer,
   ALDIM_PRE_ASK_MS,
   ALDIM_CARRY_AFTER_CORRECTION_MS,

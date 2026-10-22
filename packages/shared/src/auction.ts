@@ -1217,6 +1217,13 @@ type LotWindow = {
     productHint?: string;
     reason: string;
   };
+  /** «İkisini de aldım» — second item pending; emit needs_review on next distinct ask. */
+  dualClaimPending?: {
+    buyer: string;
+    offsetMs: number;
+    eventId: string;
+    matched: string;
+  };
 };
 
 /** Sale price for a claimed fixed-ask lot (never a later crumb below ask). */
@@ -1259,12 +1266,21 @@ export const OFFER_AMOUNT_SANITY_MIN_TRY = 500;
 
 /** Same/similar ask within this window = re-show (camera pan / rotate), not a new lot. */
 export const LOT_RESHOW_MERGE_MS = 180_000;
-/** Min open duration before a different ask may start a new lot (prefer under-count). */
-export const LOT_MIN_NEW_MS = 75_000;
+/**
+ * Min open duration before a different ask may start a new lot.
+ * 75s starved glam (~13 lots / 50 min); 40s still blocks rapid restatement phantoms.
+ * Prefer under-merge of distinct products over under-count of offered.
+ */
+export const LOT_MIN_NEW_MS = 40_000;
 /** Amount change this soon after open = price revise on the same product. */
 export const LOT_EARLY_REVISE_MS = 45_000;
-/** Relative tolerance for “similar” ask (20% — 5k↔6k re-shows merge). */
-export const LOT_AMOUNT_NEAR_RATIO = 0.2;
+/**
+ * Relative tolerance for “similar” ask on bare restatements.
+ * 20% merged glam 2000↔2500 and 2500↔3000 (common mezat steps). Prefer ~10%
+ * so camera re-shows of the *same* ask still merge, but adjacent products split.
+ * Product-cued lines at a different TRY still open a new lot even inside this band.
+ */
+export const LOT_AMOUNT_NEAR_RATIO = 0.1;
 
 export type ProductLot = {
   openMs: number;
@@ -1289,6 +1305,8 @@ export function dedupeSaleCandidates(sales: SaleCandidate[]): SaleCandidate[] {
   const out: SaleCandidate[] = [];
   for (const s of sales) {
     const dup = out.find((o) => {
+      // Confirmed vs needs_review are distinct operator rows (glam dual 2000+2500).
+      if (Boolean(o.needsReview) !== Boolean(s.needsReview)) return false;
       if (!o.buyerUsername || o.buyerUsername !== s.buyerUsername) return false;
       if (o.amountTry == null || s.amountTry == null) {
         return Math.abs(o.offsetMs - s.offsetMs) <= SALE_DEDUP_WINDOW_MS;
@@ -1327,6 +1345,18 @@ export function reconcileMezatWindows(
     offsetMs: number;
     eventId: string;
   } | null = null;
+  /** Dual-claim («ikisini de» / A+B=C) awaiting a second distinct ask. */
+  let pendingDualReview: {
+    buyer: string;
+    offsetMs: number;
+    eventId: string;
+    matched: string;
+    secondAmountTry?: number;
+  } | null = null;
+
+  const pushNeedsReview = (cand: SaleCandidate) => {
+    sales.push({ ...cand, needsReview: true });
+  };
 
   const flushNamedMissIfPending = () => {
     if (!win?.namedMissReview) return;
@@ -1420,6 +1450,7 @@ export function reconcileMezatWindows(
   };
 
   const openLot = (ev: TimelineEvent, ask?: number) => {
+    const prevDual = win?.dualClaimPending ?? pendingDualReview;
     flushAldimIfClaimed(ev.offsetMs);
     const opening = saneAsk(ask ?? ev.amountTry);
     win = {
@@ -1432,6 +1463,33 @@ export function reconcileMezatWindows(
       closed: false,
     };
     attachPendingClaim(ev.offsetMs);
+    // Dual «ikisini de» / sum comment → second distinct ask is needs_review (not auto-sold).
+    if (
+      prevDual &&
+      opening != null &&
+      (prevDual.secondAmountTry == null ||
+        amountsNear(opening, prevDual.secondAmountTry) ||
+        opening === prevDual.secondAmountTry)
+    ) {
+      const age = ev.offsetMs - prevDual.offsetMs;
+      if (age >= 0 && age <= SALE_DEDUP_WINDOW_MS) {
+        pushNeedsReview({
+          offsetMs: prevDual.offsetMs,
+          amountTry: prevDual.secondAmountTry ?? opening,
+          buyerUsername: prevDual.buyer,
+          confidence: 0.55,
+          reason: "dual_claim_second_item_needs_review",
+          saleMethod: "aldim_first_comment",
+          evidenceEventIds: [prevDual.eventId, ev.id],
+          productHint: win.productHint,
+          askAmountTry: prevDual.secondAmountTry ?? opening,
+          evidenceQuote: prevDual.matched.slice(0, 200),
+        });
+        pendingDualReview = null;
+      }
+    } else if (prevDual && !win.dualClaimPending) {
+      pendingDualReview = prevDual;
+    }
   };
 
   const freezeClaimAsk = () => {
@@ -1500,11 +1558,16 @@ export function reconcileMezatWindows(
         win.openEventIds.push(ev.id);
         continue;
       }
+      const opening = win.openingAskTry ?? win.askAmount;
+      const lastAsk = win.askAmount ?? opening;
       const near =
         askAmt != null &&
         win.askAmount != null &&
         amountsNear(askAmt, win.askAmount);
-      const opening = win.openingAskTry ?? win.askAmount;
+      const exactAsk =
+        askAmt != null &&
+        (askAmt === win.askAmount || askAmt === win.openingAskTry);
+      const productCue = isLotOpeningPriceLine(ev.matched);
       const farBelowOpening =
         saneAmt != null &&
         opening != null &&
@@ -1512,8 +1575,26 @@ export function reconcileMezatWindows(
         !amountsNear(saneAmt, opening) &&
         saneAmt / opening < 0.55;
 
+      // Product-cued / strong different ask → next lot (aligned with buildProductLots)
+      if (
+        saneAmt != null &&
+        opening != null &&
+        lastAsk != null &&
+        shouldOpenNewProductLot({
+          matched: ev.matched,
+          amount: saneAmt,
+          openingAsk: opening,
+          lastAsk,
+          dtOpen: dtSinceOpen,
+          strong: strongAsk || (reason === "seller_price_line" && productCue),
+        })
+      ) {
+        openLot(ev, saneAmt);
+        continue;
+      }
+
       // Re-show / restatement of same or similar ask → stay on this lot
-      if (near && dtSinceOpen <= LOT_RESHOW_MERGE_MS) {
+      if ((near || exactAsk) && dtSinceOpen <= LOT_RESHOW_MERGE_MS) {
         win.openEventIds.push(ev.id);
         continue;
       }
@@ -1523,7 +1604,8 @@ export function reconcileMezatWindows(
         strongAsk &&
         askAmt != null &&
         win.askAmount != null &&
-        !near
+        !near &&
+        !exactAsk
       ) {
         openLot(ev, askAmt);
         continue;
@@ -1538,8 +1620,9 @@ export function reconcileMezatWindows(
           saneAmt != null &&
           win.askAmount != null &&
           !near &&
-          dtSinceOpen >= LOT_MIN_NEW_MS &&
-          (!farBelowOpening || strongAsk || isLotOpeningPriceLine(ev.matched))
+          !exactAsk &&
+          dtSinceOpen >= LOT_PRODUCT_CUE_MIN_MS &&
+          (!farBelowOpening || strongAsk || productCue)
         ) {
           openLot(ev, saneAmt);
           continue;
@@ -1549,12 +1632,13 @@ export function reconcileMezatWindows(
       }
 
       // Weak price-line early revise on the same product — keep window
-      // (only sane amounts; refuse pey crumbs below offer floor).
+      // (only sane amounts; refuse pey crumbs / product-cued next items).
       if (
         reason === "seller_price_line" &&
         saneAmt != null &&
         dtSinceOpen <= LOT_EARLY_REVISE_MS &&
-        !farBelowOpening
+        !farBelowOpening &&
+        !productCue
       ) {
         win.askAmount = saneAmt;
         if (win.openingAskTry == null) win.openingAskTry = saneAmt;
@@ -1563,12 +1647,9 @@ export function reconcileMezatWindows(
       }
 
       // Far-below crumb without product cue → ignore (do not sell 2200 at 700).
-      // With product cue + min gap → next lot.
+      // With product cue → next lot (floor already applied in shouldOpenNewProductLot).
       if (farBelowOpening) {
-        if (
-          dtSinceOpen >= LOT_MIN_NEW_MS &&
-          (strongAsk || isLotOpeningPriceLine(ev.matched))
-        ) {
+        if (productCue || strongAsk) {
           openLot(ev, saneAmt);
           continue;
         }
@@ -1584,27 +1665,14 @@ export function reconcileMezatWindows(
         win.askAmount != null &&
         !near &&
         dtSinceOpen <= 5 * 60_000 &&
-        !isLotOpeningPriceLine(ev.matched)
+        !productCue
       ) {
         win.askAmount = saneAmt;
         win.openEventIds.push(ev.id);
         continue;
       }
 
-      // Clear new product after min gap (price-line style lives) — only with product cue
-      if (
-        reason === "seller_price_line" &&
-        saneAmt != null &&
-        win.askAmount != null &&
-        !near &&
-        dtSinceOpen >= LOT_MIN_NEW_MS &&
-        isLotOpeningPriceLine(ev.matched)
-      ) {
-        openLot(ev, saneAmt);
-        continue;
-      }
-
-      // Otherwise absorb into current lot (prefer under-count of phantoms)
+      // Otherwise absorb into current lot (bare crumbs only)
       if (askAmt != null) {
         win.openEventIds.push(ev.id);
       }
@@ -1617,6 +1685,82 @@ export function reconcileMezatWindows(
         (/ald[ıi]m/i.test(ev.matched) &&
           ev.amountTry == null &&
           isFollowerAldimClaimText(ev.matched));
+      const dualSum =
+        ev.source === "comment" ? parseDualClaimSum(ev.matched) : undefined;
+      const dualAldim =
+        ev.source === "comment" && isDualAldimClaimText(ev.matched);
+
+      // «2000+ 2500 = 4500» — one amount may be the confirmed lot; the other needs review.
+      if (dualSum && ev.buyerHint && ev.source === "comment") {
+        const claimAsk = win && !win.closed ? lotSaleAsk(win) : undefined;
+        const alreadyConfirmed = sales
+          .filter(
+            (s) =>
+              !s.needsReview &&
+              s.buyerUsername === ev.buyerHint &&
+              s.amountTry != null,
+          )
+          .map((s) => s.amountTry!);
+        // Prefer the sum leg that is NOT already a confirmed sale for this buyer.
+        const pickSecond = (): number => {
+          const aDone = alreadyConfirmed.some((x) => amountsNear(x, dualSum.a));
+          const bDone = alreadyConfirmed.some((x) => amountsNear(x, dualSum.b));
+          if (aDone && !bDone) return dualSum.b;
+          if (bDone && !aDone) return dualSum.a;
+          if (
+            claimAsk != null &&
+            amountsNear(dualSum.a, claimAsk) &&
+            !amountsNear(dualSum.b, claimAsk)
+          ) {
+            return dualSum.b;
+          }
+          if (
+            claimAsk != null &&
+            amountsNear(dualSum.b, claimAsk) &&
+            !amountsNear(dualSum.a, claimAsk)
+          ) {
+            return dualSum.a;
+          }
+          // Open lot ask is often the second item when sum lands mid-packing.
+          if (claimAsk != null && amountsNear(dualSum.b, claimAsk)) {
+            return dualSum.b;
+          }
+          if (claimAsk != null && amountsNear(dualSum.a, claimAsk)) {
+            return dualSum.a;
+          }
+          return dualSum.b;
+        };
+        const second = pickSecond();
+        pushNeedsReview({
+          offsetMs: ev.offsetMs,
+          amountTry: second,
+          buyerUsername: ev.buyerHint,
+          confidence: 0.56,
+          reason: "dual_claim_sum_needs_review",
+          saleMethod: "aldim_first_comment",
+          evidenceEventIds: win
+            ? [...win.openEventIds, ev.id]
+            : [ev.id],
+          productHint: win?.productHint ?? ev.matched.slice(0, 120),
+          askAmountTry: second,
+          evidenceQuote: ev.matched.slice(0, 200),
+        });
+        // Already emitted — do not also fire on the next openLot.
+        pendingDualReview = null;
+        if (win && !win.closed) {
+          win.dualClaimPending = undefined;
+          win.bids.push({
+            offsetMs: ev.offsetMs,
+            amountTry: second,
+            buyerHint: ev.buyerHint,
+            source: ev.source,
+            reason: "dual_claim_sum",
+            eventId: ev.id,
+          });
+        }
+        continue;
+      }
+
       if (!win || win.closed) {
         // Orphan aldım — may attach when the ask lands a few seconds later.
         if (isAldimClaim && ev.buyerHint && ev.source === "comment") {
@@ -1625,6 +1769,14 @@ export function reconcileMezatWindows(
             offsetMs: ev.offsetMs,
             eventId: ev.id,
           });
+          if (dualAldim) {
+            pendingDualReview = {
+              buyer: ev.buyerHint,
+              offsetMs: ev.offsetMs,
+              eventId: ev.id,
+              matched: ev.matched,
+            };
+          }
         }
         continue;
       }
@@ -1639,6 +1791,15 @@ export function reconcileMezatWindows(
             eventId: ev.id,
           };
           freezeClaimAsk();
+          if (dualAldim) {
+            win.dualClaimPending = {
+              buyer: ev.buyerHint,
+              offsetMs: ev.offsetMs,
+              eventId: ev.id,
+              matched: ev.matched,
+            };
+            pendingDualReview = win.dualClaimPending;
+          }
         } else if (
           win.aldimClaim &&
           win.aldimClaim.buyer !== ev.buyerHint
@@ -1650,6 +1811,19 @@ export function reconcileMezatWindows(
             offsetMs: ev.offsetMs,
             eventId: ev.id,
           });
+        } else if (
+          win.aldimClaim &&
+          win.aldimClaim.buyer === ev.buyerHint &&
+          dualAldim
+        ) {
+          // Same buyer «ikisini de aldım» after first claim → second item review.
+          win.dualClaimPending = {
+            buyer: ev.buyerHint,
+            offsetMs: ev.offsetMs,
+            eventId: ev.id,
+            matched: ev.matched,
+          };
+          pendingDualReview = win.dualClaimPending;
         }
       }
       if (ev.buyerHint || ev.amountTry != null) {
@@ -1853,26 +2027,17 @@ export function reconcileMezatWindows(
   // End of timeline: complete open aldım claim if any
   flushAldimIfClaimed(Number.MAX_SAFE_INTEGER);
 
-  // Late orphan aldım (no ask ever attached) → needs_review only when the
-  // orphan sits after the last priced ask (post-ASR / trailing comments).
-  let lastAskMs = -1;
-  for (const ev of sorted) {
-    if (
-      (ev.eventType === "price_mention" || ev.eventType === "item_intro") &&
-      ev.amountTry != null
-    ) {
-      lastAskMs = Math.max(lastAskMs, ev.offsetMs);
-    }
-  }
+  // Remaining orphan aldım (never attached to an ask) → needs_review.
+  // Prefer operator review over silent drop (glam/afra: mid-live orphans
+  // used to vanish when they sat before the last ask).
   for (const o of orphanClaims) {
-    if (lastAskMs >= 0 && o.offsetMs <= lastAskMs + 60_000) continue;
     const already = sales.some(
       (s) =>
         s.buyerUsername === o.buyer &&
         Math.abs(s.offsetMs - o.offsetMs) <= SALE_DEDUP_WINDOW_MS,
     );
     if (already) continue;
-    sales.push({
+    pushNeedsReview({
       offsetMs: o.offsetMs,
       buyerUsername: o.buyer,
       confidence: 0.5,
@@ -1880,9 +2045,33 @@ export function reconcileMezatWindows(
       saleMethod: "aldim_first_comment",
       evidenceEventIds: [o.eventId],
       productHint: `Yorum aldım @ ${o.offsetMs}ms (ask yok)`,
-      needsReview: true,
       evidenceQuote: `@${o.buyer} aldım (ask penceresi yok)`,
     });
+  }
+
+  // «İkisini de» never got a second ask → still surface for operator.
+  if (pendingDualReview) {
+    const d = pendingDualReview;
+    const already = sales.some(
+      (s) =>
+        s.needsReview &&
+        s.buyerUsername === d.buyer &&
+        Math.abs(s.offsetMs - d.offsetMs) <= SALE_DEDUP_WINDOW_MS,
+    );
+    if (!already) {
+      pushNeedsReview({
+        offsetMs: d.offsetMs,
+        amountTry: d.secondAmountTry,
+        buyerUsername: d.buyer,
+        confidence: 0.52,
+        reason: "dual_claim_unresolved_needs_review",
+        saleMethod: "aldim_first_comment",
+        evidenceEventIds: [d.eventId],
+        productHint: d.matched.slice(0, 120),
+        askAmountTry: d.secondAmountTry,
+        evidenceQuote: d.matched.slice(0, 200),
+      });
+    }
   }
 
   return dedupeSaleCandidates(sales);
@@ -1901,13 +2090,67 @@ function isPricedAskEvent(ev: TimelineEvent): boolean {
 }
 
 /**
- * Bare «1800 lira.» crumbs must not split lots. Prefer under-count of offered.
- * Product-cue lines («bunlar da 1000 lira», «fiyatı 3500») may open the next lot.
+ * Bare «1800 lira.» crumbs must not split lots.
+ * Product-cue lines («bunlar da 1000 lira», «fiyatı 3500», «bu elimdeki 2400»,
+ * «uzunlar 1000», «bu da 2500», ASR «kolyo ucu») may open the next lot.
  */
 function isLotOpeningPriceLine(text: string): boolean {
-  return /fiyat|set(?:i|imiz)?|a[cç][ıi]l[ıi][sş]|ald[ıi]m\s+diyene|bunun|bunlar(?:\s+da)?|k[uü]pe|kolye|bro[sş]|bilezik|bileklik|y[uü]z[uü]k|cam\s+kolye|\bmezat\b|ile\s+mezat/i.test(
+  return /fiyat|set(?:i|imiz)?|a[cç][ıi]l[ıi][sş]|ald[ıi]m\s+diyene|bunun|bunlar(?:\s+da)?|k[uü]pe|kolye|kolyo|bro[sş]|bilezik|bileklik|y[uü]z[uü]k|cam\s+kolye|\bmezat\b|ile\s+mezat|elimdeki|elimde\b|uzunlar|k[ıi]salar|u[cç]umuz|\bu[cç]u(?:muz)?\b|\bmone[t]?\b|trifari|\bbu\s+da\b/i.test(
     text,
   );
+}
+
+/** «İkisini de aldım» — buyer claims a second item; do not auto-confirm the pair. */
+export function isDualAldimClaimText(text: string): boolean {
+  // foldTr: JS /i does not map Turkish İ→i («İkisini» would miss).
+  return /iki(?:sini|si)?\s+de\s+aldim/i.test(foldTrToken(text));
+}
+
+/**
+ * Comment arithmetic «2000+ 2500 = 4500» → two lot asks (second often needs_review).
+ */
+export function parseDualClaimSum(text: string): { a: number; b: number; sum: number } | undefined {
+  const m = text.match(
+    /(\d{3,5})\s*\+\s*(\d{3,5})\s*=\s*(\d{3,6})/,
+  );
+  if (!m?.[1] || !m[2] || !m[3]) return undefined;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  const sum = Number(m[3]);
+  if (![a, b, sum].every((n) => Number.isFinite(n) && n >= OFFER_AMOUNT_SANITY_MIN_TRY)) {
+    return undefined;
+  }
+  return { a, b, sum };
+}
+
+/** Floor so double-ASR of the same utterance does not split a lot. */
+const LOT_PRODUCT_CUE_MIN_MS = 15_000;
+
+/** True when a priced ask should start a new product lot (not a re-show / revise). */
+function shouldOpenNewProductLot(opts: {
+  matched: string;
+  amount: number;
+  openingAsk: number;
+  lastAsk: number;
+  dtOpen: number;
+  strong: boolean;
+}): boolean {
+  const exact =
+    opts.amount === opts.openingAsk || opts.amount === opts.lastAsk;
+  const nearOpening = amountsNear(opts.amount, opts.openingAsk);
+  const nearLast = amountsNear(opts.amount, opts.lastAsk);
+  const productCue = isLotOpeningPriceLine(opts.matched);
+  // Product-cued different TRY → new lot even inside ±10% (2500 vs 3000)
+  // and even inside the early-revise window («bu elimdeki 2400» after 2200).
+  if (productCue && !exact && opts.dtOpen >= LOT_PRODUCT_CUE_MIN_MS) {
+    return true;
+  }
+  if (opts.dtOpen < LOT_MIN_NEW_MS) return false;
+  if ((opts.strong || productCue) && !nearOpening && !nearLast) return true;
+  // Bare but clearly different ask after settle → new lot (glam «2000 TL'ymiş»
+  // after a 2500 window). Prefer under-merge of distinct products.
+  if (!exact && !nearOpening && !nearLast) return true;
+  return false;
 }
 
 /**
@@ -1970,37 +2213,23 @@ export function buildProductLots(events: TimelineEvent[]): ProductLot[] {
     const dtOpen = ev.offsetMs - lot.openMs;
     const nearOpening = amountsNear(amt, lot.openingAskTry);
     const nearLast = amountsNear(amt, lot.lastAskTry);
+    const exactAsk =
+      amt === lot.openingAskTry || amt === lot.lastAskTry;
+    const productCue = isLotOpeningPriceLine(ev.matched);
 
-    // Re-show / restatement
-    if ((nearOpening || nearLast) && dtLast <= LOT_RESHOW_MERGE_MS) {
-      lot.lastMs = ev.offsetMs;
-      lot.lastAskTry = amt;
-      lot.eventIds.push(ev.id);
-      continue;
-    }
-
-    // Early revise on same product — keep opening ask (first announcement)
-    if (dtOpen <= LOT_EARLY_REVISE_MS) {
-      lot.lastMs = ev.offsetMs;
-      lot.lastAskTry = amt;
-      lot.eventIds.push(ev.id);
-      // If the first utterance was a brief wrong parse, settle opening to sticky revise
-      if (dtOpen <= LOT_EARLY_REVISE_MS && !nearOpening && dtLast <= 20_000) {
-        lot.openingAskTry = amt;
-      }
-      continue;
-    }
-
-    // Clear new product cue (different ask after the lot has had time to settle)
-    const clearNew =
-      (strong ||
-        (reason === "seller_price_line" &&
-          isLotOpeningPriceLine(ev.matched))) &&
-      !nearOpening &&
-      !nearLast &&
-      dtOpen >= LOT_MIN_NEW_MS;
-
-    if (clearNew) {
+    // Product-cued different TRY → new lot (even within ±20% / early window)
+    if (
+      shouldOpenNewProductLot({
+        matched: ev.matched,
+        amount: amt,
+        openingAsk: lot.openingAskTry,
+        lastAsk: lot.lastAskTry,
+        dtOpen,
+        strong:
+          strong ||
+          (reason === "seller_price_line" && productCue),
+      })
+    ) {
       closeLot(ev.offsetMs);
       lot = {
         openMs: ev.offsetMs,
@@ -2013,7 +2242,28 @@ export function buildProductLots(events: TimelineEvent[]): ProductLot[] {
       continue;
     }
 
-    // Prefer under-count: absorb ambiguous chatter into current lot
+    // Re-show / restatement of same or near ask (bare crumbs / camera pan)
+    if ((nearOpening || nearLast || exactAsk) && dtLast <= LOT_RESHOW_MERGE_MS) {
+      lot.lastMs = ev.offsetMs;
+      lot.lastAskTry = amt;
+      lot.eventIds.push(ev.id);
+      continue;
+    }
+
+    // Early revise on same product — keep opening ask (first announcement).
+    // Never revise opening *down* (kısa companion «700» after «Uzunlar 1000»,
+    // or etiket crumbs under a 4000 ask).
+    if (dtOpen <= LOT_EARLY_REVISE_MS && !productCue) {
+      lot.lastMs = ev.offsetMs;
+      lot.lastAskTry = amt;
+      lot.eventIds.push(ev.id);
+      if (!nearOpening && dtLast <= 20_000 && amt >= lot.openingAskTry) {
+        lot.openingAskTry = amt;
+      }
+      continue;
+    }
+
+    // Prefer under-merge of phantoms only for bare ambiguous chatter
     lot.lastMs = ev.offsetMs;
     lot.lastAskTry = amt;
     lot.eventIds.push(ev.id);
