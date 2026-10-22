@@ -6,6 +6,15 @@ import {
   parseHtmlLiveSignals,
   parseReelsTrayLives,
   type FollowingLive,
+  orderFollowingForProbe,
+  sliceRotated,
+  advanceProbeCursor,
+  estimateFullSweepMinutes,
+  formatSweepEtaTr,
+  clampProbeBatchSize,
+  saveFollowingCache,
+  loadFollowingCache,
+  emptyFollowingCache,
 } from "../apps/api/src/modules/ig_following_lives.ts";
 import {
   filterLivesNeedingCapture,
@@ -118,20 +127,81 @@ describe("poll interval 5–6 min", () => {
   });
 
   test("poll hard-timeout and stale thresholds are finite safety nets", () => {
-    expect(POLL_HARD_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
+    expect(POLL_HARD_TIMEOUT_MS).toBeGreaterThanOrEqual(90_000);
     expect(POLL_HARD_TIMEOUT_MS).toBeLessThanOrEqual(180_000);
     expect(POLL_STALE_MS).toBeGreaterThan(POLL_MS_MAX * 2);
   });
 });
 
+describe("full following rotation", () => {
+  test("priority only soft-boosts order; slice+cursor covers all", () => {
+    const following = ["z_shop", "nunusvintageshop", "a_shop", "mid"];
+    const ordered = orderFollowingForProbe(following, [
+      "nunusvintageshop",
+      "afra.vintagetaki",
+    ]);
+    expect(ordered[0]).toBe("nunusvintageshop");
+    expect(ordered).toContain("a_shop");
+    expect(ordered).toHaveLength(4);
+
+    const batch1 = sliceRotated(ordered, 0, 2);
+    expect(batch1).toEqual([ordered[0], ordered[1]]);
+    const adv1 = advanceProbeCursor(ordered.length, 0, 2);
+    expect(adv1.completedSweep).toBe(false);
+    const batch2 = sliceRotated(ordered, adv1.nextCursor, 2);
+    expect(batch2).toHaveLength(2);
+    const adv2 = advanceProbeCursor(ordered.length, adv1.nextCursor, 2);
+    expect(adv2.completedSweep).toBe(true);
+    expect(adv2.nextCursor).toBe(0);
+
+    const seen = new Set([...batch1, ...batch2]);
+    expect(seen.size).toBe(4);
+  });
+
+  test("ETA documents full sweep window", () => {
+    expect(clampProbeBatchSize(8)).toBe(8);
+    expect(estimateFullSweepMinutes(40, 8, 330_000)).toBe(27.5);
+    expect(formatSweepEtaTr(40, 8, 330_000)).toMatch(/≈27\.5 dk/);
+  });
+
+  test("following cache persists usernames + sweep time", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mezat-fc-"));
+    try {
+      const env = fakeEnv(dir);
+      const state = emptyFollowingCache();
+      state.usernames = ["shop_a", "shop_b", "nunusvintageshop"];
+      state.refreshedAt = "2026-10-22T10:00:00.000Z";
+      state.lastFullSweepAt = "2026-10-22T11:00:00.000Z";
+      state.probeCursor = 2;
+      await saveFollowingCache(env, state);
+      const loaded = await loadFollowingCache(env);
+      expect(loaded.usernames).toEqual([
+        "shop_a",
+        "shop_b",
+        "nunusvintageshop",
+      ]);
+      expect(loaded.lastFullSweepAt).toBe("2026-10-22T11:00:00.000Z");
+      expect(loaded.probeCursor).toBe(2);
+
+      const st = await getAutoFollowLiveStatus(env, null);
+      expect(st.followingCount).toBe(3);
+      expect(st.lastFullSweepAt).toBe("2026-10-22T11:00:00.000Z");
+      expect(st.fullSweepEtaTr).toMatch(/dk/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("priority usernames", () => {
-  test("defaults include afra + glamvintage_ for tray-miss probe", async () => {
+  test("defaults soft-boost afra/glam/nunus (not coverage set)", async () => {
     const dir = await mkdtemp(join(tmpdir(), "mezat-af-"));
     try {
       const cfg = await getAutoFollowLiveConfig(fakeEnv(dir));
       expect(cfg.priorityUsernames).toContain("afra.vintagetaki");
       expect(cfg.priorityUsernames).toContain("glamvintage_");
       expect(cfg.priorityUsernames).toContain("glamvintage");
+      expect(cfg.priorityUsernames).toContain("nunusvintageshop");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -251,9 +321,15 @@ describe("auto-follow poll→enqueue (mocked)", () => {
     const cycle = await runAutoFollowPollCycle(fakeSql, env, {
       dryRun: false,
       poll: async () => ({
-        ok: true,
-        source: "reels_tray",
+        ok: true as const,
+        source: "reels_tray" as const,
         detail: "2 takip canlısı (mock)",
+        followingCount: 2,
+        lastFullSweepAt: null,
+        lastFollowingRefreshAt: null,
+        probedThisCycle: [],
+        probeCursor: 0,
+        completedSweep: false,
         lives: [
           {
             username: "mock_seller_a",
@@ -323,9 +399,15 @@ describe("auto-follow poll→enqueue (mocked)", () => {
     let enqueueCalls = 0;
     const cycle2 = await runAutoFollowPollCycle(fakeSql2, env, {
       poll: async () => ({
-        ok: true,
-        source: "reels_tray",
+        ok: true as const,
+        source: "reels_tray" as const,
         detail: "same",
+        followingCount: 2,
+        lastFullSweepAt: null,
+        lastFollowingRefreshAt: null,
+        probedThisCycle: [],
+        probeCursor: 0,
+        completedSweep: false,
         lives: [
           {
             username: "mock_seller_a",

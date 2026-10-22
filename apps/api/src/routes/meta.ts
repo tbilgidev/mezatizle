@@ -73,10 +73,12 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
       const body = (await c.req.json().catch(() => ({}))) as {
         enabled?: boolean;
         pollIntervalMs?: number;
+        priorityUsernames?: string[];
       };
       const status = await setAutoFollowLiveConfig(env, {
         enabled: body.enabled,
         pollIntervalMs: body.pollIntervalMs,
+        priorityUsernames: body.priorityUsernames,
       });
       return c.json(status);
     } catch (err) {

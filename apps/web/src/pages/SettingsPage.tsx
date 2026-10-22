@@ -36,6 +36,12 @@ type AutoFollowStatus = {
   healthOk?: boolean;
   healthAlertTr?: string | null;
   priorityUsernames?: string[];
+  followingCount?: number;
+  lastFullSweepAt?: string | null;
+  lastFollowingRefreshAt?: string | null;
+  probeBatchSize?: number;
+  fullSweepEtaTr?: string;
+  lastProbeBatch?: string[];
   labelTr: string;
   hintTr: string;
   cookiesReady: boolean;
@@ -278,6 +284,22 @@ export function SettingsPage() {
               ) : null}
               <ul className="mb-4 space-y-1 text-sm text-fog">
                 <li>
+                  Takip edilen hesap:{" "}
+                  {typeof autoFollow?.followingCount === "number"
+                    ? autoFollow.followingCount
+                    : "—"}
+                  {autoFollow?.fullSweepEtaTr
+                    ? ` · tam tur ${autoFollow.fullSweepEtaTr}`
+                    : ""}
+                </li>
+                <li>
+                  Son tam yoklama: {formatWhen(autoFollow?.lastFullSweepAt)}
+                </li>
+                <li>
+                  Takip listesi yenileme:{" "}
+                  {formatWhen(autoFollow?.lastFollowingRefreshAt)}
+                </li>
+                <li>
                   Son tarama: {formatWhen(autoFollow?.lastPollAt)}
                   {autoFollow?.lastPollOk === true
                     ? " · başarılı"
@@ -287,9 +309,18 @@ export function SettingsPage() {
                 </li>
                 <li>
                   Tarama aralığı: {formatPollInterval(autoFollow?.pollIntervalMs)}
+                  {autoFollow?.probeBatchSize
+                    ? ` · yoklama/batch: ${autoFollow.probeBatchSize}`
+                    : ""}
                 </li>
                 <li>
-                  Öncelik profilleri:{" "}
+                  Son yoklanan:{" "}
+                  {autoFollow?.lastProbeBatch?.length
+                    ? autoFollow.lastProbeBatch.map((u) => `@${u}`).join(", ")
+                    : "—"}
+                </li>
+                <li>
+                  Öncelik (sırayı öne alır):{" "}
                   {autoFollow?.priorityUsernames?.length
                     ? autoFollow.priorityUsernames
                         .map((u) => `@${u}`)

@@ -17,6 +17,10 @@ import { createLiveCapture } from "./live_capture.ts";
 import {
   pollFollowingLives,
   type FollowingLive,
+  loadFollowingCache,
+  defaultProbeBatchSize,
+  formatSweepEtaTr,
+  normalizePriorityUsernames,
 } from "./ig_following_lives.ts";
 import {
   extractBroadcastIdFromUrl,
@@ -26,17 +30,17 @@ import {
   getIgCookieUsername,
   getIgSessionStatus,
 } from "./ig_session.ts";
-import { normalizePriorityUsernames } from "./ig_following_lives.ts";
 
 const CONFIG_FILE = "auto-follow-live.json";
 /**
- * Default sellers to profile-probe when reels_tray omits their live ring.
- * Always includes known mezat sellers Tolga trusts auto-record for.
+ * Soft boost only — earlier in the full-following rotation order.
+ * Coverage is the persisted following cache, not this tiny list.
  */
 const DEFAULT_PRIORITY_USERNAMES = [
   "afra.vintagetaki",
   "glamvintage_",
   "glamvintage",
+  "nunusvintageshop",
 ];
 
 /** Min / max / default IG poll interval (5–6 minutes). */
@@ -46,10 +50,10 @@ export const POLL_MS_DEFAULT = 330_000;
 /** While a recording is active, re-check DB this often (no IG hit). */
 export const PAUSE_RECHECK_MS = 30_000;
 /**
- * Hard ceiling for one IG poll (Playwright). Prevents the supervisor loop
- * from hanging forever after a stuck browser / 429 page load.
+ * Hard ceiling for one IG poll (Playwright). Allows following refresh +
+ * rotating profile probes without hanging forever after a stuck 429.
  */
-export const POLL_HARD_TIMEOUT_MS = 90_000;
+export const POLL_HARD_TIMEOUT_MS = 120_000;
 /**
  * If last successful/attempted poll is older than this while enabled and
  * not scan-paused, surface a loud "poller stuck" failure in Settings/sidebar.
@@ -96,7 +100,19 @@ export type AutoFollowLiveStatus = {
   /** Loud failure for UI when poller/cookies unhealthy. */
   healthOk: boolean;
   healthAlertTr: string | null;
+  /** Soft boost order only — not the coverage set. */
   priorityUsernames: string[];
+  /** Watcher following list size (persisted cache). */
+  followingCount: number;
+  /** When the rotating probe last wrapped the full following set. */
+  lastFullSweepAt: string | null;
+  /** When friendships/following list was last refreshed from IG. */
+  lastFollowingRefreshAt: string | null;
+  /** Profile probes per IG poll cycle. */
+  probeBatchSize: number;
+  /** Turkish ETA for one full following sweep (IG cycles; pauses while recording). */
+  fullSweepEtaTr: string;
+  lastProbeBatch: string[];
 };
 
 type PersistState = AutoFollowLiveConfig & {
@@ -372,6 +388,13 @@ export async function getAutoFollowLiveStatus(
   const cookiesReady = Boolean(ig.hasCookies) || ig.status === "yuklu";
   const priorityUsernames =
     s.priorityUsernames ?? mergePriorityUsernames(null);
+  const followingCache = await loadFollowingCache(env);
+  const probeBatchSize = defaultProbeBatchSize();
+  const fullSweepEtaTr = formatSweepEtaTr(
+    followingCache.usernames.length,
+    probeBatchSize,
+    s.pollIntervalMs,
+  );
   let healthAlertTr: string | null = null;
   if (s.enabled) {
     if (!cookiesReady) {
@@ -419,12 +442,18 @@ export async function getAutoFollowLiveStatus(
     startedAt,
     labelTr,
     hintTr:
-      `İzleyici hesabının (${watcherLabel}) takip ettiği hesaplar canlıya geçince otomatik kayıt başlar. Tarama ~5–6 dk’da bir; tepsi boş/429 olsa bile öncelik profilleri (afra, glamvintage_, …) yoklanır. Kayıt sürerken tarama durur — aynı anda tek kayıt. Manuel «Canlı yayın ekle» aynı kullanıcı/broadcast için çift başlatmaz.`,
+      `İzleyici hesabının (${watcherLabel}) takip ettiği TÜM hesaplar kapsanır: önce reels_tray, sonra takip listesinden dönen profil yoklaması (her ~5–6 dk’da ${probeBatchSize} hesap; tam tur ${fullSweepEtaTr}). Küçük «öncelik» listesi yalnızca sırayı öne alır. Kayıt sürerken tarama durur — aynı anda tek kayıt. Manuel «Canlı yayın ekle» aynı kullanıcı/broadcast için çift başlatmaz.`,
     cookiesReady,
     watcherUsername,
     healthOk: !healthAlertTr,
     healthAlertTr,
     priorityUsernames,
+    followingCount: followingCache.usernames.length,
+    lastFullSweepAt: followingCache.lastFullSweepAt,
+    lastFollowingRefreshAt: followingCache.refreshedAt,
+    probeBatchSize,
+    fullSweepEtaTr,
+    lastProbeBatch: followingCache.lastProbeBatch,
   };
 }
 
@@ -480,8 +509,13 @@ export async function runAutoFollowPollCycle(
     stateBefore.priorityUsernames,
     stateBefore.lastLivesSeen,
   );
+  const probeBatchSize = defaultProbeBatchSize();
   const result = await Promise.race([
-    poll(env, { priorityUsernames }),
+    poll(env, {
+      priorityUsernames,
+      probeBatchSize,
+      pollIntervalMs: stateBefore.pollIntervalMs,
+    }),
     new Promise<Awaited<ReturnType<typeof pollFollowingLives>>>((resolve) => {
       setTimeout(
         () =>

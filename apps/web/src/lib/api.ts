@@ -545,6 +545,12 @@ export const api = {
       healthOk?: boolean;
       healthAlertTr?: string | null;
       priorityUsernames?: string[];
+      followingCount?: number;
+      lastFullSweepAt?: string | null;
+      lastFollowingRefreshAt?: string | null;
+      probeBatchSize?: number;
+      fullSweepEtaTr?: string;
+      lastProbeBatch?: string[];
     }>("/api/settings/auto-follow-live"),
   setAutoFollowLive: (body: { enabled?: boolean; pollIntervalMs?: number }) =>
     request<Record<string, unknown>>("/api/settings/auto-follow-live", {
