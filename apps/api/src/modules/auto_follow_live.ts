@@ -5,9 +5,11 @@
  * pipeline) → live ends → finalize MP4 → analysis. Manual "Canlı yayın ekle"
  * remains available.
  *
- * Politeness: poll every ~5–6 minutes (jitter). While any capture is
- * bekleniyor/kaydediliyor (or live_captures in-flight), pause the IG scan
- * entirely and never start a second concurrent recording.
+ * Politeness: poll every ~5–6 minutes (jitter). Hard rule: while ANY
+ * capture is bekleniyor/kaydediliyor (or live_captures in-flight), pause
+ * the IG scan entirely (scanPaused) — no tray, no following refresh, no
+ * rotating full-following probes, and never enqueue a second capture for
+ * another account. Resume only after the active capture ends.
  */
 import { mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
 import { resolve } from "node:path";
