@@ -37,6 +37,7 @@ const DEFAULT_PRIORITY_USERNAMES = [
   "afra.vintagetaki",
   "glamvintage_",
   "glamvintage",
+  "nunusvintageshop",
 ];
 
 /** Min / max / default IG poll interval (5–6 minutes). */
