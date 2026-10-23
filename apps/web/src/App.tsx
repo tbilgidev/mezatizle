@@ -16,6 +16,7 @@ import { RecordingDetailPage } from "./pages/RecordingDetailPage";
 import { ReportsPage } from "./pages/ReportsPage";
 import { ReportDetailPage } from "./pages/ReportDetailPage";
 import { EvidencePage } from "./pages/EvidencePage";
+import { ReviewPopupPage } from "./pages/ReviewPopupPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
 const nav = [
@@ -180,6 +181,20 @@ function Shell({ children }: { children: React.ReactNode }) {
 }
 
 export function App() {
+  const location = useLocation();
+  const isReviewPopup =
+    location.pathname === "/review-popup" ||
+    location.pathname.endsWith("/review-popup");
+
+  // Popup window: no sidebar shell — video + comments only.
+  if (isReviewPopup) {
+    return (
+      <Routes>
+        <Route path="/review-popup" element={<ReviewPopupPage />} />
+      </Routes>
+    );
+  }
+
   return (
     <Shell>
       <Routes>
@@ -192,6 +207,7 @@ export function App() {
         <Route path="/sales/*" element={<Navigate to="/reports" replace />} />
         <Route path="/evidence" element={<EvidencePage />} />
         <Route path="/evidence/:id" element={<EvidencePage />} />
+        <Route path="/review-popup" element={<ReviewPopupPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Routes>
     </Shell>

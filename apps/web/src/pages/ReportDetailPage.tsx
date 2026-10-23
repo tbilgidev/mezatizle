@@ -8,7 +8,6 @@ import {
   Film,
   ImageOff,
   Pencil,
-  X,
 } from "lucide-react";
 import {
   api,
@@ -27,6 +26,7 @@ import {
   extractReportKpis,
   reportKpiChips,
 } from "@/lib/report-kpis";
+import { openReviewPopup } from "@/lib/review-popup";
 import {
   confidenceLabel,
   formatDateTr,
@@ -34,7 +34,6 @@ import {
   formatTry,
   statusTr,
 } from "@/lib/utils";
-import { EvidencePlayer } from "@/components/EvidencePlayer";
 import { EmptyState, ErrorState, LoadingState, PageHeader } from "@/components/States";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -188,7 +187,6 @@ function SaleTable({
   draft,
   rowError,
   reviewedIds,
-  playerSaleId,
   mode,
   onOpen,
   onReview,
@@ -203,7 +201,6 @@ function SaleTable({
   draft: EditDraft | null;
   rowError: string | null;
   reviewedIds: Set<string>;
-  playerSaleId: string | null;
   mode: "sold" | "review" | "rejected";
   onOpen: (s: ReportSale) => void;
   onReview: (id: string, status: string) => void;
@@ -231,9 +228,7 @@ function SaleTable({
         <tbody>
           {rows.map((s) => {
             const unlocked =
-              mode === "sold" ||
-              reviewedIds.has(s.id) ||
-              playerSaleId === s.id;
+              mode === "sold" || reviewedIds.has(s.id);
             const productLabel =
               s.productTitle ?? s.productDescription ?? "Ürün tanımı yok";
             const buyer = buyerLabel(s);
@@ -524,11 +519,7 @@ export function ReportDetailPage() {
   const [draft, setDraft] = useState<EditDraft | null>(null);
   const [rowError, setRowError] = useState<string | null>(null);
   const [techOpen, setTechOpen] = useState(false);
-  const [player, setPlayer] = useState<{
-    saleId: string;
-    offsetMs: number;
-  } | null>(null);
-  /** Sales whose video was reviewed this session — unlocks Onayla/Reddet. */
+  /** Sales whose video popup was opened this session — unlocks Onayla/Reddet. */
   const [reviewedIds, setReviewedIds] = useState<Set<string>>(() => new Set());
 
   async function load(opts?: { silent?: boolean }) {
@@ -576,7 +567,6 @@ export function ReportDetailPage() {
     let alive = true;
     setLoading(true);
     setReviewedIds(new Set());
-    setPlayer(null);
     setEditingId(null);
     setDraft(null);
     load()
@@ -727,6 +717,10 @@ export function ReportDetailPage() {
       setError("Satış kaydı bulunamadı.");
       return;
     }
+    if (!report?.recordingId) {
+      setError("Kayıt kimliği yok — video penceresi açılamadı.");
+      return;
+    }
     setBusyId(sale.id);
     setError(null);
     try {
@@ -752,8 +746,19 @@ export function ReportDetailPage() {
         );
         return;
       }
-      setPlayer({ saleId: sale.id, offsetMs: ms });
+      const win = openReviewPopup({
+        recordingId: report.recordingId,
+        offsetMs: ms,
+        saleId: sale.id,
+      });
+      if (!win) {
+        setError(
+          "Tarayıcı popup engelledi. Popup’lara izin verip «Videoya git»i yeniden deneyin.",
+        );
+        return;
+      }
       setReviewedIds((prev) => new Set(prev).add(sale.id));
+      setToast("Kanıt penceresi açıldı — yanına yerleştirip inceleyin");
     } catch (e) {
       setError(
         e instanceof Error
@@ -814,7 +819,6 @@ export function ReportDetailPage() {
     draft,
     rowError,
     reviewedIds,
-    playerSaleId: player?.saleId ?? null,
     onOpen: (s: ReportSale) => void openEvidencePlayer(s),
     onReview: (id: string, st: string) => void review(id, st),
     onStartEdit: (s: ReportSale) => {
@@ -903,62 +907,14 @@ export function ReportDetailPage() {
         ))}
       </div>
 
-      <div
-        className={
-          player
-            ? "lg:grid lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:items-start lg:gap-4"
-            : undefined
-        }
-        data-review-layout={player ? "split" : "list"}
-      >
-        {player ? (
-          <aside
-            className="mb-4 lg:order-2 lg:mb-0 lg:sticky lg:top-3 lg:z-20"
-            data-evidence-dock="1"
-          >
-            {/* Mobile: sticky top dock so lists can scroll underneath */}
-            <div className="sticky top-0 z-30 lg:static">
-              <div className="mb-2 flex items-center justify-between gap-2 lg:hidden">
-                <span className="text-xs font-semibold uppercase tracking-wide text-fog">
-                  Kanıt videosu
-                </span>
-                <button
-                  type="button"
-                  className="inline-flex items-center gap-1 text-xs font-semibold text-fog hover:text-mint"
-                  onClick={() => setPlayer(null)}
-                >
-                  <X className="h-3.5 w-3.5" />
-                  Kapat
-                </button>
-              </div>
-              <EvidencePlayer
-                recordingId={report.recordingId}
-                offsetMs={player.offsetMs}
-                open
-                onClose={() => setPlayer(null)}
-                title="Kanıt videosu"
-                mediaPurged={
-                  recordingMeta?.mediaPurged === true ||
-                  (recordingMeta?.media_purged_at != null &&
-                    String(recordingMeta.media_purged_at).trim() !== "")
-                }
-                mediaPurgedNoteTr={
-                  recordingMeta?.mediaPurgedNoteTr != null
-                    ? String(recordingMeta.mediaPurgedNoteTr)
-                    : null
-                }
-              />
-            </div>
-          </aside>
-        ) : null}
-
-        <div className={player ? "lg:order-1 min-w-0" : undefined}>
+      <div data-review-layout="list">
           <Card className="mb-4">
             <CardHeader>
               <CardTitle>Satış listesi</CardTitle>
               <p className="text-sm text-fog">
-                Otomatik onaylanan satışlar — satıra tıklayınca video sağda /
-                üstte sabit kalır. İnceleme bekleyenler aşağıdaki ayrı bölümde.
+                Otomatik onaylanan satışlar — «Videoya git» ayrı pencerede
+                A/V + yorum açar; bu sekmede liste kaydırmaya devam eder.
+                İnceleme bekleyenler aşağıdaki ayrı bölümde.
               </p>
             </CardHeader>
             <CardContent>
@@ -1114,7 +1070,6 @@ export function ReportDetailPage() {
               </CardContent>
             ) : null}
           </Card>
-        </div>
       </div>
     </div>
   );
