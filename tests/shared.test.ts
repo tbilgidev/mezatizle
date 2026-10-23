@@ -1917,7 +1917,8 @@ describe("Nunus numbered tray + descriptor claims", () => {
       { source: "transcript" },
     );
     expect(qty?.reason).toBe("verbal_win_named_qty");
-    expect(qty?.amountTry).toBe(2400);
+    expect(qty?.amountTry).toBe(600);
+    expect(qty?.quantity).toBe(4);
     expect(qty?.spokenBuyerName?.toLowerCase()).toBe("banu");
 
     expect(
@@ -2033,7 +2034,7 @@ describe("Nunus numbered tray + descriptor claims", () => {
     expect(banu!.amountTry).toBe(600);
   });
 
-  test("Nunus live: 4 tane … 600 bağno after single 600 is a distinct sale", () => {
+  test("Nunus live: 4 tane … 600 bağno splits into 4 unit sales", () => {
     const sales = reconcileMezatWindows([
       ev({
         id: "c",
@@ -2059,19 +2060,52 @@ describe("Nunus numbered tray + descriptor claims", () => {
         offsetMs: 22_000,
         eventType: "sold",
         matched: "Şuradakilerde 4 tane arora 600 bağno hanımda.",
-        amountTry: 2400,
+        amountTry: 600,
         spokenBuyerName: "Banu",
         reason: "verbal_win_named_qty",
         confidence: 0.84,
+        quantity: 4,
       }),
     ]);
     const banu = sales.filter(
       (s) => !s.needsReview && s.buyerUsername === "banubyktskn",
     );
-    expect(banu.length).toBe(2);
-    expect(banu.map((s) => s.amountTry).sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([
-      600, 2400,
+    expect(banu.length).toBe(5);
+    expect(banu.every((s) => s.amountTry === 600)).toBe(true);
+  });
+
+  test("Nunus live: 800+800 dual same-price emits two legs", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "Bu da 800 lira",
+        amountTry: 800,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "c",
+        offsetMs: 5_000,
+        eventType: "bid",
+        matched: "800+800",
+        amountTry: 1600,
+        buyerHint: "joelleancel",
+        reason: "bid_phrase",
+        source: "comment",
+      }),
     ]);
+    const j = sales.filter((s) => s.buyerUsername === "joelleancel");
+    expect(j.length).toBeGreaterThanOrEqual(2);
+    expect(j.every((s) => s.amountTry === 800)).toBe(true);
+  });
+
+  test("parse: Arada kaldım is not a sold; Cihayranımcım → Cihayra", () => {
+    expect(parseAuctionText("Arada kaldım.", { source: "transcript" })).toBeNull();
+    expect(
+      parseAuctionText("Tamam sizde Cihayranımcım.", { source: "transcript" })
+        ?.spokenBuyerName,
+    ).toBe("Cihayra");
   });
 
   test("same-price «bu da 800» opens distinct offered lots", () => {

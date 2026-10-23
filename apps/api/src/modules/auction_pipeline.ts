@@ -10,6 +10,29 @@ import {
   type TimelineEvent,
 } from "@mezatizle/shared";
 
+/** Instagram live DOM chrome scraped as fake "comments". */
+export function isLiveHudComment(
+  author: string | null | undefined,
+  body: string | null | undefined,
+): boolean {
+  const a = (author ?? "").trim().toLowerCase();
+  if (
+    a === "reels" ||
+    a === "popular" ||
+    a === "nunusvintageshop" ||
+    a === "instagram"
+  ) {
+    return true;
+  }
+  const b = (body ?? "").trim();
+  if (!b) return true;
+  if (/^(Profil|Gönderiler|Gonderiler|Popüler|Popular|Reels)$/i.test(b)) {
+    return true;
+  }
+  if (/Vintage Custom Jewellery/i.test(b)) return true;
+  return false;
+}
+
 /**
  * Map a timeline offset onto a sparse OCR frame index.
  * Long lives extract ~OCR_MAX_FRAMES frames at fps≈N/duration — never assume 1fps.
@@ -229,8 +252,27 @@ export async function segmentAuctionFromSignals(
   }
 
   for (const c of comments) {
-    const offset = c.offset_ms ?? 0;
-    if (offset > commentMaxMs) continue;
+    // Live DOM HUD chrome (Reels/Profil/Popüler) floods offsets past duration.
+    if (isLiveHudComment(c.author_username, c.body)) continue;
+
+    let offset = c.offset_ms ?? 0;
+    // Realign from observed_at when stored offset is past the recording
+    // (post-live DOM poll kept writing wall-clock deltas).
+    if (
+      captureStartedMs != null &&
+      c.observed_at != null &&
+      durationMs != null &&
+      offset > commentMaxMs
+    ) {
+      const derived = new Date(c.observed_at).getTime() - captureStartedMs;
+      if (derived >= 0 && derived <= commentMaxMs) {
+        offset = Math.round(derived);
+      } else {
+        continue;
+      }
+    } else if (offset > commentMaxMs) {
+      continue;
+    }
     // Pre-roll live_api comments (before capture) land at offset 0 and poison asks
     if (
       captureStartedMs != null &&
@@ -409,6 +451,10 @@ export async function reconcileSales(
         p.lotNumber != null && Number.isFinite(Number(p.lotNumber))
           ? Number(p.lotNumber)
           : undefined,
+      quantity:
+        p.quantity != null && Number.isFinite(Number(p.quantity))
+          ? Number(p.quantity)
+          : undefined,
       descriptorTokens: Array.isArray(p.descriptorTokens)
         ? p.descriptorTokens.filter((t): t is string => typeof t === "string")
         : undefined,
@@ -451,9 +497,13 @@ export async function reconcileSales(
     const spoken = (cand.spokenBuyerName ?? "").toLowerCase();
     const offsetMs = cand.offsetMs;
     const buyerKey = (buyer ?? `spoken:${spoken || "bilinmiyor"}`).toLowerCase();
+    // Multi-item packing legs («qty_2_of_4», dual 800+800) must not share a key.
+    const leg =
+      (cand.reason ?? "").match(/qty_(\d+)_of_(\d+)/)?.[0] ??
+      ((cand.reason ?? "").match(/dual_same_price[_\w]*/)?.[0] || "");
     // Legacy 8s key + ~3 min same-buyer≈price key (repeated verbal confirms).
-    const dedupeKey = `${buyerKey}:${amountCents ?? "_"}:${Math.floor(offsetMs / 8000)}`;
-    const lotDedupeKey = `${buyerKey}:${amountCents != null ? Math.round(amountCents / 100 / 500) * 500 : "_"}:${Math.floor(offsetMs / 180_000)}`;
+    const dedupeKey = `${buyerKey}:${amountCents ?? "_"}:${Math.floor(offsetMs / 8000)}:${leg}`;
+    const lotDedupeKey = `${buyerKey}:${amountCents != null ? Math.round(amountCents / 100 / 500) * 500 : "_"}:${Math.floor(offsetMs / 180_000)}:${leg}`;
     if (seenKeys.has(dedupeKey) || seenKeys.has(lotDedupeKey)) {
       skippedDuplicate++;
       continue;

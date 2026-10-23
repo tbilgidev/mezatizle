@@ -31,6 +31,8 @@ export interface ParsedAuctionSignal {
   productHint?: string;
   /** Nunus-style tray index («1 numara …»). */
   lotNumber?: number;
+  /** Packing quantity («4 tane …») — reconcile may emit one sale per unit. */
+  quantity?: number;
   /** Descriptor tokens for later «mavi aldım» / «kolye ucu aldım» matching. */
   descriptorTokens?: string[];
   confidence: number;
@@ -76,7 +78,11 @@ const UNSOLD_RE =
  * `\bsold\b` (not bare `sold`) — Turkish «soldan» / «şimdi soldan» must NOT match.
  */
 const SOLD_RE =
-  /(sat[ıi]ld[ıi]|\bsold(?:\s+to)?\b|alan(?:[ıi])?\s+bell[iı]|satt[ıi]k|kazanan\s*[:@]|gitti\s*[@]|kapatt[ıi]k|onaylad[ıi]m\s*sat|tebrikler\s*@|['']?da\s+kald[ıi]|da\s+kald[ıi]|kazand[ıi]|ald[ıi]\s+@|@\w+\s+ald[ıi])/i;
+  /(sat[ıi]ld[ıi]|\bsold(?:\s+to)?\b|alan(?:[ıi])?\s+bell[iı]|satt[ıi]k|kazanan\s*[:@]|gitti\s*[@]|kapatt[ıi]k|onaylad[ıi]m\s*sat|tebrikler\s*@|['']da\s+kald[ıi]|(?<![a-zçğıöşüA-ZÇĞİÖŞÜ])(?!(?:ara|bura|ora|sura|şura)da\b)[A-Za-zÇĞİÖŞÜçğıöşü]{2,24}['']?da\s+kald[ıi]|kazand[ıi]|ald[ıi]\s+@|@\w+\s+ald[ıi])/i;
+
+/** «Arada kaldım» / «burada kaldı» chatter — NOT a sold-to-name phrase. */
+const ARADA_KALDIM_RE =
+  /\b(?:ara|bura|ora|sura|şura)da\s+kald[ıi]m?\b/i;
 
 /** Honorific after a spoken first name in verbal win phrases. */
 const HONORIFIC =
@@ -540,14 +546,16 @@ function spokenNameMatchForms(spoken: string): string[] {
 
 function acceptSpokenName(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
-  // ASR often glues honorific: «Cihayranımcım» → Cihayra, «Banuhanım» → Banu
+  // ASR often glues honorific: «Cihayranımcım» → Cihayra, «Banuhanım» → Banu.
+  // Avoid JS `/i` with Turkish ı (U+0131). «cım» = c+ı+m; «cığım» = c+ı+ğ+ı+m.
   let name = raw.trim();
+  const gluedCim = "c[ıiİI](?:[gğGĞ][ıiİI])?m";
   name = name
-    .replace(/han[ıi]m(?:c[ıi][gğ]?[ıi]m)?$/i, "")
+    .replace(new RegExp(`han[ıiİI]m(?:${gluedCim})?$`), "")
     .trim();
-  // Whisper sometimes drops the leading h: «Cihayra»+«anımcım»
-  name = name.replace(/n[ıi]mc[ıi][gğ]?[ıi]m$/i, "").trim();
-  name = name.replace(/c[ıi][gğ]?[ıi]m$/i, "").trim();
+  // Whisper sometimes drops the leading h: «Cihayra»+«nımcım»
+  name = name.replace(new RegExp(`n[ıiİI]m${gluedCim}$`), "").trim();
+  name = name.replace(new RegExp(`${gluedCim}$`), "").trim();
   name = name.replace(/(?:bey|abla|abi)$/i, "").trim();
   if (name.length < 3) name = raw.trim();
   if (name.length < 3) return undefined;
@@ -690,10 +698,13 @@ function nameTokenMatchesSpoken(spoken: string, token: string): boolean {
   if (!token || token.length < 3) return false;
   if (token === spoken) return true;
   if (token.startsWith(spoken) || spoken.startsWith(token)) return true;
-  // ASR typos: «Şeyhna»↔«Şehnaz», «Bano»↔«Banu».
+  // ASR typos: «Şeyhna»↔«Şehnaz», «Bano»↔«Banu», «Cihayr»↔«Cihayra».
   if (spoken.length >= 4 && token.length >= 4) {
-    const max = spoken.length >= 6 ? 2 : 1;
+    const max = spoken.length >= 5 || token.length >= 5 ? 2 : 1;
     return editDistanceAtMost(spoken, token, max);
+  }
+  if (spoken.length >= 3 && token.length >= 3) {
+    return editDistanceAtMost(spoken, token, 1);
   }
   return false;
 }
@@ -1132,9 +1143,10 @@ export function parseAuctionText(
 
   // Explicit win / sold (seller confirmation) — requires evidence later
   if (SOLD_RE.test(t)) {
-    // Questions («satıldı mı») are chatter — never a sale confirm.
+    // Questions («satıldı mı») / «arada kaldım» chatter — never a sale confirm.
     if (
       /\?/.test(t) ||
+      ARADA_KALDIM_RE.test(t) ||
       /sat[ıi]ld[ıi]\s*(?:mi|mı|mü|mu)\b/i.test(t) ||
       /(?:mi|mı|mü|mu)\s+sat[ıi]ld/i.test(t)
     ) {
@@ -1166,9 +1178,9 @@ export function parseAuctionText(
       : amountTry != null
         ? 0.7
         : 0.62;
-    // «4 tane arora 600 bağno hanımda» — unit price × qty (TRY recall).
-    let soldAmount = amountTry;
+    // «4 tane arora 600 bağno hanımda» — keep unit price + quantity (split later).
     let reasonOut = bare ? "verbal_win_bare" : "verbal_win_named";
+    let quantity: number | undefined;
     const qtyM = t.match(/(\d{1,2})\s*tane\b/i);
     if (
       spokenBuyerName &&
@@ -1179,15 +1191,16 @@ export function parseAuctionText(
     ) {
       const q = Number(qtyM[1]);
       if (q >= 2 && q <= 12) {
-        soldAmount = amountTry * q;
+        quantity = q;
         reasonOut = "verbal_win_named_qty";
       }
     }
     return {
       eventType: "sold",
-      amountTry: soldAmount,
+      amountTry,
       buyerHint,
       spokenBuyerName,
+      quantity,
       confidence: conf,
       matched: t,
       reason: reasonOut,
@@ -1515,6 +1528,7 @@ export type TimelineEvent = {
   confidence: number;
   productHint?: string;
   lotNumber?: number;
+  quantity?: number;
   descriptorTokens?: string[];
 };
 
@@ -1688,6 +1702,20 @@ export function dedupeSaleCandidates(sales: SaleCandidate[]): SaleCandidate[] {
       // Confirmed vs needs_review are distinct operator rows (glam dual 2000+2500).
       if (Boolean(o.needsReview) !== Boolean(s.needsReview)) return false;
       if (!o.buyerUsername || o.buyerUsername !== s.buyerUsername) return false;
+      // Multi-item qty / dual legs must not collapse («4 tane 600» → 4 rows).
+      const oQty = (o.reason ?? "").match(/qty_(\d+)_of_(\d+)/);
+      const sQty = (s.reason ?? "").match(/qty_(\d+)_of_(\d+)/);
+      if (oQty || sQty) {
+        // Different packing legs, or qty vs prior single — keep both.
+        if (!oQty || !sQty) return false;
+        if (oQty[1] !== sQty[1]) return false;
+      }
+      if (
+        /dual_same_price_leg_|dual_same_price_second/.test(o.reason ?? "") ||
+        /dual_same_price_leg_|dual_same_price_second/.test(s.reason ?? "")
+      ) {
+        if ((o.reason ?? "") !== (s.reason ?? "")) return false;
+      }
       if (o.amountTry == null || s.amountTry == null) {
         return Math.abs(o.offsetMs - s.offsetMs) <= SALE_DEDUP_WINDOW_MS;
       }
@@ -1764,6 +1792,37 @@ export function reconcileMezatWindows(
       askAmountTry,
       needsReview: true,
     });
+  };
+
+  /** Emit one sale per packing unit («4 tane … 600» → 4×600). */
+  const pushSaleUnits = (
+    cand: SaleCandidate,
+    quantity: number | undefined,
+    opts?: { needsReview?: boolean },
+  ) => {
+    const unit = cand.amountTry ?? cand.askAmountTry;
+    const q =
+      quantity != null && quantity >= 2 && quantity <= 12 && unit != null
+        ? quantity
+        : 1;
+    for (let i = 0; i < q; i++) {
+      const row: SaleCandidate = {
+        ...cand,
+        offsetMs: cand.offsetMs + i,
+        amountTry: unit,
+        askAmountTry: unit ?? cand.askAmountTry,
+        reason:
+          q > 1
+            ? `${cand.reason ?? "sold"}+qty_${i + 1}_of_${q}`
+            : cand.reason,
+        evidenceQuote:
+          q > 1 && cand.evidenceQuote
+            ? `${cand.evidenceQuote} (${i + 1}/${q})`
+            : cand.evidenceQuote,
+      };
+      if (opts?.needsReview) pushNeedsReview(row);
+      else sales.push(row);
+    }
   };
 
   const emitNamedMiss = (lot: LotWindow) => {
@@ -2446,7 +2505,7 @@ export function reconcileMezatWindows(
         }
       }
 
-      // «2000+ 2500 = 4500» — one amount may be the confirmed lot; the other needs review.
+      // «2000+2500=4500» / Nunus «800+800» — two sell legs for the same buyer.
       if (dualSum && ev.buyerHint && ev.source === "comment") {
         const claimAsk = win && !win.closed ? lotSaleAsk(win) : undefined;
         const alreadyConfirmed = sales
@@ -2457,10 +2516,80 @@ export function reconcileMezatWindows(
               s.amountTry != null,
           )
           .map((s) => s.amountTry!);
+        const aDone = alreadyConfirmed.some((x) => amountsNear(x, dualSum.a));
+        const bDone = alreadyConfirmed.some((x) => amountsNear(x, dualSum.b));
+        // Same-price dual («800+800»): two unit sales for the buyer.
+        const samePrice = amountsNear(dualSum.a, dualSum.b);
+        if (samePrice) {
+          const unit = dualSum.a;
+          const near = nearestRecentAsk(ev.offsetMs);
+          const priced =
+            (claimAsk != null && amountsNear(claimAsk, unit)
+              ? claimAsk
+              : undefined) ??
+            (saneAsk(near?.amountTry) != null &&
+            amountsNear(near!.amountTry, unit)
+              ? near!.amountTry
+              : undefined) ??
+            unit;
+          if (win && !win.closed && !win.aldimClaim) {
+            claimLot(win, {
+              buyer: ev.buyerHint,
+              offsetMs: ev.offsetMs,
+              eventId: ev.id,
+              amountTry: priced,
+              matched: ev.matched,
+            });
+            emitAldimSale(win);
+            win.closed = true;
+            win = null;
+            // Second same-price leg
+            pushNeedsReview({
+              offsetMs: ev.offsetMs + 1,
+              amountTry: priced,
+              buyerUsername: ev.buyerHint,
+              confidence: 0.72,
+              reason: "dual_same_price_second_leg",
+              saleMethod: "aldim_first_comment",
+              evidenceEventIds: [ev.id],
+              productHint: near?.hint ?? ev.matched.slice(0, 120),
+              askAmountTry: priced,
+              evidenceQuote: ev.matched.slice(0, 200),
+            });
+          } else if (!aDone && !bDone) {
+            for (let leg = 0; leg < 2; leg++) {
+              sales.push({
+                offsetMs: ev.offsetMs + leg,
+                amountTry: priced,
+                buyerUsername: ev.buyerHint,
+                confidence: 0.8,
+                reason: `dual_same_price_leg_${leg + 1}`,
+                saleMethod: "aldim_first_comment",
+                evidenceEventIds: [ev.id],
+                productHint: near?.hint ?? ev.matched.slice(0, 120),
+                askAmountTry: priced,
+                evidenceQuote: ev.matched.slice(0, 200),
+              });
+            }
+          } else if (aDone !== bDone) {
+            pushNeedsReview({
+              offsetMs: ev.offsetMs,
+              amountTry: priced,
+              buyerUsername: ev.buyerHint,
+              confidence: 0.56,
+              reason: "dual_same_price_second_needs_review",
+              saleMethod: "aldim_first_comment",
+              evidenceEventIds: [ev.id],
+              productHint: win?.productHint ?? ev.matched.slice(0, 120),
+              askAmountTry: priced,
+              evidenceQuote: ev.matched.slice(0, 200),
+            });
+          }
+          pendingDualReview = null;
+          continue;
+        }
         // Prefer the sum leg that is NOT already a confirmed sale for this buyer.
         const pickSecond = (): number => {
-          const aDone = alreadyConfirmed.some((x) => amountsNear(x, dualSum.a));
-          const bDone = alreadyConfirmed.some((x) => amountsNear(x, dualSum.b));
           if (aDone && !bDone) return dualSum.b;
           if (bDone && !aDone) return dualSum.a;
           if (
@@ -2477,7 +2606,6 @@ export function reconcileMezatWindows(
           ) {
             return dualSum.a;
           }
-          // Open lot ask is often the second item when sum lands mid-packing.
           if (claimAsk != null && amountsNear(dualSum.b, claimAsk)) {
             return dualSum.b;
           }
@@ -2487,6 +2615,24 @@ export function reconcileMezatWindows(
           return dualSum.b;
         };
         const second = pickSecond();
+        // First leg: claim open lot when ask matches either side.
+        if (win && !win.closed && !win.aldimClaim && claimAsk != null) {
+          if (
+            amountsNear(claimAsk, dualSum.a) ||
+            amountsNear(claimAsk, dualSum.b)
+          ) {
+            claimLot(win, {
+              buyer: ev.buyerHint,
+              offsetMs: ev.offsetMs,
+              eventId: ev.id,
+              amountTry: claimAsk,
+              matched: ev.matched,
+            });
+            emitAldimSale(win);
+            win.closed = true;
+            win = null;
+          }
+        }
         pushNeedsReview({
           offsetMs: ev.offsetMs,
           amountTry: second,
@@ -2501,19 +2647,7 @@ export function reconcileMezatWindows(
           askAmountTry: second,
           evidenceQuote: ev.matched.slice(0, 200),
         });
-        // Already emitted — do not also fire on the next openLot.
         pendingDualReview = null;
-        if (win && !win.closed) {
-          win.dualClaimPending = undefined;
-          win.bids.push({
-            offsetMs: ev.offsetMs,
-            amountTry: second,
-            buyerHint: ev.buyerHint,
-            source: ev.source,
-            reason: "dual_claim_sum",
-            eventId: ev.id,
-          });
-        }
         continue;
       }
 
@@ -2993,19 +3127,22 @@ export function reconcileMezatWindows(
           openWin.closed = true;
           win = null;
         }
-        sales.push({
-          offsetMs: ev.offsetMs,
-          amountTry: amount,
-          buyerUsername: buyer,
-          spokenBuyerName: ev.spokenBuyerName,
-          confidence,
-          reason: `${reason || "sold"}+${method}`,
-          saleMethod: method,
-          evidenceEventIds: [...new Set(evidence)],
-          productHint: ev.productHint ?? ev.matched.slice(0, 120),
-          askAmountTry: lotAsk ?? amount,
-          evidenceQuote: ev.matched.slice(0, 200),
-        });
+        pushSaleUnits(
+          {
+            offsetMs: ev.offsetMs,
+            amountTry: amount,
+            buyerUsername: buyer,
+            spokenBuyerName: ev.spokenBuyerName,
+            confidence,
+            reason: `${reason || "sold"}+${method}`,
+            saleMethod: method,
+            evidenceEventIds: [...new Set(evidence)],
+            productHint: ev.productHint ?? ev.matched.slice(0, 120),
+            askAmountTry: lotAsk ?? amount,
+            evidenceQuote: ev.matched.slice(0, 200),
+          },
+          ev.quantity,
+        );
         continue;
       }
 
@@ -3054,6 +3191,7 @@ export function reconcileMezatWindows(
         const priced = amount ?? near?.amountTry;
         // Same buyer packing another (different) price is a new sale —
         // only skip when amount is missing or near the prior confirm.
+        const qty = ev.quantity != null && ev.quantity >= 2 ? ev.quantity : 1;
         const alreadyConfirmed = sales.some((s) => {
           if (s.needsReview) return false;
           if (Math.abs(s.offsetMs - ev.offsetMs) > SALE_DEDUP_WINDOW_MS)
@@ -3064,6 +3202,8 @@ export function reconcileMezatWindows(
             (s.buyerUsername != null &&
               foldTrToken(s.buyerUsername).includes(spokenFold));
           if (!samePerson) return false;
+          // «4 tane 600» after a prior single 600 is additional inventory.
+          if (qty >= 2) return false;
           if (priced == null || s.amountTry == null) return true;
           return amountsNear(s.amountTry, priced);
         });
@@ -3080,40 +3220,68 @@ export function reconcileMezatWindows(
             pool.push({ buyerHint: o.buyer });
           }
         }
-        const hits = matchSpokenNameHits(ev.spokenBuyerName, pool);
+        // Wider commenter pool for packing confirms (Nunus names lag comments).
+        const widePool = recentCommenters
+          .filter(
+            (c) =>
+              ev.offsetMs - c.offsetMs <= SALE_BID_LOOKBACK_MS * 4 &&
+              c.offsetMs <= ev.offsetMs + 10_000,
+          )
+          .map((c) => ({ buyerHint: c.buyerHint }));
+        for (const o of orphanClaims) {
+          if (Math.abs(ev.offsetMs - o.offsetMs) <= SALE_BID_LOOKBACK_MS * 4) {
+            widePool.push({ buyerHint: o.buyer });
+          }
+        }
+        const hits = matchSpokenNameHits(ev.spokenBuyerName, [
+          ...pool,
+          ...widePool,
+        ]);
         if (hits.length === 1 && priced != null && saneAsk(priced) != null) {
-          sales.push({
-            offsetMs: ev.offsetMs,
-            amountTry: priced,
-            buyerUsername: hits[0],
-            spokenBuyerName: ev.spokenBuyerName,
-            confidence: 0.86,
-            reason: "verbal_hanimda_no_lot+name_match",
-            saleMethod: "verbal_win_confirm",
-            evidenceEventIds: [ev.id],
-            productHint: near?.hint ?? ev.matched.slice(0, 120),
-            askAmountTry: priced,
-            evidenceQuote: ev.matched.slice(0, 200),
-          });
+          pushSaleUnits(
+            {
+              offsetMs: ev.offsetMs,
+              amountTry: amount ?? priced,
+              buyerUsername: hits[0],
+              spokenBuyerName: ev.spokenBuyerName,
+              confidence: 0.86,
+              reason: "verbal_hanimda_no_lot+name_match",
+              saleMethod: "verbal_win_confirm",
+              evidenceEventIds: [ev.id],
+              productHint: near?.hint ?? ev.matched.slice(0, 120),
+              askAmountTry: amount ?? priced,
+              evidenceQuote: ev.matched.slice(0, 200),
+            },
+            ev.quantity,
+          );
           continue;
         }
-        if (priced != null) {
-          pushNeedsReview({
-            offsetMs: ev.offsetMs,
-            amountTry: priced,
-            buyerUsername: hits[0],
-            spokenBuyerName: ev.spokenBuyerName,
-            confidence: 0.5,
-            reason:
-              hits.length > 1
-                ? "verbal_win_no_lot_ambiguous_needs_review"
-                : "verbal_win_no_lot_needs_review",
-            saleMethod: "verbal_win_confirm",
-            evidenceEventIds: [ev.id],
-            productHint: near?.hint ?? ev.matched.slice(0, 120),
-            askAmountTry: priced,
-            evidenceQuote: ev.matched.slice(0, 200),
-          });
+        // Always surface named packing for review with price — never silent drop.
+        const reviewPrice =
+          saneAsk(amount) ?? priced ?? nearestRecentAsk(ev.offsetMs)?.amountTry;
+        if (reviewPrice != null || hits.length > 0) {
+          pushSaleUnits(
+            {
+              offsetMs: ev.offsetMs,
+              amountTry: reviewPrice,
+              buyerUsername: hits.length === 1 ? hits[0] : hits[0],
+              spokenBuyerName: ev.spokenBuyerName,
+              confidence: 0.5,
+              reason:
+                hits.length > 1
+                  ? "verbal_win_no_lot_ambiguous_needs_review"
+                  : hits.length === 1
+                    ? "verbal_win_no_lot_needs_review"
+                    : "verbal_win_named_unmatched_needs_review",
+              saleMethod: "verbal_win_confirm",
+              evidenceEventIds: [ev.id],
+              productHint: near?.hint ?? ev.matched.slice(0, 120),
+              askAmountTry: reviewPrice,
+              evidenceQuote: ev.matched.slice(0, 200),
+            },
+            ev.quantity,
+            { needsReview: true },
+          );
         }
         continue;
       }
@@ -3343,17 +3511,32 @@ export function isDualAldimClaimText(text: string): boolean {
  * Comment arithmetic «2000+ 2500 = 4500» → two lot asks (second often needs_review).
  */
 export function parseDualClaimSum(text: string): { a: number; b: number; sum: number } | undefined {
-  const m = text.match(
+  const withEq = text.match(
     /(\d{3,5})\s*\+\s*(\d{3,5})\s*=\s*(\d{3,6})/,
   );
-  if (!m?.[1] || !m[2] || !m[3]) return undefined;
-  const a = Number(m[1]);
-  const b = Number(m[2]);
-  const sum = Number(m[3]);
-  if (![a, b, sum].every((n) => Number.isFinite(n) && n >= OFFER_AMOUNT_SANITY_MIN_TRY)) {
-    return undefined;
+  if (withEq?.[1] && withEq[2] && withEq[3]) {
+    const a = Number(withEq[1]);
+    const b = Number(withEq[2]);
+    const sum = Number(withEq[3]);
+    if ([a, b, sum].every((n) => Number.isFinite(n) && n >= OFFER_AMOUNT_SANITY_MIN_TRY)) {
+      return { a, b, sum };
+    }
   }
-  return { a, b, sum };
+  // Nunus chat: bare «800+800» / «800 + 800» (no equals) = two same-price takes.
+  const bare = text.match(/^\s*(\d{3,5})\s*\+\s*(\d{3,5})\s*$/);
+  if (bare?.[1] && bare[2]) {
+    const a = Number(bare[1]);
+    const b = Number(bare[2]);
+    if (
+      Number.isFinite(a) &&
+      Number.isFinite(b) &&
+      a >= OFFER_AMOUNT_SANITY_MIN_TRY &&
+      b >= OFFER_AMOUNT_SANITY_MIN_TRY
+    ) {
+      return { a, b, sum: a + b };
+    }
+  }
+  return undefined;
 }
 
 /** Floor so double-ASR of the same utterance does not split a lot. */
