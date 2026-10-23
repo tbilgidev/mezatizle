@@ -282,6 +282,13 @@ export async function reconcileSales(
       confidence: Number(r.confidence ?? p.confidence ?? 0),
       productHint:
         typeof p.productHint === "string" ? p.productHint : undefined,
+      lotNumber:
+        p.lotNumber != null && Number.isFinite(Number(p.lotNumber))
+          ? Number(p.lotNumber)
+          : undefined,
+      descriptorTokens: Array.isArray(p.descriptorTokens)
+        ? p.descriptorTokens.filter((t): t is string => typeof t === "string")
+        : undefined,
     };
   });
 

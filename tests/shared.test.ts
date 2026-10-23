@@ -117,7 +117,9 @@ describe("Turkish auction rules", () => {
     const nine = parseAuctionText("9", { source: "comment" });
     expect(nine?.eventType).toBe("bid");
     expect(nine?.amountTry).toBe(9000);
-    expect(nine?.reason).toBe("comment_number_bid");
+    // 1–20 bare digits are tray-or-pey candidates (reconcile picks tray when open).
+    expect(nine?.reason).toBe("comment_lot_number_or_bid");
+    expect(nine?.lotNumber).toBe(9);
     expect(parseAuctionText("10", { source: "comment" })?.amountTry).toBe(
       10000,
     );
@@ -1406,6 +1408,271 @@ describe("product lot dedup (sparse offers)", () => {
     expect(s.productsOffered).toBeLessThanOrEqual(6);
     expect(s.productsOffered).toBeGreaterThanOrEqual(2);
     expect(s.offeredSumTry).toBe(7000 + 3000 + 12000);
+  });
+});
+
+describe("Nunus numbered tray + descriptor claims", () => {
+  const ev = (
+    partial: Partial<TimelineEvent> &
+      Pick<TimelineEvent, "id" | "offsetMs" | "eventType" | "matched">,
+  ): TimelineEvent => ({
+    source: "transcript",
+    confidence: 0.8,
+    ...partial,
+  });
+
+  test("parse: multi numbered tray asks emit one lot per number", () => {
+    const signals = parseAuctionTexts(
+      "1 numara 1000 TL, 2 numara 1200 TL, 3 numara 800 lira",
+      { source: "transcript" },
+    );
+    expect(signals.length).toBe(3);
+    expect(signals.map((s) => s.lotNumber)).toEqual([1, 2, 3]);
+    expect(signals.map((s) => s.amountTry)).toEqual([1000, 1200, 800]);
+    expect(signals.every((s) => s.reason === "numbered_lot_ask")).toBe(true);
+  });
+
+  test("parse: numbered verbal confirm + soft asks + descriptor aldım", () => {
+    const conf = parseAuctionText("1 numara Gamze hanım", {
+      source: "transcript",
+    });
+    expect(conf?.eventType).toBe("sold");
+    expect(conf?.lotNumber).toBe(1);
+    expect(conf?.spokenBuyerName?.toLowerCase()).toContain("gamze");
+    expect(conf?.reason).toBe("numbered_lot_verbal_confirm");
+
+    expect(
+      parseAuctionText("800 kolye", { source: "transcript" })?.amountTry,
+    ).toBe(800);
+    expect(
+      parseAuctionText("Bu da 700 diyelim.", { source: "transcript" })
+        ?.amountTry,
+    ).toBe(700);
+
+    const d = parseAuctionText("mavi kristalli kolye aldım", {
+      source: "comment",
+    });
+    expect(d?.reason).toBe("descriptor_aldim_claim");
+    expect(d?.descriptorTokens?.length).toBeGreaterThan(0);
+  });
+
+  test("reconcile: numbered tray — digit claims + verbal confirms, no double count", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "n1",
+        offsetMs: 1000,
+        eventType: "price_mention",
+        matched: "1 numara 1000 TL",
+        amountTry: 1000,
+        lotNumber: 1,
+        reason: "numbered_lot_ask",
+        productHint: "1 numara",
+      }),
+      ev({
+        id: "n2",
+        offsetMs: 1100,
+        eventType: "price_mention",
+        matched: "2 numara 1200 TL",
+        amountTry: 1200,
+        lotNumber: 2,
+        reason: "numbered_lot_ask",
+        productHint: "2 numara",
+      }),
+      ev({
+        id: "n3",
+        offsetMs: 1200,
+        eventType: "price_mention",
+        matched: "3 numara 800 TL",
+        amountTry: 800,
+        lotNumber: 3,
+        reason: "numbered_lot_ask",
+        productHint: "3 numara",
+      }),
+      ev({
+        id: "c1",
+        offsetMs: 5000,
+        eventType: "bid",
+        matched: "1",
+        lotNumber: 1,
+        amountTry: 1000,
+        buyerHint: "gamze.yuksel.07",
+        reason: "comment_lot_number_or_bid",
+        source: "comment",
+      }),
+      ev({
+        id: "c3",
+        offsetMs: 6000,
+        eventType: "bid",
+        matched: "3",
+        lotNumber: 3,
+        amountTry: 3000,
+        buyerHint: "claudia.demo",
+        reason: "comment_lot_number_or_bid",
+        source: "comment",
+      }),
+      ev({
+        id: "c1b",
+        offsetMs: 7000,
+        eventType: "bid",
+        matched: "1",
+        lotNumber: 1,
+        amountTry: 1000,
+        buyerHint: "someone.else",
+        reason: "comment_lot_number_or_bid",
+        source: "comment",
+      }),
+      ev({
+        id: "v1",
+        offsetMs: 12_000,
+        eventType: "sold",
+        matched: "1 numara Gamze hanım",
+        lotNumber: 1,
+        spokenBuyerName: "Gamze",
+        reason: "numbered_lot_verbal_confirm",
+      }),
+      ev({
+        id: "v3",
+        offsetMs: 13_000,
+        eventType: "sold",
+        matched: "3 numara Claudia hanım",
+        lotNumber: 3,
+        spokenBuyerName: "Claudia",
+        reason: "numbered_lot_verbal_confirm",
+      }),
+    ]);
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBe(2);
+    expect(confirmed.map((s) => s.buyerUsername).sort()).toEqual([
+      "claudia.demo",
+      "gamze.yuksel.07",
+    ]);
+    expect(confirmed.find((s) => s.buyerUsername === "gamze.yuksel.07")!.amountTry).toBe(
+      1000,
+    );
+    expect(confirmed.find((s) => s.buyerUsername === "claudia.demo")!.amountTry).toBe(
+      800,
+    );
+    // Second «1» comment must not create another sale.
+    expect(confirmed.every((s) => s.buyerUsername !== "someone.else")).toBe(true);
+  });
+
+  test("reconcile: sequential descriptors — later «mavi aldım» matches parked lot", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "a",
+        offsetMs: 1000,
+        eventType: "price_mention",
+        matched: "mavi kristalli kolye 1500 lira",
+        amountTry: 1500,
+        reason: "seller_price_line",
+        productHint: "mavi kristalli kolye",
+        descriptorTokens: ["mavi", "kristalli", "kolye"],
+      }),
+      ev({
+        id: "b",
+        offsetMs: 40_000,
+        eventType: "price_mention",
+        matched: "sarı boncuklu bileklik 900 lira",
+        amountTry: 900,
+        reason: "seller_price_line",
+        productHint: "sarı boncuklu bileklik",
+        descriptorTokens: ["sari", "boncuklu", "bileklik"],
+      }),
+      ev({
+        id: "c",
+        offsetMs: 80_000,
+        eventType: "price_mention",
+        matched: "kolye ucu 700 lira",
+        amountTry: 700,
+        reason: "seller_price_line",
+        productHint: "kolye ucu",
+        descriptorTokens: ["kolye", "ucu"],
+      }),
+      ev({
+        id: "claim-a",
+        offsetMs: 100_000,
+        eventType: "bid",
+        matched: "mavi aldım",
+        buyerHint: "ayse.demo",
+        reason: "descriptor_aldim_claim",
+        source: "comment",
+        descriptorTokens: ["mavi"],
+        productHint: "mavi",
+      }),
+      ev({
+        id: "claim-c",
+        offsetMs: 110_000,
+        eventType: "bid",
+        matched: "kolye ucu aldım",
+        buyerHint: "banu.demo",
+        reason: "descriptor_aldim_claim",
+        source: "comment",
+        descriptorTokens: ["kolye", "ucu"],
+        productHint: "kolye ucu",
+      }),
+    ]);
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBeGreaterThanOrEqual(2);
+    expect(
+      confirmed.some(
+        (s) => s.buyerUsername === "ayse.demo" && s.amountTry === 1500,
+      ),
+    ).toBe(true);
+    expect(
+      confirmed.some(
+        (s) => s.buyerUsername === "banu.demo" && s.amountTry === 700,
+      ),
+    ).toBe(true);
+  });
+
+  test("needs_review orphan keeps price from «Aldım 800» comment", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "c",
+        offsetMs: 50_000,
+        eventType: "bid",
+        matched: "Aldım 800",
+        amountTry: 800,
+        buyerHint: "gamze.yuksel.07",
+        reason: "aldim_claim",
+        source: "comment",
+      }),
+    ]);
+    expect(sales.length).toBe(1);
+    expect(sales[0]!.needsReview).toBe(true);
+    expect(sales[0]!.amountTry).toBe(800);
+    expect(sales[0]!.askAmountTry).toBe(800);
+  });
+
+  test("same-price «bu da 800» opens distinct offered lots", () => {
+    const lots = summarizeOfferWindows([
+      ev({
+        id: "a1",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "Bu da 800 lira",
+        amountTry: 800,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "a2",
+        offsetMs: 30_000,
+        eventType: "price_mention",
+        matched: "Bu da 800 lira",
+        amountTry: 800,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "a3",
+        offsetMs: 60_000,
+        eventType: "price_mention",
+        matched: "Bu da 800 diyelim",
+        amountTry: 800,
+        reason: "seller_price_line",
+      }),
+    ]);
+    expect(lots.productsOffered).toBe(3);
+    expect(lots.offeredSumTry).toBe(2400);
   });
 });
 
