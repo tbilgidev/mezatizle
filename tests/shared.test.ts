@@ -7,7 +7,9 @@ import {
   isSaleWorthy,
   isSellerAcceptPhrase,
   isVerbalWinPhrase,
+  matchSpokenNameHits,
   matchSpokenNameToBuyer,
+  normalizeClaimOrthography,
   normalizeInstagramUsername,
   parseAuctionText,
   parseAuctionTexts,
@@ -1900,6 +1902,176 @@ describe("Nunus numbered tray + descriptor claims", () => {
       parseAuctionText("Hayırlı uğurlu olsun.", { source: "transcript" })
         ?.eventType,
     ).toBe("sold");
+  });
+
+  test("Nunus live: ASR bağno/Bano → Banu + banubyktskn match", () => {
+    const bagno = parseAuctionText("Tamam buna 600 bu bağno hanımda.", {
+      source: "transcript",
+    });
+    expect(bagno?.eventType).toBe("sold");
+    expect(bagno?.spokenBuyerName?.toLowerCase()).toBe("banu");
+    expect(bagno?.amountTry).toBe(600);
+
+    const qty = parseAuctionText(
+      "Şuradakilerde 4 tane arora 600 bağno hanımda.",
+      { source: "transcript" },
+    );
+    expect(qty?.reason).toBe("verbal_win_named_qty");
+    expect(qty?.amountTry).toBe(2400);
+    expect(qty?.spokenBuyerName?.toLowerCase()).toBe("banu");
+
+    expect(
+      matchSpokenNameHits("Bano", [{ buyerHint: "banubyktskn" }]),
+    ).toEqual(["banubyktskn"]);
+    expect(
+      matchSpokenNameHits("bağno", [{ buyerHint: "banubyktskn" }]),
+    ).toEqual(["banubyktskn"]);
+  });
+
+  test("Nunus live: OCR aldm / alayım claims", () => {
+    expect(normalizeClaimOrthography("Dnz yldz aldm")).toMatch(/ald[ıi]m/i);
+    expect(
+      parseAuctionText("700 u alayim", { source: "comment" })?.reason,
+    ).toBe("aldim_claim");
+    expect(
+      parseAuctionText("700 u alayim", { source: "comment" })?.amountTry,
+    ).toBe(700);
+    expect(
+      parseAuctionText("Aldmmm", { source: "comment" })?.reason,
+    ).toBe("aldim_claim");
+    expect(
+      parseAuctionText("Dnz yldz aldm", { source: "comment" })?.reason,
+    ).toMatch(/aldim/);
+  });
+
+  test("Nunus live: İkisi de tamam + soft sizde no-lot → price commenter", () => {
+    expect(
+      parseAuctionText("İkisi de tamam.", { source: "transcript" })?.reason,
+    ).toBe("verbal_win_bare");
+    expect(
+      parseAuctionText("İkisi de 700.", { source: "transcript" })?.amountTry,
+    ).toBe(700);
+
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "İkisi de 700.",
+        amountTry: 700,
+        reason: "verbal_win_bare",
+      }),
+      ev({
+        id: "c",
+        offsetMs: 5_000,
+        eventType: "bid",
+        matched: "700 u aldım",
+        amountTry: 700,
+        buyerHint: "tito.pamela",
+        reason: "aldim_claim",
+        source: "comment",
+      }),
+      ev({
+        id: "vw",
+        offsetMs: 20_000,
+        eventType: "sold",
+        matched: "İkisi de tamam.",
+        reason: "verbal_win_bare",
+        confidence: 0.62,
+      }),
+      ev({
+        id: "vw2",
+        offsetMs: 25_000,
+        eventType: "sold",
+        matched: "O da sizde.",
+        reason: "verbal_win_bare",
+        confidence: 0.62,
+      }),
+    ]);
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBeGreaterThanOrEqual(1);
+    expect(confirmed.some((s) => s.buyerUsername === "tito.pamela")).toBe(
+      true,
+    );
+    expect(confirmed.some((s) => s.amountTry === 700)).toBe(true);
+  });
+
+  test("Nunus live: bağno hanımda confirms banubyktskn at spoken 600", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "Bu broş 1000 lira",
+        amountTry: 1000,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "c",
+        offsetMs: 8_000,
+        eventType: "bid",
+        matched: "Dnz yldz aldım",
+        buyerHint: "banubyktskn",
+        reason: "descriptor_aldim_claim",
+        source: "comment",
+      }),
+      ev({
+        id: "vw",
+        offsetMs: 20_000,
+        eventType: "sold",
+        matched: "Tamam buna 600 bu bağno hanımda.",
+        amountTry: 600,
+        spokenBuyerName: "Banu",
+        reason: "verbal_win_named",
+        confidence: 0.84,
+      }),
+    ]);
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBeGreaterThanOrEqual(1);
+    const banu = confirmed.find((s) => s.buyerUsername === "banubyktskn");
+    expect(banu).toBeTruthy();
+    expect(banu!.amountTry).toBe(600);
+  });
+
+  test("Nunus live: 4 tane … 600 bağno after single 600 is a distinct sale", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "c",
+        offsetMs: 0,
+        eventType: "bid",
+        matched: "Dnz yldz aldım",
+        buyerHint: "banubyktskn",
+        reason: "descriptor_aldim_claim",
+        source: "comment",
+      }),
+      ev({
+        id: "vw1",
+        offsetMs: 10_000,
+        eventType: "sold",
+        matched: "Tamam buna 600 bu bağno hanımda.",
+        amountTry: 600,
+        spokenBuyerName: "Banu",
+        reason: "verbal_win_named",
+        confidence: 0.84,
+      }),
+      ev({
+        id: "vw2",
+        offsetMs: 22_000,
+        eventType: "sold",
+        matched: "Şuradakilerde 4 tane arora 600 bağno hanımda.",
+        amountTry: 2400,
+        spokenBuyerName: "Banu",
+        reason: "verbal_win_named_qty",
+        confidence: 0.84,
+      }),
+    ]);
+    const banu = sales.filter(
+      (s) => !s.needsReview && s.buyerUsername === "banubyktskn",
+    );
+    expect(banu.length).toBe(2);
+    expect(banu.map((s) => s.amountTry).sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([
+      600, 2400,
+    ]);
   });
 
   test("same-price «bu da 800» opens distinct offered lots", () => {

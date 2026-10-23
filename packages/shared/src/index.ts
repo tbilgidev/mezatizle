@@ -101,6 +101,7 @@ export {
   descriptorOverlapScore,
   matchSpokenNameToBuyer,
   matchSpokenNameHits,
+  normalizeClaimOrthography,
   ALDIM_PRE_ASK_MS,
   ALDIM_CARRY_AFTER_CORRECTION_MS,
   isSellerAldimClosing,

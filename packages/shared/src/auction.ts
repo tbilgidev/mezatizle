@@ -131,11 +131,16 @@ const VERBAL_WIN_SIZ_BUNU_ALDI_RE = new RegExp(
 
 /** «ikisi de sizin olacak» / «sizin olacak» packing confirm. */
 const VERBAL_WIN_SIZIN_OLACAK_RE =
-  /\b(?:ikisi\s+de\s+)?sizin\s+olacak\b/i;
+  /\b(?:[iıİI]kisi\s+de\s+)?sizin\s+olacak\b/i;
 
 /** Soft confirm without a spoken name — only closes a lot that already has an aldım/bid. */
 const VERBAL_WIN_BARE_RE =
-  /^(?:tamam[,.]?\s+)?(?:hay[ıi]rl[ıi](?:\s+u[gğ]urlu)?\s+olsun(?:\s+can[ıi]m)?|g[uü]le\s+g[uü]le\s+(?:iyi\s+g[uü]nlerde\s+)?(?:kullan|tak[ıi]n?|giy)(?:\s+\S+){0,6}|ikisi\s+de\s+sizin\s+olacak|sizin\s+olacak|(?:bu\s+da\s+|o\s+da\s+)?sizde)[.!?…]*$/i;
+  /^(?:tamam[,.]?\s+)?(?:hay[ıi]rl[ıi](?:\s+u[gğ]urlu)?\s+olsun(?:\s+can[ıi]m)?|g[uü]le\s+g[uü]le\s+(?:iyi\s+g[uü]nlerde\s+)?(?:kullan|tak[ıi]n?|giy)(?:\s+\S+){0,6}|[iıİI]kisi\s+de\s+sizin\s+olacak|[iıİI]kisi\s+de\s+tamam|sizin\s+olacak|(?:bu\s+da\s+|o\s+da\s+)?sizde)[.!?…]*$/i;
+
+/** Seller «İkisi de 700» / «İkisi de tamam» — dual packing confirm.
+ * Leading İ must be explicit — JS `/i` does not fold Turkish İ→i. */
+const VERBAL_WIN_IKISI_DE_RE =
+  /(?:^|[^A-Za-zÇĞİÖŞÜçğıöşü])[iıİI]kisi\s+de\s+(?:tamam|olur|okey|okay|\d{2,7})\b/i;
 
 /**
  * Nunus packing: «Bu Deniz hanımda», «Banu hanımda 800», «Bano hanımda 1500».
@@ -413,8 +418,22 @@ export function parsePriceTry(text: string): number | undefined {
  * True when a follower comment «aldım» is a real take-it claim (not a question /
  * hypothetical). Prefer under-count: ambiguous questions never claim a lot.
  */
+/**
+ * OCR/chat typos: «Aldmm», «aldm», «Dnz yldz aldm», «700 u alayım».
+ * Expand before aldım / bid detection — never invent non-claim chatter.
+ */
+export function normalizeClaimOrthography(text: string): string {
+  let t = text.trim();
+  if (!t) return t;
+  // «alayım / alayim» (I'll take it) after a price → aldım
+  t = t.replace(/\balay[ıi]m\b/gi, "aldım");
+  // Collapsed / doubled m: aldm, aldmm, aldmmm
+  t = t.replace(/\baldm+\b/gi, "aldım");
+  return t;
+}
+
 export function isFollowerAldimClaimText(text: string): boolean {
-  const t = text.trim();
+  const t = normalizeClaimOrthography(text.trim());
   if (!t || !/ald[ıi]m/i.test(t)) return false;
   if (/\?/.test(t)) return false;
   if (/\bacaba\b/i.test(t)) return false;
@@ -494,22 +513,50 @@ const SPOKEN_NAME_STOP = new Set(
     "senin",
     "benim",
     "bunlar",
-    "bagno",
-    "bagin",
   ].map(foldTrToken),
 );
+
+/**
+ * Nunus / Whisper ASR first-name drift → canonical spoken form for handle match.
+ * «bağno»/«Bano» are Banu; do NOT put these in SPOKEN_NAME_STOP.
+ */
+const SPOKEN_NAME_ASR_ALIASES: Record<string, string> = {
+  bagno: "banu",
+  bano: "banu",
+  seyhna: "sehnaz",
+  sehna: "sehnaz",
+  cihayranimcim: "cihayra",
+  cihayranim: "cihayra",
+};
+
+function spokenNameMatchForms(spoken: string): string[] {
+  const folded = foldTrToken(spoken.trim());
+  if (folded.length < 3) return [];
+  const out = [folded];
+  const alias = SPOKEN_NAME_ASR_ALIASES[folded];
+  if (alias && alias !== folded) out.push(alias);
+  return out;
+}
 
 function acceptSpokenName(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
   // ASR often glues honorific: «Cihayranımcım» → Cihayra, «Banuhanım» → Banu
   let name = raw.trim();
+  name = name
+    .replace(/han[ıi]m(?:c[ıi][gğ]?[ıi]m)?$/i, "")
+    .trim();
+  // Whisper sometimes drops the leading h: «Cihayra»+«anımcım»
+  name = name.replace(/n[ıi]mc[ıi][gğ]?[ıi]m$/i, "").trim();
   name = name.replace(/c[ıi][gğ]?[ıi]m$/i, "").trim();
-  name = name.replace(/han[ıi]m$/i, "").trim();
   name = name.replace(/(?:bey|abla|abi)$/i, "").trim();
   if (name.length < 3) name = raw.trim();
   if (name.length < 3) return undefined;
-  if (SPOKEN_NAME_STOP.has(foldTrToken(name))) return undefined;
+  const folded = foldTrToken(name);
+  if (SPOKEN_NAME_STOP.has(folded)) return undefined;
   if (/^\d/.test(name)) return undefined;
+  // Nonsense ASR tokens that are never real first names → canonical.
+  // Keep «Şeyhna» etc. as surface form (aliases still help handle match).
+  if (folded === "bagno" || folded === "bano") return "Banu";
   return name;
 }
 
@@ -534,6 +581,7 @@ export function isVerbalWinPhrase(text: string): boolean {
   if (VERBAL_WIN_NAME_ONLY_SIZDE_RE.test(t)) return true;
   if (VERBAL_WIN_HANIMDA_RE.test(t) && !/\bsenin\s+han/i.test(t)) return true;
   if (VERBAL_WIN_SOFT_SIZDE_RE.test(t)) return true;
+  if (VERBAL_WIN_IKISI_DE_RE.test(t) && t.length <= 80) return true;
   if (VERBAL_WIN_PRODUCT_GITTI_RE.test(t) && t.length <= 60) return true;
   if (VERBAL_WIN_BRAVO_RE.test(t)) return true;
   if (VERBAL_WIN_ALDIM_GELDI_RE.test(t)) return true;
@@ -560,6 +608,7 @@ export function isVerbalWinPhrase(text: string): boolean {
 export function isBareVerbalWin(text: string): boolean {
   const t = text.trim();
   if (VERBAL_WIN_BARE_RE.test(t)) return true;
+  if (VERBAL_WIN_IKISI_DE_RE.test(t) && !parseSpokenBuyerName(t)) return true;
   if (VERBAL_WIN_SOFT_SIZDE_RE.test(t) && !parseSpokenBuyerName(t)) return true;
   if (VERBAL_WIN_PRODUCT_GITTI_RE.test(t) && t.length <= 60) return true;
   return false;
@@ -658,42 +707,46 @@ export function matchSpokenNameHits(
   spoken: string,
   candidates: Array<{ buyerHint?: string; displayName?: string }>,
 ): string[] {
-  const name = foldTrToken(spoken.trim());
-  if (name.length < 3) return [];
+  const names = spokenNameMatchForms(spoken);
+  if (!names.length) return [];
   const hits: string[] = [];
   for (const c of candidates) {
     const user = (c.buyerHint ?? "").trim().replace(/^@/, "").toLowerCase();
     if (!user) continue;
     const display = c.displayName ? foldTrToken(c.displayName) : "";
     let ok = false;
-    if (display) {
-      const displayTokens = display
-        .split(/[^a-z0-9]+/)
-        .filter((t) => t.length >= 3);
-      if (
-        display === name ||
-        displayTokens.some((t) => nameTokenMatchesSpoken(name, t))
-      ) {
-        ok = true;
-      }
-    }
-    const foldedUser = foldTrToken(user);
-    if (!ok && foldedUser.includes(name)) ok = true;
-    if (!ok) {
-      const tokens = foldedUser
-        .split(/[^a-z0-9]+/)
-        .filter((t) => t.length >= 3);
-      // Username prefix before trailing digits (halecaloglu1 → halecaloglu)
-      const prefix = foldedUser.replace(/\d+$/g, "");
-      if (prefix.length >= 3) tokens.push(prefix);
-      // First-name glued into handle: sehnazsenerergun ↔ «Şehnaz» / ASR «Şeyhna»
-      if (name.length >= 5 && foldedUser.length >= name.length) {
-        tokens.push(foldedUser.slice(0, name.length));
-        if (foldedUser.length > name.length) {
-          tokens.push(foldedUser.slice(0, name.length + 1));
+    for (const name of names) {
+      if (display) {
+        const displayTokens = display
+          .split(/[^a-z0-9]+/)
+          .filter((t) => t.length >= 3);
+        if (
+          display === name ||
+          displayTokens.some((t) => nameTokenMatchesSpoken(name, t))
+        ) {
+          ok = true;
         }
       }
-      ok = tokens.some((t) => nameTokenMatchesSpoken(name, t));
+      const foldedUser = foldTrToken(user);
+      if (!ok && foldedUser.includes(name)) ok = true;
+      if (!ok) {
+        const tokens = foldedUser
+          .split(/[^a-z0-9]+/)
+          .filter((t) => t.length >= 3);
+        // Username prefix before trailing digits (halecaloglu1 → halecaloglu)
+        const prefix = foldedUser.replace(/\d+$/g, "");
+        if (prefix.length >= 3) tokens.push(prefix);
+        // First-name glued into handle: banubyktskn ↔ «Banu» / ASR «Bano»
+        // (len≥4 — «Bano» must see prefix «banu»)
+        if (name.length >= 4 && foldedUser.length >= name.length) {
+          tokens.push(foldedUser.slice(0, name.length));
+          if (foldedUser.length > name.length) {
+            tokens.push(foldedUser.slice(0, name.length + 1));
+          }
+        }
+        ok = tokens.some((t) => nameTokenMatchesSpoken(name, t));
+      }
+      if (ok) break;
     }
     if (ok) hits.push(user);
   }
@@ -1034,8 +1087,11 @@ export function parseAuctionText(
   text: string,
   opts?: ParseAuctionOpts,
 ): ParsedAuctionSignal | null {
-  const t = text.trim();
-  if (isAuctionNoise(t)) return null;
+  const raw = text.trim();
+  if (isAuctionNoise(raw)) return null;
+  // OCR claim typos («aldm», «alayım») — parse on normalized text.
+  const t =
+    opts?.source === "comment" ? normalizeClaimOrthography(raw) : raw;
 
   if (CORRECTION_RE.test(t)) {
     return {
@@ -1110,14 +1166,31 @@ export function parseAuctionText(
       : amountTry != null
         ? 0.7
         : 0.62;
+    // «4 tane arora 600 bağno hanımda» — unit price × qty (TRY recall).
+    let soldAmount = amountTry;
+    let reasonOut = bare ? "verbal_win_bare" : "verbal_win_named";
+    const qtyM = t.match(/(\d{1,2})\s*tane\b/i);
+    if (
+      spokenBuyerName &&
+      amountTry != null &&
+      qtyM?.[1] &&
+      amountTry >= OFFER_AMOUNT_SANITY_MIN_TRY &&
+      amountTry <= OFFER_AMOUNT_SANITY_MAX_TRY
+    ) {
+      const q = Number(qtyM[1]);
+      if (q >= 2 && q <= 12) {
+        soldAmount = amountTry * q;
+        reasonOut = "verbal_win_named_qty";
+      }
+    }
     return {
       eventType: "sold",
-      amountTry,
+      amountTry: soldAmount,
       buyerHint,
       spokenBuyerName,
       confidence: conf,
       matched: t,
-      reason: bare ? "verbal_win_bare" : "verbal_win_named",
+      reason: reasonOut,
     };
   }
 
@@ -1544,6 +1617,11 @@ function resolveSaleAmountTry(opts: {
 }): number | undefined {
   const { askTry, eventAmountTry, method } = opts;
   if (method === "counter_accept" && eventAmountTry != null) {
+    return eventAmountTry;
+  }
+  // Named packing «… 600 bağno hanımda» while another ask is open — seller
+  // stated this sale's price; do not overwrite with the unrelated lot ask.
+  if (method === "verbal_win_confirm" && eventAmountTry != null) {
     return eventAmountTry;
   }
   if (askTry == null) return eventAmountTry;
@@ -2972,18 +3050,24 @@ export function reconcileMezatWindows(
       // price is known («Deniz hanımda 800»), else needs_review.
       if (isVerbal && ev.spokenBuyerName && !openWin) {
         const spokenFold = foldTrToken(ev.spokenBuyerName);
-        const alreadyConfirmed = sales.some(
-          (s) =>
-            !s.needsReview &&
-            Math.abs(s.offsetMs - ev.offsetMs) <= SALE_DEDUP_WINDOW_MS &&
-            ((s.spokenBuyerName &&
-              foldTrToken(s.spokenBuyerName) === spokenFold) ||
-              (s.buyerUsername != null &&
-                foldTrToken(s.buyerUsername).includes(spokenFold))),
-        );
-        if (alreadyConfirmed) continue;
         const near = nearestRecentAsk(ev.offsetMs);
         const priced = amount ?? near?.amountTry;
+        // Same buyer packing another (different) price is a new sale —
+        // only skip when amount is missing or near the prior confirm.
+        const alreadyConfirmed = sales.some((s) => {
+          if (s.needsReview) return false;
+          if (Math.abs(s.offsetMs - ev.offsetMs) > SALE_DEDUP_WINDOW_MS)
+            return false;
+          const samePerson =
+            (s.spokenBuyerName &&
+              foldTrToken(s.spokenBuyerName) === spokenFold) ||
+            (s.buyerUsername != null &&
+              foldTrToken(s.buyerUsername).includes(spokenFold));
+          if (!samePerson) return false;
+          if (priced == null || s.amountTry == null) return true;
+          return amountsNear(s.amountTry, priced);
+        });
+        if (alreadyConfirmed) continue;
         const pool = recentCommenters
           .filter(
             (c) =>
@@ -3030,6 +3114,90 @@ export function reconcileMezatWindows(
             askAmountTry: priced,
             evidenceQuote: ev.matched.slice(0, 200),
           });
+        }
+        continue;
+      }
+
+      // Bare soft packing («O da sizde» / «İkisi de tamam») with no open lot —
+      // attach recent ask-price commenter (Nunus multi-item bursts).
+      if (isVerbal && !ev.spokenBuyerName && !openWin) {
+        const near = nearestRecentAsk(ev.offsetMs);
+        const ask = amount ?? near?.amountTry;
+        if (ask != null && saneAsk(ask) != null) {
+          const window = recentCommenters.filter(
+            (c) =>
+              ev.offsetMs - c.offsetMs >= 0 &&
+              ev.offsetMs - c.offsetMs <= 90_000,
+          );
+          const priceMatch = [...window]
+            .reverse()
+            .find(
+              (c) =>
+                c.amountTry != null &&
+                (c.amountTry === ask || amountsNear(c.amountTry, ask)),
+            );
+          const orphanMatch = [...orphanClaims]
+            .reverse()
+            .find(
+              (o) =>
+                ev.offsetMs - o.offsetMs >= 0 &&
+                ev.offsetMs - o.offsetMs <= 90_000,
+            );
+          const pick =
+            priceMatch ??
+            (orphanMatch
+              ? {
+                  buyerHint: orphanMatch.buyer,
+                  eventId: orphanMatch.eventId,
+                  amountTry: orphanMatch.amountTry,
+                }
+              : undefined);
+          if (pick?.buyerHint) {
+            const already = sales.some(
+              (s) =>
+                !s.needsReview &&
+                s.buyerUsername === pick.buyerHint &&
+                s.amountTry != null &&
+                amountsNear(s.amountTry, ask) &&
+                Math.abs(s.offsetMs - ev.offsetMs) <= SALE_DEDUP_WINDOW_MS,
+            );
+            // «İkisi de» / second «sizde» after first confirm → allow a second
+            // same-price sale outside the tight dedup only when dual phrasing.
+            const dualPhrase = VERBAL_WIN_IKISI_DE_RE.test(ev.matched);
+            if (!already || dualPhrase) {
+              if (already && dualPhrase) {
+                pushNeedsReview({
+                  offsetMs: ev.offsetMs,
+                  amountTry: ask,
+                  buyerUsername: pick.buyerHint,
+                  confidence: 0.55,
+                  reason: "dual_soft_sizde_second_needs_review",
+                  saleMethod: "verbal_win_confirm",
+                  evidenceEventIds: [ev.id, pick.eventId].filter(
+                    Boolean,
+                  ) as string[],
+                  productHint: near?.hint ?? ev.matched.slice(0, 120),
+                  askAmountTry: ask,
+                  evidenceQuote: ev.matched.slice(0, 200),
+                });
+              } else if (!already) {
+                sales.push({
+                  offsetMs: ev.offsetMs,
+                  amountTry: ask,
+                  buyerUsername: pick.buyerHint,
+                  confidence: 0.82,
+                  reason: "soft_sizde_no_lot+price_commenter",
+                  saleMethod: "verbal_win_confirm",
+                  evidenceEventIds: [ev.id, pick.eventId].filter(
+                    Boolean,
+                  ) as string[],
+                  productHint: near?.hint ?? ev.matched.slice(0, 120),
+                  askAmountTry: ask,
+                  evidenceQuote: ev.matched.slice(0, 200),
+                });
+              }
+            }
+          }
         }
         continue;
       }
