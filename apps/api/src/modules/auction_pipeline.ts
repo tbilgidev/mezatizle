@@ -394,9 +394,16 @@ export async function reconcileSales(
 
     const spoken = (spokenBuyerName ?? "").toLowerCase();
     const buyerKey = (buyer ?? `spoken:${spoken || "bilinmiyor"}`).toLowerCase();
+    // Multi-item packing / dual «ikisini de» / 800+800 legs must not share a key.
+    const leg =
+      (cand.reason ?? "").match(/qty_(\d+)_of_(\d+)/)?.[0] ??
+      (cand.reason ?? "").match(
+        /dual_(?:same_price_leg_\d+|same_price_second\w*|buy_both_leg_\d+\w*|claim_sum\w*)/,
+      )?.[0] ??
+      "";
     // Legacy 8s key + ~3 min same-buyer≈price key (repeated verbal confirms).
-    const dedupeKey = `${buyerKey}:${amountCents ?? "_"}:${Math.floor(offsetMs / 8000)}`;
-    const lotDedupeKey = `${buyerKey}:${amountCents != null ? Math.round(amountCents / 100 / 500) * 500 : "_"}:${Math.floor(offsetMs / 180_000)}`;
+    const dedupeKey = `${buyerKey}:${amountCents ?? "_"}:${Math.floor(offsetMs / 8000)}:${leg}`;
+    const lotDedupeKey = `${buyerKey}:${amountCents != null ? Math.round(amountCents / 100 / 500) * 500 : "_"}:${Math.floor(offsetMs / 180_000)}:${leg}`;
     if (seenKeys.has(dedupeKey) || seenKeys.has(lotDedupeKey)) {
       skippedDuplicate++;
       continue;
