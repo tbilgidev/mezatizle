@@ -4,6 +4,7 @@
  *
  * Usage: bun run ./scripts/rerun-nunus-reconcile.ts [recording-id]
  */
+import { resolve } from "node:path";
 import { createSql } from "@mezatizle/db";
 import { summarizeOfferWindows, type TimelineEvent } from "@mezatizle/shared";
 import {
@@ -17,7 +18,11 @@ const RECORDING_ID =
 const databaseUrl =
   process.env.DATABASE_URL ??
   "postgres://mezatizle:mezatizle@127.0.0.1:5433/mezatizle";
-const storageRoot = process.env.STORAGE_ROOT ?? "./storage";
+
+/** Prefer live mezatizle storage — worktree ./storage often has no frames/video. */
+const storageRoot = resolve(
+  process.env.STORAGE_ROOT ?? "/home/tolga/projects/mezatizle/storage",
+);
 
 const sql = createSql(databaseUrl);
 

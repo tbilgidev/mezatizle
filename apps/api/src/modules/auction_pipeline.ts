@@ -1,5 +1,5 @@
 import { copyFile, mkdir, readdir, access } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { Sql } from "@mezatizle/db";
 import {
   explainSaleTr,
@@ -100,7 +100,11 @@ async function extractFrameAtOffset(
   }
 }
 
-async function attachProductImage(
+/**
+ * Attach a JPEG under storage/products/<id>.jpg and return the relative key.
+ * Prefer ffmpeg seek on the master video; fall back to OCR frame bank.
+ */
+export async function attachProductImage(
   storageRoot: string,
   recordingId: string,
   productId: string,
@@ -111,23 +115,26 @@ async function attachProductImage(
     frameFps?: number | null;
   },
 ) {
-  const framesDir = join(storageRoot, "frames", recordingId);
-  const outDir = join(storageRoot, "products");
+  const root = resolve(storageRoot);
+  const framesDir = join(root, "frames", recordingId);
+  const outDir = join(root, "products");
   await mkdir(outDir, { recursive: true });
   const dest = join(outDir, `${productId}.jpg`);
   const ffmpegPath = process.env.FFMPEG_PATH ?? "ffmpeg";
 
   // Prefer a still from the master at this lot's offset (distinct thumbs on long lives).
-  if (
-    opts?.videoPath &&
-    offsetMs != null &&
-    Number.isFinite(offsetMs)
-  ) {
+  const videoAbs =
+    opts?.videoPath != null && opts.videoPath.length > 0
+      ? opts.videoPath.startsWith("/")
+        ? opts.videoPath
+        : join(root, opts.videoPath)
+      : null;
+  if (videoAbs && offsetMs != null && Number.isFinite(offsetMs)) {
     try {
-      await access(opts.videoPath);
+      await access(videoAbs);
       const ok = await extractFrameAtOffset(
         ffmpegPath,
-        opts.videoPath,
+        videoAbs,
         offsetMs,
         dest,
       );
@@ -141,7 +148,12 @@ async function attachProductImage(
     const files = (await readdir(framesDir))
       .filter((f) => f.endsWith(".jpg"))
       .sort();
-    if (!files[0]) return null;
+    if (!files[0]) {
+      console.warn(
+        `[attachProductImage] no frames in ${framesDir} (storageRoot=${root})`,
+      );
+      return null;
+    }
     const indices = files
       .map((f) => {
         const m = f.match(/(\d+)/);
@@ -323,6 +335,7 @@ export async function reconcileSales(
   recordingId: string,
   storageRoot = process.env.STORAGE_ROOT ?? "./storage",
 ) {
+  const root = resolve(storageRoot);
   const rec = await sql<
     {
       seller_id: string;
@@ -343,7 +356,9 @@ export async function reconcileSales(
       ? Number(rec[0].duration_seconds)
       : null;
   const videoPath = rec[0].storage_path
-    ? join(storageRoot, rec[0].storage_path)
+    ? rec[0].storage_path.startsWith("/")
+      ? rec[0].storage_path
+      : join(root, rec[0].storage_path)
     : null;
 
   const minConf = Number(
@@ -578,7 +593,7 @@ export async function reconcileSales(
       RETURNING id
     `;
     const imagePath = await attachProductImage(
-      storageRoot,
+      root,
       recordingId,
       product[0]!.id,
       offsetMs,
