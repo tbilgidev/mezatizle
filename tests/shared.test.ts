@@ -1844,6 +1844,41 @@ describe("Nunus numbered tray + descriptor claims", () => {
     expect(confirmed[0]!.amountTry).toBe(800);
   });
 
+  test("Nunus: soft «Tamam sizde» attaches recent ask-price commenter", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "Bu da 1000 lira",
+        amountTry: 1000,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "c",
+        offsetMs: 4_000,
+        eventType: "bid",
+        matched: "1000",
+        amountTry: 1000,
+        buyerHint: "aura_studio_34",
+        reason: "comment_number_bid",
+        source: "comment",
+      }),
+      ev({
+        id: "vw",
+        offsetMs: 20_000,
+        eventType: "sold",
+        matched: "Tamam sizde.",
+        reason: "verbal_win_bare",
+        confidence: 0.62,
+      }),
+    ]);
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBe(1);
+    expect(confirmed[0]!.buyerUsername).toBe("aura_studio_34");
+    expect(confirmed[0]!.amountTry).toBe(1000);
+  });
+
   test("parse: Nunus hanımda / soft sizde / hayırlı uğurlu", () => {
     const h = parseAuctionText("Bu Deniz hanımda 800.", {
       source: "transcript",
