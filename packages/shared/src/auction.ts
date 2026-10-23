@@ -641,8 +641,8 @@ function nameTokenMatchesSpoken(spoken: string, token: string): boolean {
   if (!token || token.length < 3) return false;
   if (token === spoken) return true;
   if (token.startsWith(spoken) || spoken.startsWith(token)) return true;
-  // ASR typos: «Şeyhna»↔«Şehnaz» (distance 2). Keep tight for short names.
-  if (spoken.length >= 5 && token.length >= 5) {
+  // ASR typos: «Şeyhna»↔«Şehnaz», «Bano»↔«Banu».
+  if (spoken.length >= 4 && token.length >= 4) {
     const max = spoken.length >= 6 ? 2 : 1;
     return editDistanceAtMost(spoken, token, max);
   }
@@ -2799,6 +2799,59 @@ export function reconcileMezatWindows(
           amount = amount ?? lotAsk;
           evidence.push(openWin.aldimClaim.eventId);
           method = isVerbal ? "verbal_win_confirm" : "aldim_first_comment";
+        }
+
+        // Nunus soft «sizde» / «gitti» with no name: attach the most recent
+        // ask-price or aldım commenter in the lookback (single best guess).
+        if (!buyer && !verbalNameMiss && isVerbal && openWin) {
+          const ask = lotAsk;
+          const window = recentCommenters.filter(
+            (c) =>
+              ev.offsetMs - c.offsetMs >= 0 &&
+              ev.offsetMs - c.offsetMs <= 90_000,
+          );
+          const priceMatch =
+            ask != null
+              ? [...window]
+                  .reverse()
+                  .find(
+                    (c) =>
+                      c.amountTry != null &&
+                      (c.amountTry === ask || amountsNear(c.amountTry, ask)),
+                  )
+              : undefined;
+          const orphanMatch = [...orphanClaims]
+            .reverse()
+            .find(
+              (o) =>
+                ev.offsetMs - o.offsetMs >= 0 &&
+                ev.offsetMs - o.offsetMs <= 90_000,
+            );
+          const pick =
+            priceMatch ??
+            (orphanMatch
+              ? {
+                  buyerHint: orphanMatch.buyer,
+                  eventId: orphanMatch.eventId,
+                  amountTry: orphanMatch.amountTry,
+                }
+              : undefined) ??
+            (window.length === 1 ? window[0] : undefined);
+          if (pick?.buyerHint) {
+            buyer = pick.buyerHint;
+            amount = amount ?? ask ?? pick.amountTry;
+            if (pick.eventId) evidence.push(pick.eventId);
+            method = "verbal_win_confirm";
+            if (!openWin.aldimClaim) {
+              claimLot(openWin, {
+                buyer,
+                offsetMs: ev.offsetMs,
+                eventId: ev.id,
+                amountTry: amount,
+                matched: ev.matched,
+              });
+            }
+          }
         }
 
         // Win confirm after bids (classic satıldı / lookback) — only if no aldım claim
