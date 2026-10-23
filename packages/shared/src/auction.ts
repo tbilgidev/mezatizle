@@ -1594,6 +1594,9 @@ export function reconcileMezatWindows(
   const trayLots = new Map<number, LotWindow>();
   /** Sequential intros parked when the next product opens (descriptor claims later). */
   let pendingUnclaimed: LotWindow[] = [];
+  /** Recent sane asks for filling needs_review amounts when the lot window is gone. */
+  const recentAsks: Array<{ offsetMs: number; amountTry: number; hint?: string }> =
+    [];
   /** Aldım comments that arrived with no open lot (often just before the ask). */
   const orphanClaims: Array<{
     buyer: string;
@@ -1834,6 +1837,34 @@ export function reconcileMezatWindows(
     return best;
   };
 
+  const rememberAsk = (
+    offsetMs: number,
+    amount: number | undefined,
+    hint?: string,
+  ) => {
+    const a = saneAsk(amount);
+    if (a == null) return;
+    recentAsks.push({ offsetMs, amountTry: a, hint });
+    if (recentAsks.length > 40) recentAsks.shift();
+  };
+
+  const nearestRecentAsk = (
+    offsetMs: number,
+  ): { amountTry: number; hint?: string } | undefined => {
+    let best: { amountTry: number; hint?: string; dt: number } | undefined;
+    for (const a of recentAsks) {
+      const dt = offsetMs - a.offsetMs;
+      if (dt < -15_000 || dt > PENDING_LOT_CLAIM_MS) continue;
+      const adt = Math.abs(dt);
+      if (!best || adt < best.dt) {
+        best = { amountTry: a.amountTry, hint: a.hint, dt: adt };
+      }
+    }
+    return best
+      ? { amountTry: best.amountTry, hint: best.hint }
+      : undefined;
+  };
+
   const openLot = (ev: TimelineEvent, ask?: number) => {
     const prevDual = win?.dualClaimPending ?? pendingDualReview;
     // Numbered tray batch: keep siblings open together.
@@ -1868,6 +1899,7 @@ export function reconcileMezatWindows(
       }
       trayLots.set(ev.lotNumber, lot);
       win = lot;
+      rememberAsk(ev.offsetMs, opening, lot.productHint);
       attachPendingClaim(ev.offsetMs);
       return;
     }
@@ -1890,6 +1922,7 @@ export function reconcileMezatWindows(
       bids: [],
       closed: false,
     };
+    rememberAsk(ev.offsetMs, opening, win.productHint);
     attachPendingClaim(ev.offsetMs);
     // Dual «ikisini de» / sum comment → second distinct ask is needs_review (not auto-sold).
     if (
@@ -2681,20 +2714,24 @@ export function reconcileMezatWindows(
       emitAldimSale(parked);
       continue;
     }
-    const priced = saneAsk(o.amountTry);
+    const near = nearestRecentAsk(o.offsetMs);
+    const priced = saneAsk(o.amountTry) ?? near?.amountTry;
     pushNeedsReview({
       offsetMs: o.offsetMs,
       amountTry: priced,
       buyerUsername: o.buyer,
       confidence: priced != null ? 0.55 : 0.5,
       reason:
-        priced != null
+        saneAsk(o.amountTry) != null
           ? "orphan_aldim_with_price_needs_review"
-          : "orphan_aldim_no_ask_needs_review",
+          : near != null
+            ? "orphan_aldim_nearest_ask_needs_review"
+            : "orphan_aldim_no_ask_needs_review",
       saleMethod: "aldim_first_comment",
       evidenceEventIds: [o.eventId],
       productHint:
         o.matched?.slice(0, 120) ??
+        near?.hint ??
         `Yorum aldım @ ${o.offsetMs}ms (ask yok)`,
       askAmountTry: priced,
       evidenceQuote:

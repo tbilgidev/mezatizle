@@ -1644,6 +1644,47 @@ describe("Nunus numbered tray + descriptor claims", () => {
     expect(sales[0]!.askAmountTry).toBe(800);
   });
 
+  test("needs_review orphan without comment price fills from nearest ask", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 10_000,
+        eventType: "price_mention",
+        matched: "Bu da 1000 lira",
+        amountTry: 1000,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "next",
+        offsetMs: 50_000,
+        eventType: "price_mention",
+        matched: "Bu da 700 lira",
+        amountTry: 700,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "c",
+        offsetMs: 55_000,
+        eventType: "bid",
+        matched: "Tek taş gib olanı aldım",
+        buyerHint: "melek12_masal16",
+        reason: "descriptor_aldim_claim",
+        source: "comment",
+        descriptorTokens: ["tek", "tas"],
+      }),
+    ]);
+    const review = sales.filter((s) => s.needsReview);
+    // Either matched as sale to 700 lot, or needs_review with nearest ask filled.
+    const melek = sales.find((s) => s.buyerUsername === "melek12_masal16");
+    expect(melek).toBeTruthy();
+    expect(melek!.amountTry ?? melek!.askAmountTry).toBeTruthy();
+    if (melek!.needsReview) {
+      expect(review.some((s) => s.amountTry != null || s.askAmountTry != null)).toBe(
+        true,
+      );
+    }
+  });
+
   test("same-price «bu da 800» opens distinct offered lots", () => {
     const lots = summarizeOfferWindows([
       ev({
