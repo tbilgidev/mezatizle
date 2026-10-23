@@ -1730,6 +1730,27 @@ export function reconcileMezatWindows(
         askAmountTry: ask,
         evidenceQuote: `@${last.buyer} teklif / onay belirsiz → ${ask} TRY`,
       });
+    } else if (
+      ask != null &&
+      bidBuyers.length === 0 &&
+      !lot.namedMissReview &&
+      atMs - lot.openMs >= 20_000 &&
+      ((lot.descriptorTokens?.length ?? 0) > 0 ||
+        PRODUCT_NOUN_RE.test(lot.productHint ?? ""))
+    ) {
+      // Priced product intro that never got a clear claim — operator may know
+      // a verbal sale the ASR missed.
+      pushNeedsReview({
+        offsetMs: lot.openMs,
+        amountTry: ask,
+        confidence: 0.46,
+        reason: "unclaimed_product_ask_needs_review",
+        saleMethod: "sold_phrase",
+        evidenceEventIds: [...lot.openEventIds],
+        productHint: lot.productHint,
+        askAmountTry: ask,
+        evidenceQuote: (lot.productHint ?? `Ask ${ask} TRY`).slice(0, 200),
+      });
     }
     lot.closed = true;
     pendingUnclaimed.push(lot);
