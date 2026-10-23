@@ -530,6 +530,55 @@ export async function probePublicLive(
   };
 }
 
+/** Serialize createLiveCapture across concurrent POSTs (in-process). */
+let createLiveCaptureTail: Promise<unknown> = Promise.resolve();
+
+/** Postgres advisory lock — serialize create across double-POST / auto-follow races. */
+const CREATE_LIVE_CAPTURE_LOCK = 0x4d455a41; // 'MEZA'
+
+export type ActiveCaptureDupRow = {
+  recording_id: string;
+  username: string;
+  watch_url: string | null;
+  source_url: string | null;
+  capture_status: string | null;
+  max_duration_minutes: number | null;
+  last_probe_detail: string | null;
+  capture_error: string | null;
+};
+
+/**
+ * Hard rule: at most ONE active capture globally.
+ * Prefer same username / same broadcast_id; otherwise reuse any
+ * bekleniyor/kaydediliyor row so a second seller cannot start.
+ */
+export function findActiveCaptureConflict(
+  rows: ActiveCaptureDupRow[],
+  usernameLc: string,
+  wantBid: string | null,
+): ActiveCaptureDupRow | undefined {
+  if (!rows.length) return undefined;
+  const bidFromProbeDetail = (
+    detail: string | null | undefined,
+  ): string | null => {
+    if (!detail) return null;
+    const m = detail.match(/\bbid[=:]?\s*(\d{5,})\b/i);
+    return m?.[1] ?? null;
+  };
+  const exact = rows.find((row) => {
+    const u = String(row.username || "").toLowerCase();
+    if (u === usernameLc) return true;
+    if (!wantBid) return false;
+    const bid =
+      extractBroadcastIdFromUrl(row.watch_url || "") ||
+      extractBroadcastIdFromUrl(row.source_url || "") ||
+      bidFromProbeDetail(row.last_probe_detail);
+    return bid != null && bid === wantBid;
+  });
+  if (exact) return exact;
+  return rows[0];
+}
+
 export async function createLiveCapture(
   sql: Sql,
   env: AppEnv,
@@ -538,6 +587,44 @@ export async function createLiveCapture(
     displayName?: string;
     notes?: string;
     /** Empty/0 = entire live until it ends. */
+    maxDurationMinutes?: number | null;
+  },
+) {
+  const run = createLiveCaptureTail.then(() =>
+    createLiveCaptureLocked(sql, env, opts),
+  );
+  createLiveCaptureTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+async function createLiveCaptureLocked(
+  sql: Sql,
+  env: AppEnv,
+  opts: {
+    input: string;
+    displayName?: string;
+    notes?: string;
+    maxDurationMinutes?: number | null;
+  },
+) {
+  await sql`SELECT pg_advisory_lock(${CREATE_LIVE_CAPTURE_LOCK})`;
+  try {
+    return await createLiveCaptureBody(sql, env, opts);
+  } finally {
+    await sql`SELECT pg_advisory_unlock(${CREATE_LIVE_CAPTURE_LOCK})`;
+  }
+}
+
+async function createLiveCaptureBody(
+  sql: Sql,
+  env: AppEnv,
+  opts: {
+    input: string;
+    displayName?: string;
+    notes?: string;
     maxDurationMinutes?: number | null;
   },
 ) {
@@ -563,19 +650,9 @@ export async function createLiveCapture(
     );
   }
 
-  // Hard dedupe: never start a second capture for the same seller or broadcast
-  // (manual double-click / auto-follow race). Return the healthy in-flight one.
+  // Hard dedupe: at most ONE active capture globally (any seller).
   const wantBid = extractBroadcastIdFromUrl(parsed.watchUrl);
-  const activeDup = await sql<{
-    recording_id: string;
-    username: string;
-    watch_url: string | null;
-    source_url: string | null;
-    capture_status: string | null;
-    max_duration_minutes: number | null;
-    last_probe_detail: string | null;
-    capture_error: string | null;
-  }[]>`
+  const activeDup = await sql<ActiveCaptureDupRow[]>`
     SELECT lc.recording_id, s.instagram_username AS username,
            lc.watch_url, r.source_url, r.capture_status,
            lc.max_duration_minutes, lc.last_probe_detail, r.capture_error
@@ -585,35 +662,39 @@ export async function createLiveCapture(
     WHERE lc.status IN ('pending', 'waiting', 'recording', 'finalizing')
        OR r.capture_status IN ('bekleniyor', 'kaydediliyor')
        OR r.status IN ('awaiting_live', 'recording')
+    ORDER BY
+      CASE WHEN r.capture_status = 'kaydediliyor' THEN 0
+           WHEN lc.status = 'recording' THEN 0
+           ELSE 1 END,
+      lc.created_at ASC
   `;
   const usernameLc = parsed.username.toLowerCase();
-  const hit = activeDup.find((row) => {
-    const u = String(row.username || "").toLowerCase();
-    if (u === usernameLc) return true;
-    if (!wantBid) return false;
-    const bid =
-      extractBroadcastIdFromUrl(row.watch_url || "") ||
-      extractBroadcastIdFromUrl(row.source_url || "");
-    return bid != null && bid === wantBid;
-  });
+  const hit = findActiveCaptureConflict(activeDup, usernameLc, wantBid);
   if (hit) {
+    const hitUser = String(hit.username || "").toLowerCase();
+    const sameSeller = hitUser === usernameLc;
     console.warn(
-      `[live-capture] dedupe reuse ${hit.recording_id} for @${parsed.username}` +
-        (wantBid ? ` bid=${wantBid}` : ""),
+      `[live-capture] dedupe reuse ${hit.recording_id} (@${hitUser || "?"})` +
+        ` for request @${parsed.username}` +
+        (wantBid ? ` bid=${wantBid}` : "") +
+        (sameSeller ? "" : " [global-single]"),
     );
+    const detail = sameSeller
+      ? hit.last_probe_detail ||
+        "Aynı kullanıcı/broadcast zaten kaydediliyor — yeni kayıt açılmadı."
+      : `Başka bir kayıt zaten sürüyor (@${hitUser || "?"}) — aynı anda tek canlı kayıt. Yeni kayıt açılmadı.`;
     return {
       recordingId: hit.recording_id,
       username: String(hit.username || parsed.username),
       watchUrl: hit.watch_url || parsed.watchUrl,
       captureStatus: hit.capture_status || "kaydediliyor",
       lastError: hit.capture_error,
-      lastProbeDetail:
-        hit.last_probe_detail ||
-        "Aynı kullanıcı/broadcast zaten kaydediliyor — yeni kayıt açılmadı.",
+      lastProbeDetail: detail,
       maxDurationMinutes: hit.max_duration_minutes,
       quality: CAPTURE_QUALITY,
       policy: LIVE_CAPTURE_POLICY,
       deduped: true as const,
+      globalSingle: !sameSeller,
     };
   }
 
@@ -685,7 +766,6 @@ export async function createLiveCapture(
           last_probe_detail = ${first.detail}, updated_at = now()
       WHERE recording_id = ${id}
     `;
-    // Kick recording ASAP (supervisor will no-op if already active)
     void startRecordingProcess(
       sql,
       env,
@@ -711,7 +791,6 @@ export async function createLiveCapture(
       WHERE id = ${id}
     `;
   } else {
-    // not_found / rate_limited / error → keep waiting, but show real reason
     await sql`
       UPDATE live_captures
       SET attempt_count = 1, last_probe_at = now(),
@@ -789,6 +868,217 @@ export async function cancelLiveCapture(sql: Sql, recordingId: string) {
       AND status IN ('awaiting_live', 'recording')
   `;
   return { ok: true };
+}
+
+/**
+ * Operator early stop: kill capture, finalize MP4 safely, enqueue analysis.
+ * Unlike cancelLiveCapture, does NOT discard — cut footage is analyzed.
+ */
+export async function stopLiveCaptureAndAnalyze(
+  sql: Sql,
+  env: AppEnv,
+  recordingId: string,
+): Promise<{
+  ok: boolean;
+  recordingId: string;
+  finalized: boolean;
+  analysisEnqueued: boolean;
+  detail: string;
+}> {
+  const rows = await sql<{
+    lc_status: string;
+    process_pid: number | null;
+    capture_status: string | null;
+    r_status: string;
+  }[]>`
+    SELECT lc.status AS lc_status, lc.process_pid,
+           r.capture_status, r.status AS r_status
+    FROM live_captures lc
+    JOIN recordings r ON r.id = lc.recording_id
+    WHERE lc.recording_id = ${recordingId}
+  `;
+  if (!rows[0]) throw new Error("Canlı oturum bulunamadı");
+  const row = rows[0];
+  if (
+    row.lc_status === "completed" ||
+    row.capture_status === "bitti" ||
+    row.r_status === "ready" ||
+    row.r_status === "processed"
+  ) {
+    return {
+      ok: true,
+      recordingId,
+      finalized: true,
+      analysisEnqueued: true,
+      detail: "Kayıt zaten tamamlanmış.",
+    };
+  }
+  if (row.lc_status === "cancelled" || row.capture_status === "iptal") {
+    throw new Error("Oturum iptal — analiz için kesilemez.");
+  }
+
+  const destAbs = safeJoinStorage(
+    env.storageRoot,
+    "recordings",
+    `${recordingId}.mp4`,
+  );
+  const partAbs = `${destAbs}.part.mp4`;
+  const partBytes = await fileSize(partAbs);
+  const finalBytes = await fileSize(destAbs);
+  const useful = Math.max(partBytes, finalBytes) >= 64_000;
+
+  // Waiting with no bytes: clear the global single slot (no analysis).
+  if (
+    !useful &&
+    (row.lc_status === "pending" ||
+      row.lc_status === "waiting" ||
+      row.capture_status === "bekleniyor")
+  ) {
+    await cancelLiveCapture(sql, recordingId);
+    return {
+      ok: true,
+      recordingId,
+      finalized: false,
+      analysisEnqueued: false,
+      detail:
+        "Bekleyen oturum durduruldu (dosya yok) — analiz kuyruğu yok; yeni kayıt açılabilir.",
+    };
+  }
+
+  const why = "operatör erken kesim — finalize + analiz";
+  console.warn(`[live-capture] operator stop ${recordingId}: ${why}`);
+
+  const proc = activeProcs.get(recordingId);
+  if (proc && !proc.killed) {
+    try {
+      proc.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+  }
+  await killCapturePid(row.process_pid);
+  activeProcs.delete(recordingId);
+  await stopLiveViewerPresence(recordingId);
+
+  // Prefer in-flight finalize from ffmpeg close handler.
+  if (finalizeInFlight.has(recordingId)) {
+    await finalizeInFlight.get(recordingId);
+  } else {
+    await Bun.sleep(800);
+    if (finalizeInFlight.has(recordingId)) {
+      await finalizeInFlight.get(recordingId);
+    } else {
+      await finalizeRecording(sql, env, recordingId, destAbs, partAbs, 0, why);
+    }
+  }
+
+  const after = await sql<{
+    lc_status: string;
+    capture_status: string | null;
+  }[]>`
+    SELECT lc.status AS lc_status, r.capture_status
+    FROM live_captures lc
+    JOIN recordings r ON r.id = lc.recording_id
+    WHERE lc.recording_id = ${recordingId}
+  `;
+  const finalized =
+    after[0]?.lc_status === "completed" ||
+    after[0]?.capture_status === "bitti";
+
+  const jobs = await sql<{ id: string }[]>`
+    SELECT id FROM processing_jobs
+    WHERE recording_id = ${recordingId}
+    LIMIT 1
+  `;
+  const analysisEnqueued = jobs.length > 0;
+
+  return {
+    ok: true,
+    recordingId,
+    finalized,
+    analysisEnqueued,
+    detail: finalized
+      ? analysisEnqueued
+        ? "Kayıt kesildi, dosya finalize edildi, analiz kuyruğa alındı."
+        : "Kayıt kesildi ve finalize edildi (analiz kuyruğu kontrol edin)."
+      : useful
+        ? "Kesim denendi — finalize sürüyor olabilir; birkaç saniye sonra yenileyin."
+        : "Kesim: yeterli kayıt verisi yok.",
+  };
+}
+
+/**
+ * Operator cutover: stop current capture (finalize + analyze), then start a
+ * new one via live URL / @username. Auto never does this — operators only.
+ */
+export async function cutoverLiveCapture(
+  sql: Sql,
+  env: AppEnv,
+  opts: {
+    input: string;
+    stopRecordingId?: string | null;
+    displayName?: string;
+    notes?: string;
+    maxDurationMinutes?: number | null;
+  },
+) {
+  let stopId = opts.stopRecordingId?.trim() || null;
+  if (!stopId) {
+    const active = await sql<{ recording_id: string }[]>`
+      SELECT lc.recording_id
+      FROM live_captures lc
+      JOIN recordings r ON r.id = lc.recording_id
+      WHERE lc.status IN ('pending', 'waiting', 'recording', 'finalizing')
+         OR r.capture_status IN ('bekleniyor', 'kaydediliyor')
+         OR r.status IN ('awaiting_live', 'recording')
+      ORDER BY
+        CASE WHEN r.capture_status = 'kaydediliyor' THEN 0
+             WHEN lc.status = 'recording' THEN 0
+             ELSE 1 END,
+        lc.created_at ASC
+      LIMIT 1
+    `;
+    stopId = active[0]?.recording_id ?? null;
+  }
+
+  let stopped: Awaited<ReturnType<typeof stopLiveCaptureAndAnalyze>> | null =
+    null;
+  if (stopId) {
+    stopped = await stopLiveCaptureAndAnalyze(sql, env, stopId);
+    // Wait briefly if finalize still clearing the global single slot.
+    for (let i = 0; i < 40; i++) {
+      const still = await sql<{ n: number }[]>`
+        SELECT COUNT(*)::int AS n
+        FROM live_captures lc
+        JOIN recordings r ON r.id = lc.recording_id
+        WHERE lc.recording_id = ${stopId}
+          AND (
+            lc.status IN ('pending', 'waiting', 'recording', 'finalizing')
+            OR r.capture_status IN ('bekleniyor', 'kaydediliyor')
+            OR r.status IN ('awaiting_live', 'recording')
+          )
+      `;
+      if ((still[0]?.n ?? 0) === 0) break;
+      await Bun.sleep(500);
+    }
+  }
+
+  const started = await createLiveCapture(sql, env, {
+    input: opts.input,
+    displayName: opts.displayName,
+    notes:
+      opts.notes ??
+      (stopId
+        ? `cutover: önceki kayıt ${stopId.slice(0, 8)} kesildi`
+        : undefined),
+    maxDurationMinutes: opts.maxDurationMinutes,
+  });
+
+  return {
+    ok: true,
+    stopped,
+    started,
+  };
 }
 
 async function fileSize(path: string): Promise<number> {

@@ -341,6 +341,72 @@ export function RecordingsPage() {
     }
   }
 
+  async function onStopLive(id: string) {
+    setBusy(true);
+    setError(null);
+    setOk(null);
+    try {
+      const res = await api.stopLive(id);
+      setOk(res.detail || "Kayıt kesildi — analiz kuyruğa alındı.");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onCutoverSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const form = e.currentTarget;
+    setBusy(true);
+    setError(null);
+    setOk(null);
+    setLimitation(null);
+    const fd = new FormData(form);
+    try {
+      const active = rows.find(
+        (r) =>
+          String(r.source_type) === "live" &&
+          (r.status === "awaiting_live" ||
+            r.status === "recording" ||
+            String(r.capture_status) === "kaydediliyor" ||
+            String(r.capture_status) === "bekleniyor"),
+      );
+      const durRaw = String(fd.get("maxDurationMinutes") ?? "").trim();
+      const maxDurationMinutes = durRaw === "" ? null : Number(durRaw);
+      const res = await api.cutoverLive({
+        input: String(fd.get("input") ?? ""),
+        stopRecordingId: active ? String(active.id) : undefined,
+        displayName: String(fd.get("displayName") ?? "") || undefined,
+        notes: String(fd.get("notes") ?? "") || undefined,
+        maxDurationMinutes:
+          maxDurationMinutes != null &&
+          Number.isFinite(maxDurationMinutes) &&
+          maxDurationMinutes > 0
+            ? maxDurationMinutes
+            : null,
+      });
+      const stopNote = res.stopped?.detail
+        ? `Önceki: ${res.stopped.detail} · `
+        : "";
+      setOk(
+        `${stopNote}Yeni kayıt · ${res.started.recordingId.slice(0, 8)}… (@${res.started.username})`,
+      );
+      setLimitation(res.started.policy?.limitationTr ?? null);
+      form.reset();
+      await refresh();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Kes ve kaydet başarısız. Önce kaydı kesip sonra eklemeyi deneyin.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="mx-auto max-w-[1100px] animate-rise">
       <PageHeader
@@ -425,7 +491,9 @@ export function RecordingsPage() {
         </form>
         <p className="mt-3 text-xs text-fog">
           Varsayılan: yayının tamamı. Süre dolunca veya yayın bitince kayıt
-          sonlanır → analiz. Dosya ~720p / CRF28 / AAC 80kbps.
+          sonlanır → analiz. Dosya ~720p / CRF28 / AAC 80kbps. Aynı anda tek
+          kayıt — ikinci ekleme engellenir; önce «Kaydı kes» veya aşağıdaki
+          «Kes ve şunu kaydet».
         </p>
         {ok && (
           <p className="mt-3">
@@ -433,6 +501,50 @@ export function RecordingsPage() {
           </p>
         )}
         {limitation && <p className="mt-2 text-sm text-fog">{limitation}</p>}
+      </section>
+
+      <section className="relative mb-4 overflow-hidden rounded-[1.35rem] border border-amber/30 bg-gradient-to-br from-amber/10 via-panel to-panel-2 p-5 shadow-[0_18px_50px_rgba(0,0,0,0.25)]">
+        <h2 className="font-display mb-1 text-xl font-bold tracking-tight">
+          Kes ve şunu kaydet
+        </h2>
+        <p className="mb-4 text-sm text-fog">
+          Aktif kaydı erken bitirir (dosya finalize + analiz kuyruğu), hemen
+          yeni canlıyı başlatır. Otomatik takip ikinci kayıt açmaz — yalnız
+          operatör.
+        </p>
+        <form
+          className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4"
+          onSubmit={onCutoverSubmit}
+        >
+          <Field label="Yeni canlı link veya @kullanıcı" className="sm:col-span-2 lg:col-span-4">
+            <Input
+              name="input"
+              placeholder="@satici veya https://www.instagram.com/satici/live/"
+              required
+            />
+          </Field>
+          <Field label="Görünen ad (ops.)">
+            <Input name="displayName" placeholder="Satıcı adı" />
+          </Field>
+          <Field label="Kayıt süresi (dk)">
+            <Input
+              name="maxDurationMinutes"
+              type="number"
+              min={0}
+              max={1440}
+              step={1}
+              placeholder="boş = tüm yayın"
+            />
+          </Field>
+          <Field label="Not (ops.)">
+            <Input name="notes" placeholder="opsiyonel" />
+          </Field>
+          <div className="flex items-end">
+            <Button type="submit" disabled={busy} variant="secondary" className="w-full">
+              {busy ? "Kesiliyor…" : "Kes ve şunu kaydet"}
+            </Button>
+          </div>
+        </form>
       </section>
 
       <details
@@ -705,15 +817,35 @@ export function RecordingsPage() {
                               ) : null}
                               {String(r.source_type) === "live" &&
                               (r.status === "awaiting_live" ||
-                                r.status === "recording") ? (
-                                <Button
-                                  type="button"
-                                  size="sm"
-                                  variant="secondary"
-                                  onClick={() => void onCancel(id)}
-                                >
-                                  İptal
-                                </Button>
+                                r.status === "recording" ||
+                                String(r.capture_status) === "kaydediliyor" ||
+                                String(r.capture_status) === "bekleniyor") ? (
+                                <>
+                                  {(r.status === "recording" ||
+                                    String(r.capture_status) ===
+                                      "kaydediliyor") && (
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      variant="secondary"
+                                      disabled={busy}
+                                      title="Kaydı erken bitir → finalize + analiz (silmez)"
+                                      onClick={() => void onStopLive(id)}
+                                    >
+                                      Kaydı kes
+                                    </Button>
+                                  )}
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="ghost"
+                                    disabled={busy}
+                                    title="İptal — analiz yok, dosya atılır"
+                                    onClick={() => void onCancel(id)}
+                                  >
+                                    İptal
+                                  </Button>
+                                </>
                               ) : null}
                               <Button
                                 type="button"

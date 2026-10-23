@@ -1,15 +1,14 @@
 /**
  * Auto-capture lives from accounts followed by the watcher IG session.
  *
- * When enabled: poll following-lives → createLiveCapture (same supervisor
- * pipeline) → live ends → finalize MP4 → analysis. Manual "Canlı yayın ekle"
- * remains available.
+ * When enabled: at three Europe/Istanbul evening slots (20:05, 21:05, 22:05)
+ * poll following-lives → createLiveCapture → live ends → finalize → analysis.
+ * Manual "Canlı yayın ekle" remains available anytime.
  *
- * Politeness: poll every ~5–6 minutes (jitter). Hard rule: while ANY
- * capture is bekleniyor/kaydediliyor (or live_captures in-flight), pause
- * the IG scan entirely (scanPaused) — no tray, no following refresh, no
- * rotating full-following probes, and never enqueue a second capture for
- * another account. Resume only after the active capture ends.
+ * Outside those slots: no tray / following / profile probe sweeps for
+ * auto-follow. Hard rule: while ANY capture is bekleniyor/kaydediliyor
+ * (or live_captures in-flight), skip the slot scan entirely (scanPaused)
+ * and never enqueue a second concurrent auto recording.
  */
 import { mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -45,22 +44,177 @@ const DEFAULT_PRIORITY_USERNAMES = [
   "nunusvintageshop",
 ];
 
-/** Min / max / default IG poll interval (5–6 minutes). */
+/**
+ * Legacy clamp retained for within-slot probe ETA / config compat.
+ * Auto-follow no longer continuous-polls on this interval.
+ */
 export const POLL_MS_MIN = 300_000;
 export const POLL_MS_MAX = 360_000;
 export const POLL_MS_DEFAULT = 330_000;
 /** While a recording is active, re-check DB this often (no IG hit). */
 export const PAUSE_RECHECK_MS = 30_000;
+/** Idle wait while disabled / waiting for next evening slot (responsive toggle). */
+export const SCHEDULER_IDLE_CHUNK_MS = 60_000;
 /**
  * Hard ceiling for one IG poll (Playwright). Allows following refresh +
  * rotating profile probes without hanging forever after a stuck 429.
  */
 export const POLL_HARD_TIMEOUT_MS = 120_000;
 /**
- * If last successful/attempted poll is older than this while enabled and
- * not scan-paused, surface a loud "poller stuck" failure in Settings/sidebar.
- * (2× max interval + rate-limit backoff ≈ 12+6 min → use 20 min.)
+ * After a scheduled slot time, allow this long to fire the poll once
+ * (covers scheduler wake jitter). Then wait for the next slot.
  */
+export const SLOT_FIRE_GRACE_MS = 120_000;
+/** Loud alert if a due evening slot was missed by more than this. */
+export const SLOT_MISS_ALERT_MS = 10 * 60_000;
+
+/** Ban-safer evening-only auto-follow windows (fixed TRT / Europe/Istanbul). */
+export const SCAN_TIMEZONE = "Europe/Istanbul";
+/** Turkey observes permanent UTC+3 (no DST) — used for wall-clock math. */
+export const ISTANBUL_UTC_OFFSET_MS = 3 * 60 * 60 * 1000;
+export const SCAN_SLOTS_HM = [
+  { hour: 20, minute: 5 },
+  { hour: 21, minute: 5 },
+  { hour: 22, minute: 5 },
+] as const;
+export const SCAN_SLOT_LABELS_TR = "20:05, 21:05, 22:05";
+
+export type IstanbulWall = {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+};
+
+export function utcToIstanbulWall(date: Date): IstanbulWall {
+  const t = new Date(date.getTime() + ISTANBUL_UTC_OFFSET_MS);
+  return {
+    year: t.getUTCFullYear(),
+    month: t.getUTCMonth() + 1,
+    day: t.getUTCDate(),
+    hour: t.getUTCHours(),
+    minute: t.getUTCMinutes(),
+    second: t.getUTCSeconds(),
+  };
+}
+
+export function istanbulWallToUtc(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second = 0,
+): Date {
+  return new Date(
+    Date.UTC(year, month - 1, day, hour, minute, second) - ISTANBUL_UTC_OFFSET_MS,
+  );
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
+export function slotKeyFor(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+): string {
+  return `${year}-${pad2(month)}-${pad2(day)}T${pad2(hour)}:${pad2(minute)}`;
+}
+
+/**
+ * If `now` falls inside a slot's fire grace window, return that slot key.
+ */
+export function currentDueSlotKey(
+  now: Date = new Date(),
+): string | null {
+  const p = utcToIstanbulWall(now);
+  const nowMs =
+    ((p.hour * 60 + p.minute) * 60 + p.second) * 1000;
+  for (const slot of SCAN_SLOTS_HM) {
+    const slotMs = (slot.hour * 60 + slot.minute) * 60 * 1000;
+    const delta = nowMs - slotMs;
+    if (delta >= 0 && delta < SLOT_FIRE_GRACE_MS) {
+      return slotKeyFor(p.year, p.month, p.day, slot.hour, slot.minute);
+    }
+  }
+  return null;
+}
+
+/**
+ * Next evening scan instant (Europe/Istanbul). If currently inside a slot's
+ * grace window, returns that slot's start (still "due").
+ */
+export function nextEveningScanAt(now: Date = new Date()): Date {
+  const p = utcToIstanbulWall(now);
+  for (let dayOffset = 0; dayOffset <= 1; dayOffset++) {
+    const base = istanbulWallToUtc(p.year, p.month, p.day, 12, 0);
+    const day = utcToIstanbulWall(
+      new Date(base.getTime() + dayOffset * 24 * 60 * 60_000),
+    );
+    for (const slot of SCAN_SLOTS_HM) {
+      const at = istanbulWallToUtc(
+        day.year,
+        day.month,
+        day.day,
+        slot.hour,
+        slot.minute,
+      );
+      const age = now.getTime() - at.getTime();
+      if (age <= 0) return at;
+      if (age < SLOT_FIRE_GRACE_MS) return at;
+    }
+  }
+  // Fallback: day+2 first slot (should be unreachable)
+  const next = utcToIstanbulWall(
+    new Date(
+      istanbulWallToUtc(p.year, p.month, p.day, 12, 0).getTime() +
+        2 * 24 * 60 * 60_000,
+    ),
+  );
+  const first = SCAN_SLOTS_HM[0]!;
+  return istanbulWallToUtc(
+    next.year,
+    next.month,
+    next.day,
+    first.hour,
+    first.minute,
+  );
+}
+
+export function formatScanAtIstanbulTr(date: Date): string {
+  const p = utcToIstanbulWall(date);
+  return `${pad2(p.day)}.${pad2(p.month)}.${p.year} ${pad2(p.hour)}:${pad2(p.minute)} (İstanbul)`;
+}
+
+export function eveningScheduleHintTr(): string {
+  return `Otomatik tarama günde 3 kez: ${SCAN_SLOT_LABELS_TR} Europe/Istanbul. Dışında IG takip taraması yok; manuel «Canlı yayın ekle» her zaman açık.`;
+}
+
+/**
+ * Legacy helper: rate-limit backoff still used if a slot poll 429s and the
+ * next slot is sooner than the backoff (unusual). Otherwise loop sleeps to
+ * the next evening slot.
+ */
+export function nextPollSleepMs(
+  baseMs: number,
+  opts?: { rateLimited?: boolean; random?: () => number },
+): number {
+  const rnd = opts?.random ?? Math.random;
+  if (opts?.rateLimited) {
+    return Math.floor(POLL_MS_MAX * 2 + rnd() * 60_000);
+  }
+  const base = clampPollIntervalMs(baseMs);
+  const jittered = base + (rnd() - 0.5) * 60_000;
+  return Math.floor(Math.min(POLL_MS_MAX, Math.max(POLL_MS_MIN, jittered)));
+}
+
+/** @deprecated continuous poll removed — kept for tests/compat */
 export const POLL_STALE_MS = 20 * 60_000;
 
 export type AutoFollowLiveConfig = {
@@ -115,6 +269,12 @@ export type AutoFollowLiveStatus = {
   /** Turkish ETA for one full following sweep (IG cycles; pauses while recording). */
   fullSweepEtaTr: string;
   lastProbeBatch: string[];
+  /** ISO time of next evening auto-follow scan (Europe/Istanbul slots). */
+  nextScanAt: string;
+  /** e.g. "20:05, 21:05, 22:05" */
+  scanWindowsTr: string;
+  scanTimezone: string;
+  scheduleHintTr: string;
 };
 
 type PersistState = AutoFollowLiveConfig & {
@@ -142,24 +302,6 @@ export function clampPollIntervalMs(n: number): number {
 function defaultPollMs(): number {
   const n = Number(process.env.AUTO_FOLLOW_LIVE_POLL_MS ?? String(POLL_MS_DEFAULT));
   return clampPollIntervalMs(Number.isFinite(n) ? n : POLL_MS_DEFAULT);
-}
-
-/**
- * Sleep until next IG poll: random jitter in [5, 6] minutes around the
- * configured base. On rate-limit, sleep ≥ 12 minutes.
- */
-export function nextPollSleepMs(
-  baseMs: number,
-  opts?: { rateLimited?: boolean; random?: () => number },
-): number {
-  const rnd = opts?.random ?? Math.random;
-  if (opts?.rateLimited) {
-    return Math.floor(POLL_MS_MAX * 2 + rnd() * 60_000);
-  }
-  const base = clampPollIntervalMs(baseMs);
-  // ±30s around base, clamped to 5–6 min
-  const jittered = base + (rnd() - 0.5) * 60_000;
-  return Math.floor(Math.min(POLL_MS_MAX, Math.max(POLL_MS_MIN, jittered)));
 }
 
 async function ensureConfigDir(env: AppEnv) {
@@ -397,6 +539,9 @@ export async function getAutoFollowLiveStatus(
     probeBatchSize,
     s.pollIntervalMs,
   );
+  const nextAt = nextEveningScanAt();
+  const nextScanAt = nextAt.toISOString();
+  const scheduleHintTr = eveningScheduleHintTr();
   let healthAlertTr: string | null = null;
   if (s.enabled) {
     if (!cookiesReady) {
@@ -405,28 +550,42 @@ export async function getAutoFollowLiveStatus(
     } else if (!loopStarted) {
       healthAlertTr =
         "Takip canlı poller çalışmıyor (API restart / AUTO_FOLLOW_LIVE=0).";
-    } else if (!scanPaused && s.lastPollAt) {
-      const age = Date.now() - new Date(s.lastPollAt).getTime();
-      if (Number.isFinite(age) && age > POLL_STALE_MS) {
-        healthAlertTr = `Takip canlı poller takıldı — son tarama ${Math.round(age / 60_000)} dk önce${s.lastError ? ` (${s.lastError})` : ""}.`;
+    } else if (!scanPaused) {
+      // Missed-slot alert: most recent slot start + grace + miss window passed
+      // without a poll at/after that slot.
+      const p = utcToIstanbulWall(new Date());
+      let mostRecentSlotAt: Date | null = null;
+      for (const slot of SCAN_SLOTS_HM) {
+        const at = istanbulWallToUtc(
+          p.year,
+          p.month,
+          p.day,
+          slot.hour,
+          slot.minute,
+        );
+        if (at.getTime() <= Date.now()) mostRecentSlotAt = at;
       }
-    } else if (!scanPaused && !s.lastPollAt && startedAt) {
-      const age = Date.now() - new Date(startedAt).getTime();
-      if (Number.isFinite(age) && age > POLL_STALE_MS) {
-        healthAlertTr =
-          "Takip canlı poller henüz tarama yapamadı — kontrol edin.";
+      if (
+        mostRecentSlotAt &&
+        Date.now() - mostRecentSlotAt.getTime() >
+          SLOT_FIRE_GRACE_MS + SLOT_MISS_ALERT_MS
+      ) {
+        const last = s.lastPollAt ? new Date(s.lastPollAt).getTime() : 0;
+        if (!Number.isFinite(last) || last < mostRecentSlotAt.getTime()) {
+          healthAlertTr = `Akşam tarama penceresi kaçırıldı — son plan ${formatScanAtIstanbulTr(mostRecentSlotAt)}${s.lastError ? ` (${s.lastError})` : ""}.`;
+        }
       }
-    }
-    // Surface recent cookie/429 failures only while we should be polling
-    // (not while scan is paused for an active kaydediliyor).
-    if (
-      !healthAlertTr &&
-      !scanPaused &&
-      s.lastPollOk === false &&
-      s.lastError &&
-      /429|rate-limit|çerez|oturum|blocked|401|403/i.test(s.lastError)
-    ) {
-      healthAlertTr = `Takip canlı uyarısı: ${s.lastError}`;
+      // Surface fresh 429/cookie failures only near/after a due slot (not all day).
+      const due = currentDueSlotKey();
+      if (
+        !healthAlertTr &&
+        due &&
+        s.lastPollOk === false &&
+        s.lastError &&
+        /429|rate-limit|çerez|oturum|blocked|401|403/i.test(s.lastError)
+      ) {
+        healthAlertTr = `Takip canlı uyarısı: ${s.lastError}`;
+      }
     }
   }
   return {
@@ -444,7 +603,7 @@ export async function getAutoFollowLiveStatus(
     startedAt,
     labelTr,
     hintTr:
-      `İzleyici hesabının (${watcherLabel}) takip ettiği TÜM hesaplar kapsanır: önce reels_tray, sonra takip listesinden dönen profil yoklaması (her ~5–6 dk’da ${probeBatchSize} hesap; tam tur ${fullSweepEtaTr}). Küçük «öncelik» listesi yalnızca sırayı öne alır. Kayıt sürerken tarama durur — aynı anda tek kayıt. Manuel «Canlı yayın ekle» aynı kullanıcı/broadcast için çift başlatmaz.`,
+      `İzleyici hesabının (${watcherLabel}) takip ettiği TÜM hesaplar akşam pencerelerinde taranır (${SCAN_SLOT_LABELS_TR} İstanbul): önce reels_tray, sonra takip listesinden dönen profil yoklaması (pencere başına ~${probeBatchSize} hesap; tam tur ${fullSweepEtaTr} — kayıt sürerken pencereler atlanır). Küçük «öncelik» listesi yalnızca sırayı öne alır. Aynı anda tek kayıt; operatör «Kaydı kes» ile erken bitirip yenisini başlatabilir. Manuel «Canlı yayın ekle» her zaman açık.`,
     cookiesReady,
     watcherUsername,
     healthOk: !healthAlertTr,
@@ -456,6 +615,10 @@ export async function getAutoFollowLiveStatus(
     probeBatchSize,
     fullSweepEtaTr,
     lastProbeBatch: followingCache.lastProbeBatch,
+    nextScanAt,
+    scanWindowsTr: SCAN_SLOT_LABELS_TR,
+    scanTimezone: SCAN_TIMEZONE,
+    scheduleHintTr,
   };
 }
 
@@ -660,11 +823,12 @@ export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
   loopStarted = true;
   startedAt = new Date().toISOString();
   console.log(
-    `[auto-follow] supervisor started (poll ${POLL_MS_MIN / 1000}–${POLL_MS_MAX / 1000}s jitter)`,
+    `[auto-follow] supervisor started (evening slots ${SCAN_SLOT_LABELS_TR} ${SCAN_TIMEZONE})`,
   );
 
-  let lastFailKind: string | null = null;
   let lastWhoamiAt = 0;
+  /** Slot keys already fired this process (avoid double-scan in grace). */
+  const firedSlotKeys = new Set<string>();
 
   for (;;) {
     try {
@@ -673,16 +837,17 @@ export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
       memoryStatus = state;
 
       if (!state.enabled) {
-        await Bun.sleep(nextPollSleepMs(state.pollIntervalMs));
+        state.lastDetail =
+          "Takip canlı otomatik kayıt kapalı — akşam taraması yok.";
+        await savePersist(env, state);
+        memoryStatus = state;
+        await Bun.sleep(SCHEDULER_IDLE_CHUNK_MS);
         continue;
       }
 
       const ig = await getIgSessionStatus(env);
       // Keep watcher label synced to cookie session (not stale credential mask).
-      if (
-        ig.hasCookies &&
-        Date.now() - lastWhoamiAt > 30 * 60_000
-      ) {
+      if (ig.hasCookies && Date.now() - lastWhoamiAt > 30 * 60_000) {
         lastWhoamiAt = Date.now();
         const who = await whoamiIgCookies(env).catch(() => null);
         if (who?.ok) {
@@ -697,7 +862,7 @@ export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
         state.lastDetail = state.lastError;
         await savePersist(env, state);
         memoryStatus = state;
-        await Bun.sleep(nextPollSleepMs(state.pollIntervalMs));
+        await Bun.sleep(SCHEDULER_IDLE_CHUNK_MS);
         continue;
       }
 
@@ -711,7 +876,9 @@ export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
                 `@${a.username}${a.captureStatus ? ` (${a.captureStatus})` : ""}`,
             )
             .join(", ") || "kayıt";
-        state.lastDetail = `Kayıt sürüyor (${who}) — takip taraması duraklatıldı.`;
+        const due = currentDueSlotKey();
+        if (due) firedSlotKeys.add(due); // skip this slot — do not thrash after recording ends mid-grace
+        state.lastDetail = `Kayıt sürüyor (${who}) — takip taraması duraklatıldı. Sonraki: ${formatScanAtIstanbulTr(nextEveningScanAt(new Date(Date.now() + SLOT_FIRE_GRACE_MS)))}.`;
         state.lastError = null;
         await savePersist(env, state);
         memoryStatus = state;
@@ -719,19 +886,58 @@ export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
         continue;
       }
 
+      const dueKey = currentDueSlotKey();
+      if (!dueKey || firedSlotKeys.has(dueKey)) {
+        const nextAt = dueKey && firedSlotKeys.has(dueKey)
+          ? nextEveningScanAt(new Date(Date.now() + SLOT_FIRE_GRACE_MS))
+          : nextEveningScanAt();
+        const wait = Math.max(1_000, nextAt.getTime() - Date.now());
+        state.lastDetail = `Sonraki akşam taraması: ${formatScanAtIstanbulTr(nextAt)}. Pencereler: ${SCAN_SLOT_LABELS_TR}.`;
+        state.lastError = null;
+        await savePersist(env, state);
+        memoryStatus = state;
+        await Bun.sleep(Math.min(wait, SCHEDULER_IDLE_CHUNK_MS));
+        continue;
+      }
+
+      console.log(`[auto-follow] evening slot fire ${dueKey}`);
       const cycle = await runAutoFollowPollCycle(sql, env);
+      firedSlotKeys.add(dueKey);
+
       if (cycle.paused) {
         await Bun.sleep(PAUSE_RECHECK_MS);
         continue;
       }
 
-      if (/429|rate-limit/i.test(cycle.detail)) lastFailKind = "rate_limited";
-      else lastFailKind = null;
+      // 429: do not retry this slot; backoff is "wait until next evening slot"
+      // (ban-safer than 5–6 min continuous). Intra-slot probe gaps remain in poller.
+      if (/429|rate-limit/i.test(cycle.detail)) {
+        const nextAt = nextEveningScanAt(
+          new Date(Date.now() + SLOT_FIRE_GRACE_MS),
+        );
+        const rlSleep = nextPollSleepMs(state.pollIntervalMs, {
+          rateLimited: true,
+        });
+        const untilNext = Math.max(1_000, nextAt.getTime() - Date.now());
+        const sleepMs = Math.max(untilNext, rlSleep);
+        state.lastDetail = `${cycle.detail} — sonraki deneme ${formatScanAtIstanbulTr(new Date(Date.now() + sleepMs))}.`;
+        await savePersist(env, state);
+        memoryStatus = state;
+        await Bun.sleep(Math.min(sleepMs, SCHEDULER_IDLE_CHUNK_MS));
+        continue;
+      }
 
+      const nextAt = nextEveningScanAt(
+        new Date(Date.now() + SLOT_FIRE_GRACE_MS),
+      );
+      state.lastDetail = `Tarama tamam (${dueKey}). Sonraki: ${formatScanAtIstanbulTr(nextAt)}.`;
+      await savePersist(env, state);
+      memoryStatus = state;
       await Bun.sleep(
-        nextPollSleepMs(state.pollIntervalMs, {
-          rateLimited: lastFailKind === "rate_limited",
-        }),
+        Math.min(
+          Math.max(1_000, nextAt.getTime() - Date.now()),
+          SCHEDULER_IDLE_CHUNK_MS,
+        ),
       );
     } catch (err) {
       console.error("[auto-follow] tick error", err);
@@ -741,7 +947,7 @@ export async function autoFollowLiveLoop(sql: Sql, env: AppEnv) {
       state.lastPollAt = new Date().toISOString();
       await savePersist(env, state);
       memoryStatus = state;
-      await Bun.sleep(nextPollSleepMs(defaultPollMs()));
+      await Bun.sleep(SCHEDULER_IDLE_CHUNK_MS);
     }
   }
 }

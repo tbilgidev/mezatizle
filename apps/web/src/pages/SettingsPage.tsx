@@ -42,18 +42,14 @@ type AutoFollowStatus = {
   probeBatchSize?: number;
   fullSweepEtaTr?: string;
   lastProbeBatch?: string[];
+  nextScanAt?: string;
+  scanWindowsTr?: string;
+  scanTimezone?: string;
+  scheduleHintTr?: string;
   labelTr: string;
   hintTr: string;
   cookiesReady: boolean;
 };
-
-function formatPollInterval(ms: number | undefined): string {
-  const n = ms ?? 330_000;
-  const min = n / 60_000;
-  const label =
-    Number.isInteger(min) ? `${min} dk` : `≈${min.toFixed(1).replace(/\.0$/, "")} dk`;
-  return `${label} (5–6 dk aralığında jitter)`;
-}
 
 function formatWhen(iso: string | null | undefined): string {
   if (!iso) return "—";
@@ -68,7 +64,29 @@ function formatWhen(iso: string | null | undefined): string {
       minute: "2-digit",
       second: "2-digit",
       hour12: false,
+      timeZone: "Europe/Istanbul",
     });
+  } catch {
+    return iso;
+  }
+}
+
+function formatNextScan(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return (
+      d.toLocaleString("tr-TR", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+        timeZone: "Europe/Istanbul",
+      }) + " (İstanbul)"
+    );
   } catch {
     return iso;
   }
@@ -284,12 +302,27 @@ export function SettingsPage() {
               ) : null}
               <ul className="mb-4 space-y-1 text-sm text-fog">
                 <li>
+                  Akşam tarama pencereleri:{" "}
+                  {autoFollow?.scanWindowsTr ?? "20:05, 21:05, 22:05"} (
+                  {autoFollow?.scanTimezone ?? "Europe/Istanbul"})
+                </li>
+                <li>
+                  Sonraki tarama: {formatNextScan(autoFollow?.nextScanAt)}
+                </li>
+                <li>
+                  {autoFollow?.scheduleHintTr ||
+                    "Günde 3 tarama; sürekli 5–6 dk yoklama yok (ban-safer)."}
+                </li>
+                <li>
                   Takip edilen hesap:{" "}
                   {typeof autoFollow?.followingCount === "number"
                     ? autoFollow.followingCount
                     : "—"}
                   {autoFollow?.fullSweepEtaTr
                     ? ` · tam tur ${autoFollow.fullSweepEtaTr}`
+                    : ""}
+                  {autoFollow?.probeBatchSize
+                    ? ` · yoklama/batch: ${autoFollow.probeBatchSize}`
                     : ""}
                 </li>
                 <li>
@@ -306,12 +339,6 @@ export function SettingsPage() {
                     : autoFollow?.lastPollOk === false
                       ? " · hata"
                       : ""}
-                </li>
-                <li>
-                  Tarama aralığı: {formatPollInterval(autoFollow?.pollIntervalMs)}
-                  {autoFollow?.probeBatchSize
-                    ? ` · yoklama/batch: ${autoFollow.probeBatchSize}`
-                    : ""}
                 </li>
                 <li>
                   Son yoklanan:{" "}

@@ -436,6 +436,50 @@ export const api = {
     request<{ ok: boolean }>(`/api/recordings/${id}/cancel-live`, {
       method: "POST",
     }),
+  /** Operator early cut — finalize + analysis (not iptal). */
+  stopLive: (id: string) =>
+    request<{
+      ok: boolean;
+      recordingId: string;
+      finalized: boolean;
+      analysisEnqueued: boolean;
+      detail: string;
+    }>(`/api/recordings/${id}/stop-live`, {
+      method: "POST",
+    }),
+  /** Stop current (optional id) then start new live. */
+  cutoverLive: (body: {
+    input: string;
+    stopRecordingId?: string;
+    displayName?: string;
+    notes?: string;
+    maxDurationMinutes?: number | null;
+  }) =>
+    request<{
+      ok: boolean;
+      stopped: {
+        ok: boolean;
+        recordingId: string;
+        finalized: boolean;
+        analysisEnqueued: boolean;
+        detail: string;
+      } | null;
+      started: {
+        recordingId: string;
+        username: string;
+        watchUrl: string;
+        captureStatus: string;
+        deduped?: boolean;
+        globalSingle?: boolean;
+        lastProbeDetail?: string | null;
+        maxDurationMinutes?: number | null;
+        policy?: { limitationTr?: string; message?: string };
+      };
+    }>("/api/recordings/cutover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
   /** Soft cascade delete one recording (+ derived analysis / storage). */
   deleteRecording: (id: string) =>
     request<{
@@ -551,6 +595,10 @@ export const api = {
       probeBatchSize?: number;
       fullSweepEtaTr?: string;
       lastProbeBatch?: string[];
+      nextScanAt?: string;
+      scanWindowsTr?: string;
+      scanTimezone?: string;
+      scheduleHintTr?: string;
     }>("/api/settings/auto-follow-live"),
   setAutoFollowLive: (body: { enabled?: boolean; pollIntervalMs?: number }) =>
     request<Record<string, unknown>>("/api/settings/auto-follow-live", {

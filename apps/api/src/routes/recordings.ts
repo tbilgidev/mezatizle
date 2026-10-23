@@ -5,8 +5,10 @@ import { createRecordingFromUpload } from "../modules/ingestion.ts";
 import {
   cancelLiveCapture,
   createLiveCapture,
+  cutoverLiveCapture,
   resumeBlockedLiveCapture,
   runCaptureStallWatchdogTick,
+  stopLiveCaptureAndAnalyze,
   LIVE_CAPTURE_POLICY,
 } from "../modules/live_capture.ts";
 import { safeJoinStorage } from "../lib/storage.ts";
@@ -144,10 +146,63 @@ export function recordingsRoutes(sql: Sql, env: AppEnv) {
     }
   });
 
+  /**
+   * Operator cutover: stop current (finalize+analyze) then start new capture.
+   * Must be registered before /:id routes. Body: { input, stopRecordingId?, … }
+   */
+  app.post("/cutover", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as {
+      input?: string;
+      stopRecordingId?: string;
+      displayName?: string;
+      notes?: string;
+      maxDurationMinutes?: number | string | null;
+    };
+    if (!body.input?.trim()) {
+      return c.json(
+        { error: "Yeni canlı link veya @kullanıcı adı gerekli" },
+        400,
+      );
+    }
+    const rawDur = body.maxDurationMinutes;
+    const maxDurationMinutes =
+      rawDur === "" || rawDur == null ? null : Number(rawDur);
+    try {
+      const result = await cutoverLiveCapture(sql, env, {
+        input: body.input,
+        stopRecordingId: body.stopRecordingId,
+        displayName: body.displayName,
+        notes: body.notes,
+        maxDurationMinutes: Number.isFinite(maxDurationMinutes as number)
+          ? (maxDurationMinutes as number)
+          : null,
+      });
+      return c.json(result, 201);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg, policy: LIVE_CAPTURE_POLICY }, 400);
+    }
+  });
+
   app.post("/:id/cancel-live", async (c) => {
     const id = c.req.param("id");
     try {
       const result = await cancelLiveCapture(sql, id);
+      return c.json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
+  });
+
+  /**
+   * Operator early cut: finalize MP4 + enqueue analysis (does not discard).
+   * Use before starting a different live while one is kaydediliyor.
+   */
+  app.post("/:id/stop-live", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const result = await stopLiveCaptureAndAnalyze(sql, env, id);
       return c.json(result);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

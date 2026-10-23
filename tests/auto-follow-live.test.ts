@@ -25,13 +25,21 @@ import {
   hasBlockingActiveCapture,
   nextPollSleepMs,
   clampPollIntervalMs,
+  nextEveningScanAt,
+  currentDueSlotKey,
+  utcToIstanbulWall,
+  istanbulWallToUtc,
+  SCAN_SLOTS_HM,
+  SCAN_SLOT_LABELS_TR,
+  SCAN_TIMEZONE,
+  SLOT_FIRE_GRACE_MS,
   POLL_MS_MIN,
   POLL_MS_MAX,
   POLL_MS_DEFAULT,
   POLL_HARD_TIMEOUT_MS,
-  POLL_STALE_MS,
   type ActiveCaptureRef,
 } from "../apps/api/src/modules/auto_follow_live.ts";
+import { findActiveCaptureConflict } from "../apps/api/src/modules/live_capture.ts";
 import type { AppEnv } from "../apps/api/src/lib/env.ts";
 import { parseLiveSourceInput } from "@mezatizle/shared";
 
@@ -104,7 +112,71 @@ describe("parseReelsTrayLives", () => {
   });
 });
 
-describe("poll interval 5–6 min", () => {
+describe("evening Istanbul scan slots", () => {
+  test("slots are 20:05 / 21:05 / 22:05 Europe/Istanbul", () => {
+    expect(SCAN_TIMEZONE).toBe("Europe/Istanbul");
+    expect(SCAN_SLOT_LABELS_TR).toBe("20:05, 21:05, 22:05");
+    expect(SCAN_SLOTS_HM).toEqual([
+      { hour: 20, minute: 5 },
+      { hour: 21, minute: 5 },
+      { hour: 22, minute: 5 },
+    ]);
+  });
+
+  test("nextScanAt is one of the three Istanbul wall times", () => {
+    // 2026-10-23 14:00 Istanbul = 11:00 UTC
+    const afternoon = istanbulWallToUtc(2026, 10, 23, 14, 0);
+    const next = nextEveningScanAt(afternoon);
+    const wall = utcToIstanbulWall(next);
+    expect(wall.hour).toBe(20);
+    expect(wall.minute).toBe(5);
+    expect(wall.day).toBe(23);
+  });
+
+  test("after 20:05 next is 21:05; after 22:05 next is next-day 20:05", () => {
+    const after20 = istanbulWallToUtc(2026, 10, 23, 20, 10);
+    // past grace → 21:05
+    const pastGrace = new Date(
+      istanbulWallToUtc(2026, 10, 23, 20, 5).getTime() + SLOT_FIRE_GRACE_MS + 1,
+    );
+    const n21 = nextEveningScanAt(pastGrace);
+    const w21 = utcToIstanbulWall(n21);
+    expect(w21.hour).toBe(21);
+    expect(w21.minute).toBe(5);
+
+    const pastLast = new Date(
+      istanbulWallToUtc(2026, 10, 23, 22, 5).getTime() + SLOT_FIRE_GRACE_MS + 1,
+    );
+    const nNext = nextEveningScanAt(pastLast);
+    const wNext = utcToIstanbulWall(nNext);
+    expect(wNext.day).toBe(24);
+    expect(wNext.hour).toBe(20);
+    expect(wNext.minute).toBe(5);
+
+    // within grace of 20:05 → still due that slot
+    const due = currentDueSlotKey(
+      new Date(istanbulWallToUtc(2026, 10, 23, 20, 5).getTime() + 30_000),
+    );
+    expect(due).toBe("2026-10-23T20:05");
+    expect(currentDueSlotKey(after20)).toBeNull();
+  });
+
+  test("status exposes nextScanAt + schedule copy", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "mezat-af-sched-"));
+    try {
+      const st = await getAutoFollowLiveStatus(fakeEnv(dir), null);
+      expect(st.scanWindowsTr).toBe(SCAN_SLOT_LABELS_TR);
+      expect(st.scanTimezone).toBe(SCAN_TIMEZONE);
+      expect(st.nextScanAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+      expect(st.scheduleHintTr).toMatch(/20:05/);
+      expect(st.hintTr).toMatch(/İstanbul|20:05/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("poll interval helpers (legacy / 429 backoff)", () => {
   test("clamps and defaults to ~5.5 min", () => {
     expect(clampPollIntervalMs(90_000)).toBe(POLL_MS_MIN);
     expect(clampPollIntervalMs(400_000)).toBe(POLL_MS_MAX);
@@ -126,10 +198,29 @@ describe("poll interval 5–6 min", () => {
     expect(rl).toBeGreaterThanOrEqual(POLL_MS_MAX * 2);
   });
 
-  test("poll hard-timeout and stale thresholds are finite safety nets", () => {
+  test("poll hard-timeout is a finite safety net", () => {
     expect(POLL_HARD_TIMEOUT_MS).toBeGreaterThanOrEqual(90_000);
     expect(POLL_HARD_TIMEOUT_MS).toBeLessThanOrEqual(180_000);
-    expect(POLL_STALE_MS).toBeGreaterThan(POLL_MS_MAX * 2);
+  });
+});
+
+describe("global single capture conflict", () => {
+  test("blocks second seller while any capture active", () => {
+    const rows = [
+      {
+        recording_id: "r1",
+        username: "shop_a",
+        watch_url: null,
+        source_url: null,
+        capture_status: "kaydediliyor",
+        max_duration_minutes: null,
+        last_probe_detail: null,
+        capture_error: null,
+      },
+    ];
+    const hit = findActiveCaptureConflict(rows, "shop_b", null);
+    expect(hit?.recording_id).toBe("r1");
+    expect(hit?.username).toBe("shop_a");
   });
 });
 
