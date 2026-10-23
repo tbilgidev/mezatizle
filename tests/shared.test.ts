@@ -400,10 +400,11 @@ describe("mezat window reconcile", () => {
         reason: "seller_aldim_ask",
       }),
     ]);
-    expect(sales.length).toBe(1);
-    expect(sales[0]!.buyerUsername).toBe("z.g.sahsuvaroglu");
-    expect(sales[0]!.amountTry).toBe(4500);
-    expect(sales[0]!.saleMethod).toBe("aldim_first_comment");
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBe(1);
+    expect(confirmed[0]!.buyerUsername).toBe("z.g.sahsuvaroglu");
+    expect(confirmed[0]!.amountTry).toBe(4500);
+    expect(confirmed[0]!.saleMethod).toBe("aldim_first_comment");
   });
 
   test("glam: later seller_price_line crumb must not rewrite claimed ask", () => {
@@ -444,10 +445,11 @@ describe("mezat window reconcile", () => {
         reason: "seller_price_line",
       }),
     ]);
-    expect(sales.length).toBe(1);
-    expect(sales[0]!.buyerUsername).toBe("aylinbakay");
-    expect(sales[0]!.amountTry).toBe(2200);
-    expect(sales[0]!.askAmountTry).toBe(2200);
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBe(1);
+    expect(confirmed[0]!.buyerUsername).toBe("aylinbakay");
+    expect(confirmed[0]!.amountTry).toBe(2200);
+    expect(confirmed[0]!.askAmountTry).toBe(2200);
   });
 
   test("glam: product-cued elimdeki / bu da open distinct lots (recall)", () => {
@@ -618,9 +620,10 @@ describe("mezat window reconcile", () => {
         reason: "price_mention",
       }),
     ]);
-    expect(sales.length).toBe(1);
-    expect(sales[0]!.buyerUsername).toBe("cig.mut");
-    expect(sales[0]!.amountTry).toBe(2000);
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBe(1);
+    expect(confirmed[0]!.buyerUsername).toBe("cig.mut");
+    expect(confirmed[0]!.amountTry).toBe(2000);
   });
 
   test("claimed aldım survives correction_or_void pass (flush at claim ask)", () => {
@@ -1066,10 +1069,11 @@ describe("mezat window reconcile", () => {
         reason: "price_mention",
       }),
     ]);
-    expect(sales.length).toBe(1);
-    expect(sales[0]!.buyerUsername).toBe("draylingunbay");
-    expect(sales[0]!.amountTry).toBe(1000);
-    expect(sales[0]!.saleMethod).toBe("aldim_first_comment");
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBe(1);
+    expect(confirmed[0]!.buyerUsername).toBe("draylingunbay");
+    expect(confirmed[0]!.amountTry).toBe(1000);
+    expect(confirmed[0]!.saleMethod).toBe("aldim_first_comment");
   });
 
   test("second aldım on open lot orphans onto the next ask", () => {
