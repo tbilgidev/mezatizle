@@ -186,7 +186,18 @@ export async function reconcileSales(
   );
   const gate = Number.isFinite(minConf) ? minConf : SALE_MIN_CONFIDENCE;
 
-  // Preserve operator approve/reject across re-reconcile (match by ~offset + buyer/spoken).
+  // Preserve operator approve/reject + inline field edits across re-reconcile.
+  type OperatorOverride = {
+    status: string;
+    buyerUsername: string | null;
+    amountCents: number | null;
+    saleMethod: string | null;
+    askAmountTry: number | null;
+    spokenBuyerName: string | null;
+    offsetMs: number;
+    operatorEdited: boolean;
+    used: boolean;
+  };
   const priorDecisions = await sql<
     {
       status: string;
@@ -203,9 +214,13 @@ export async function reconcileSales(
     FROM sales sa
     LEFT JOIN products p ON p.id = sa.product_id
     WHERE sa.recording_id = ${recordingId}
-      AND sa.status IN ('confirmed', 'rejected')
+      AND (
+        sa.status IN ('confirmed', 'rejected')
+        OR COALESCE((p.attributes->>'operatorEdited')::boolean, false) = true
+      )
   `;
   const decisionByKey = new Map<string, string>();
+  const operatorOverrides: OperatorOverride[] = [];
   for (const d of priorDecisions) {
     const attrs = d.attrs && typeof d.attrs === "object" ? d.attrs : {};
     const offsetMs =
@@ -219,12 +234,54 @@ export async function reconcileSales(
     const buyer = (d.buyer_username ?? "").toLowerCase();
     const amt =
       d.amount_cents != null ? Math.round(Number(d.amount_cents) / 100) : "_";
+    const operatorEdited = attrs.operatorEdited === true;
     if (offsetMs != null) {
       decisionByKey.set(
         `${Math.floor(offsetMs / 15_000)}|${buyer}|${spoken}|${amt}`,
         d.status,
       );
+      // Offset-only key so buyer/amount edits still match after re-reconcile.
+      if (operatorEdited || d.status === "confirmed" || d.status === "rejected") {
+        decisionByKey.set(`off:${Math.floor(offsetMs / 15_000)}`, d.status);
+      }
+      operatorOverrides.push({
+        status: d.status,
+        buyerUsername: d.buyer_username,
+        amountCents:
+          d.amount_cents != null && Number.isFinite(Number(d.amount_cents))
+            ? Math.round(Number(d.amount_cents))
+            : null,
+        saleMethod:
+          typeof attrs.saleMethod === "string" ? attrs.saleMethod : null,
+        askAmountTry:
+          attrs.askAmountTry != null &&
+          Number.isFinite(Number(attrs.askAmountTry))
+            ? Number(attrs.askAmountTry)
+            : null,
+        spokenBuyerName:
+          typeof attrs.spokenBuyerName === "string"
+            ? attrs.spokenBuyerName
+            : null,
+        offsetMs,
+        operatorEdited,
+        used: false,
+      });
     }
+  }
+
+  function takeOperatorOverride(offsetMs: number): OperatorOverride | null {
+    let best: OperatorOverride | null = null;
+    let bestDist = Infinity;
+    for (const o of operatorOverrides) {
+      if (o.used || !o.operatorEdited) continue;
+      const dist = Math.abs(o.offsetMs - offsetMs);
+      if (dist <= 8_000 && dist < bestDist) {
+        best = o;
+        bestDist = dist;
+      }
+    }
+    if (best) best.used = true;
+    return best;
   }
 
   const oldSales = await sql<{ id: string; product_id: string | null }[]>`
@@ -313,13 +370,29 @@ export async function reconcileSales(
       }
     }
 
-    const amountCents =
+    const offsetMs = cand.offsetMs;
+    const op = takeOperatorOverride(offsetMs);
+
+    let amountCents =
       cand.amountTry != null && cand.amountTry >= 10
         ? Math.round(cand.amountTry * 100)
         : null;
-    const buyer = cand.buyerUsername ?? null;
-    const spoken = (cand.spokenBuyerName ?? "").toLowerCase();
-    const offsetMs = cand.offsetMs;
+    let buyer = cand.buyerUsername ?? null;
+    let spokenBuyerName = cand.spokenBuyerName ?? null;
+    let saleMethod = cand.saleMethod;
+    let askAmountTry = cand.askAmountTry ?? null;
+
+    if (op) {
+      if (op.buyerUsername != null) buyer = op.buyerUsername;
+      if (op.amountCents != null) amountCents = op.amountCents;
+      if (op.saleMethod != null) {
+        saleMethod = op.saleMethod as typeof saleMethod;
+      }
+      if (op.askAmountTry != null) askAmountTry = op.askAmountTry;
+      if (op.spokenBuyerName != null) spokenBuyerName = op.spokenBuyerName;
+    }
+
+    const spoken = (spokenBuyerName ?? "").toLowerCase();
     const buyerKey = (buyer ?? `spoken:${spoken || "bilinmiyor"}`).toLowerCase();
     // Legacy 8s key + ~3 min same-buyer≈price key (repeated verbal confirms).
     const dedupeKey = `${buyerKey}:${amountCents ?? "_"}:${Math.floor(offsetMs / 8000)}`;
@@ -331,17 +404,17 @@ export async function reconcileSales(
     seenKeys.add(dedupeKey);
     seenKeys.add(lotDedupeKey);
 
+    const effectiveHasBuyer = Boolean(buyer);
     const gaps: string[] = [];
     if (amountCents == null) gaps.push("amount_unknown");
-    if (!hasBuyer) gaps.push("buyer_unknown");
-    if (wantsReview) gaps.push("needs_review");
+    if (!effectiveHasBuyer) gaps.push("buyer_unknown");
+    if (wantsReview && !op) gaps.push("needs_review");
 
     const productHint =
       cand.productHint && cand.productHint.trim().length > 2
         ? cand.productHint.trim().slice(0, 200)
         : `Canlı lot @ ${offsetMs}ms (inceleme)`;
 
-    const saleMethod = cand.saleMethod;
     const evidenceQuote =
       cand.evidenceQuote?.trim().slice(0, 240) ||
       cand.reason.slice(0, 240);
@@ -354,9 +427,10 @@ export async function reconcileSales(
         gaps,
       }),
       evidenceQuote ? `Kanıt: «${evidenceQuote}»` : "",
-      wantsReview
+      wantsReview && !(op && (op.status === "confirmed" || op.status === "rejected"))
         ? "Operatör onayı bekleniyor (satış KPI’sına dahil değil)."
         : "",
+      op?.operatorEdited ? "Operatör düzeltmesi korundu." : "",
     ]
       .filter(Boolean)
       .join(" ");
@@ -366,13 +440,16 @@ export async function reconcileSales(
       : new Date();
 
     const decisionKey = `${Math.floor(offsetMs / 15_000)}|${(buyer ?? "").toLowerCase()}|${spoken}|${amountCents != null ? Math.round(amountCents / 100) : "_"}`;
-    const preserved = decisionByKey.get(decisionKey);
+    const preserved =
+      decisionByKey.get(decisionKey) ??
+      (op ? op.status : undefined) ??
+      decisionByKey.get(`off:${Math.floor(offsetMs / 15_000)}`);
     // Auto-confirm only with buyer + price; amount-unknown → needs_review
     // (never KPI-inflate a null TRY sale from bare verbal packing).
     let status =
       preserved === "confirmed" || preserved === "rejected"
         ? preserved
-        : wantsReview || !hasBuyer || amountCents == null
+        : wantsReview || !effectiveHasBuyer || amountCents == null
           ? "needs_review"
           : "confirmed";
 
@@ -385,14 +462,17 @@ export async function reconcileSales(
         ${sql.json({
           confidence: cand.confidence,
           amountKnown: amountCents != null,
-          buyerKnown: hasBuyer,
-          spokenBuyerName: cand.spokenBuyerName ?? null,
+          buyerKnown: effectiveHasBuyer,
+          spokenBuyerName: spokenBuyerName ?? null,
           saleMethod,
           offsetMs,
-          askAmountTry: cand.askAmountTry ?? null,
+          askAmountTry,
           gaps,
-          needsReview: wantsReview || status === "needs_review",
+          needsReview: status === "needs_review",
           evidenceQuote,
+          operatorEdited: op?.operatorEdited === true,
+          operatorEditedAt:
+            op?.operatorEdited === true ? new Date().toISOString() : undefined,
         })}
       )
       RETURNING id

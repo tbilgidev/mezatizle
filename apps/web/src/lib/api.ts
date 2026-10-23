@@ -122,6 +122,8 @@ export type ReportSale = {
   spokenBuyerName: string | null;
   amountCents: number | null;
   amountTry: number | null;
+  /** Listed ask when shown / distinct from sold amount. */
+  askAmountTry?: number | null;
   status: string;
   productTitle: string | null;
   /** Longer product blurb when distinct from title. */
@@ -131,6 +133,7 @@ export type ReportSale = {
   thumbnailUrl: string | null;
   /** How the sale was detected: saleMethod / transcript / ocr / … */
   detectionMethod: string | null;
+  saleMethod?: string | null;
   /** 0–1 confidence when API provides it. */
   confidence: number | null;
   /** Timeline offset in muxed recording (ms) for video seek. */
@@ -138,6 +141,28 @@ export type ReportSale = {
   explanationTr: string | null;
   /** Short ASR/comment quote for needs_review list. */
   evidenceQuote?: string | null;
+  operatorEdited?: boolean;
+};
+
+export type SaleReviewPatch = {
+  status?: string;
+  buyerUsername?: string | null;
+  amountTry?: number | null;
+  askAmount?: number | null;
+  method?: string | null;
+  spokenBuyerName?: string | null;
+};
+
+export type SaleKpiSnapshot = {
+  confirmedCount: number;
+  needsReviewCount: number;
+  rejectedCount: number;
+  saleCount: number;
+  productsSoldCount: number;
+  productsSold: number;
+  productsSoldSumTry: number;
+  totalSoldTry: number;
+  sumAmountTry: number;
 };
 
 export type ReportDetail = ReportListItem & {
@@ -276,6 +301,9 @@ export function normalizeReportSale(raw: Record<string, unknown>): ReportSale {
     ),
     amountCents,
     amountTry,
+    askAmountTry:
+      num(raw.askAmountTry ?? raw.ask_amount_try ?? raw.askAmount ?? raw.ask_amount) ??
+      num(attrs?.askAmountTry),
     status: String(raw.status ?? "candidate"),
     productTitle: str(raw.productTitle ?? raw.product_title ?? raw.title),
     productDescription: str(
@@ -298,11 +326,16 @@ export function normalizeReportSale(raw: Record<string, unknown>): ReportSale {
         raw.evidenceSource ??
         raw.evidence_source,
     ),
+    saleMethod: str(
+      raw.saleMethod ?? raw.sale_method ?? attrs?.saleMethod ?? raw.detectionMethod,
+    ),
     confidence,
     offsetMs:
       num(raw.offsetMs ?? raw.offset_ms ?? raw.seekMs ?? raw.seek_ms) ??
       num(attrs?.offsetMs),
     explanationTr: str(raw.explanationTr ?? raw.explanation_tr),
+    evidenceQuote: str(raw.evidenceQuote ?? raw.evidence_quote ?? attrs?.evidenceQuote),
+    operatorEdited: raw.operatorEdited === true || attrs?.operatorEdited === true,
   };
 }
 
@@ -399,12 +432,18 @@ export const api = {
         source?: string | null;
       }>;
     }>(`/api/comments/${recordingId}`),
-  reviewSale: (id: string, status: string) =>
-    request(`/api/sales/${id}/review`, {
+  reviewSale: (id: string, patch: string | SaleReviewPatch) => {
+    const body: SaleReviewPatch =
+      typeof patch === "string" ? { status: patch } : patch;
+    return request<{
+      sale: Record<string, unknown>;
+      kpis: SaleKpiSnapshot | null;
+    }>(`/api/sales/${id}/review`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status }),
-    }),
+      body: JSON.stringify(body),
+    });
+  },
   upload: async (form: FormData) => {
     const res = await fetch(url("/api/recordings/upload"), {
       method: "POST",

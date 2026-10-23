@@ -77,6 +77,8 @@ export type ReportSaleRow = {
   saleMethod: string | null;
   /** Alias of saleMethod for mezatizle-ui ReportDetailPage. */
   detectionMethod: string | null;
+  /** Opening / listed ask when distinct from sold amount. */
+  askAmountTry: number | null;
   soldAt: string | null;
   offsetMs: number | null;
   confidence: number | null;
@@ -85,6 +87,8 @@ export type ReportSaleRow = {
   explanationTr: string | null;
   /** ASR/yorum kanıt alıntısı (inceleme listesi). */
   evidenceQuote: string | null;
+  /** Operator patched buyer/price/method — durable across re-fetch. */
+  operatorEdited?: boolean;
 };
 
 export type ReportDetail = ReportListItem & {
@@ -541,6 +545,7 @@ export function reportsRoutes(sql: Sql) {
         (typeof evPayload.spokenBuyerName === "string"
           ? evPayload.spokenBuyerName
           : null);
+      const askAmountTry = attrNumber(attrs, "askAmountTry");
       const explanationTr =
         typeof evPayload.explanationTr === "string"
           ? evPayload.explanationTr
@@ -570,6 +575,7 @@ export function reportsRoutes(sql: Sql) {
         amountCents: s.amount_cents != null ? Number(s.amount_cents) : null,
         amountTry:
           s.amount_cents != null ? Number(s.amount_cents) / 100 : null,
+        askAmountTry,
         currency: String(s.currency ?? "TRY"),
         saleMethod,
         detectionMethod: saleMethod,
@@ -583,6 +589,7 @@ export function reportsRoutes(sql: Sql) {
         evidenceIds: evList.map((e) => e.id),
         explanationTr,
         evidenceQuote,
+        operatorEdited: attrs?.operatorEdited === true,
       };
     });
 

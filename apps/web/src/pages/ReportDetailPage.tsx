@@ -7,8 +7,17 @@ import {
   Download,
   Film,
   ImageOff,
+  Pencil,
+  X,
 } from "lucide-react";
-import { api, type ReportDetail, type ReportSale } from "@/lib/api";
+import {
+  api,
+  normalizeReportSale,
+  type ReportDetail,
+  type ReportSale,
+  type SaleKpiSnapshot,
+  type SaleReviewPatch,
+} from "@/lib/api";
 import {
   analysisProgressInfo,
   isAnalysisFailed,
@@ -30,6 +39,7 @@ import { EmptyState, ErrorState, LoadingState, PageHeader } from "@/components/S
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input, Select } from "@/components/ui/input";
 
 function saleBadge(status: string): "ok" | "warn" | "danger" | "muted" {
   if (status === "confirmed") return "ok";
@@ -38,7 +48,17 @@ function saleBadge(status: string): "ok" | "warn" | "danger" | "muted" {
   return "muted";
 }
 
+const METHOD_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "aldim_first_comment", label: "Aldım (yorum)" },
+  { value: "bid_win_confirm", label: "Pey / teklif" },
+  { value: "verbal_win_confirm", label: "Sözlü onay" },
+  { value: "counter_accept", label: "Karşı teklif kabul" },
+  { value: "sold_phrase", label: "Satıldı ifadesi" },
+  { value: "manual", label: "Elle" },
+];
+
 const METHOD_TR: Record<string, string> = {
+  ...Object.fromEntries(METHOD_OPTIONS.map((m) => [m.value, m.label])),
   transcript: "Ses",
   asr: "Ses",
   ocr: "OCR",
@@ -50,7 +70,6 @@ const METHOD_TR: Record<string, string> = {
   reconcile: "Eşleştirme",
   bid: "Teklif",
   auction_event: "Olay",
-  manual: "Elle",
   seller_aldim: "Satıcı «aldım»",
   seller_sold: "Satıcı «satıldı»",
   buyer_bid: "Alıcı teklifi",
@@ -138,32 +157,71 @@ function buyerLabel(s: ReportSale): { text: string; known: boolean } {
   return { text: "bilinmiyor", known: false };
 }
 
+type EditDraft = {
+  buyerUsername: string;
+  amountTry: string;
+  askAmount: string;
+  method: string;
+};
+
+function draftFromSale(s: ReportSale): EditDraft {
+  return {
+    buyerUsername: s.buyerUsername?.replace(/^@/, "") ?? "",
+    amountTry: s.amountTry != null ? String(s.amountTry) : "",
+    askAmount: s.askAmountTry != null ? String(s.askAmountTry) : "",
+    method: (s.saleMethod ?? s.detectionMethod ?? "manual").toLowerCase(),
+  };
+}
+
+function parseOptionalTry(raw: string): number | null | undefined {
+  const t = raw.trim().replace(/\s/g, "").replace(",", ".");
+  if (!t) return null;
+  const n = Number(t);
+  if (!Number.isFinite(n) || n < 0) return undefined;
+  return n;
+}
+
 function SaleTable({
   rows,
   busyId,
+  editingId,
+  draft,
+  rowError,
   reviewedIds,
   playerSaleId,
   mode,
   onOpen,
   onReview,
+  onStartEdit,
+  onCancelEdit,
+  onDraftChange,
+  onSaveEdit,
 }: {
   rows: ReportSale[];
   busyId: string | null;
+  editingId: string | null;
+  draft: EditDraft | null;
+  rowError: string | null;
   reviewedIds: Set<string>;
   playerSaleId: string | null;
   mode: "sold" | "review" | "rejected";
   onOpen: (s: ReportSale) => void;
   onReview: (id: string, status: string) => void;
+  onStartEdit: (s: ReportSale) => void;
+  onCancelEdit: () => void;
+  onDraftChange: (patch: Partial<EditDraft>) => void;
+  onSaveEdit: (id: string) => void;
 }) {
   return (
     <div className="overflow-x-auto">
-      <table className="w-full min-w-[720px] border-collapse text-left text-sm">
+      <table className="w-full min-w-[820px] border-collapse text-left text-sm">
         <thead>
           <tr className="border-b border-line text-xs uppercase tracking-wide text-fog">
             <th className="pb-2 pr-3 font-semibold">Görsel</th>
             <th className="pb-2 pr-3 font-semibold">Ürün / kanıt</th>
             <th className="pb-2 pr-3 font-semibold">Alıcı</th>
             <th className="pb-2 pr-3 font-semibold">Tutar</th>
+            <th className="pb-2 pr-3 font-semibold">Ask</th>
             <th className="pb-2 pr-3 font-semibold">Yöntem</th>
             <th className="pb-2 pr-3 font-semibold">Zaman</th>
             <th className="pb-2 pr-3 font-semibold">Güven</th>
@@ -182,10 +240,18 @@ function SaleTable({
             const quote =
               s.evidenceQuote?.trim() ||
               (s.explanationTr ? s.explanationTr.slice(0, 160) : null);
+            const editing = editingId === s.id && draft;
+            const busy = busyId === s.id;
+            const showAsk =
+              editing ||
+              (s.askAmountTry != null &&
+                (s.amountTry == null || s.askAmountTry !== s.amountTry));
             return (
               <tr
                 key={s.id}
                 className="border-b border-line/70 align-top transition-colors hover:bg-white/[0.03]"
+                data-sale-id={s.id}
+                data-editing={editing ? "1" : undefined}
               >
                 <td className="py-3 pr-3">
                   <button
@@ -219,20 +285,90 @@ function SaleTable({
                     </Badge>
                   </button>
                 </td>
-                <td className="py-3 pr-3 whitespace-nowrap">
-                  {buyer.known ? (
-                    <span className="font-semibold text-mint">{buyer.text}</span>
+                <td className="py-3 pr-3">
+                  {editing ? (
+                    <Input
+                      className="h-9 min-w-[8rem]"
+                      placeholder="@kullanici"
+                      value={draft.buyerUsername}
+                      disabled={busy}
+                      onChange={(e) =>
+                        onDraftChange({ buyerUsername: e.target.value })
+                      }
+                    />
+                  ) : buyer.known ? (
+                    <span className="whitespace-nowrap font-semibold text-mint">
+                      {buyer.text}
+                    </span>
                   ) : (
                     <span className="text-fog" title="Alıcı tahmini">
                       {buyer.text}
                     </span>
                   )}
                 </td>
-                <td className="py-3 pr-3 whitespace-nowrap font-display text-base font-semibold tracking-tight">
-                  {formatTry(s.amountTry)}
+                <td className="py-3 pr-3">
+                  {editing ? (
+                    <Input
+                      className="h-9 w-24"
+                      inputMode="decimal"
+                      placeholder="TRY"
+                      value={draft.amountTry}
+                      disabled={busy}
+                      onChange={(e) =>
+                        onDraftChange({ amountTry: e.target.value })
+                      }
+                    />
+                  ) : (
+                    <span className="whitespace-nowrap font-display text-base font-semibold tracking-tight">
+                      {formatTry(s.amountTry)}
+                    </span>
+                  )}
                 </td>
-                <td className="py-3 pr-3 whitespace-nowrap text-fog">
-                  {methodTr(s.detectionMethod)}
+                <td className="py-3 pr-3">
+                  {editing ? (
+                    <Input
+                      className="h-9 w-24"
+                      inputMode="decimal"
+                      placeholder="Ask"
+                      value={draft.askAmount}
+                      disabled={busy}
+                      onChange={(e) =>
+                        onDraftChange({ askAmount: e.target.value })
+                      }
+                    />
+                  ) : showAsk ? (
+                    <span className="whitespace-nowrap text-fog">
+                      {formatTry(s.askAmountTry)}
+                    </span>
+                  ) : (
+                    <span className="text-fog">—</span>
+                  )}
+                </td>
+                <td className="py-3 pr-3">
+                  {editing ? (
+                    <Select
+                      className="h-9 min-w-[9rem]"
+                      value={
+                        METHOD_OPTIONS.some((m) => m.value === draft.method)
+                          ? draft.method
+                          : "manual"
+                      }
+                      disabled={busy}
+                      onChange={(e) =>
+                        onDraftChange({ method: e.target.value })
+                      }
+                    >
+                      {METHOD_OPTIONS.map((m) => (
+                        <option key={m.value} value={m.value}>
+                          {m.label}
+                        </option>
+                      ))}
+                    </Select>
+                  ) : (
+                    <span className="whitespace-nowrap text-fog">
+                      {methodTr(s.detectionMethod ?? s.saleMethod)}
+                    </span>
+                  )}
                 </td>
                 <td className="py-3 pr-3 whitespace-nowrap text-fog">
                   {s.offsetMs != null
@@ -247,7 +383,7 @@ function SaleTable({
                     <button
                       type="button"
                       className="inline-flex items-center gap-1 text-sm font-semibold text-mint hover:text-mint-bright disabled:opacity-50"
-                      disabled={busyId === s.id}
+                      disabled={busy}
                       onClick={() => onOpen(s)}
                     >
                       <Film className="h-3.5 w-3.5" />
@@ -259,11 +395,45 @@ function SaleTable({
                     >
                       Kanıt paneli →
                     </Link>
+                    {editing ? (
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        <Button
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => onSaveEdit(s.id)}
+                        >
+                          {busy ? "Kaydediliyor…" : "Kaydet"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={busy}
+                          onClick={onCancelEdit}
+                        >
+                          İptal
+                        </Button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        className="inline-flex items-center gap-1 text-xs font-semibold text-fog hover:text-mint disabled:opacity-50"
+                        disabled={busy || (editingId != null && editingId !== s.id)}
+                        onClick={() => onStartEdit(s)}
+                      >
+                        <Pencil className="h-3 w-3" />
+                        Düzenle
+                      </button>
+                    )}
+                    {editing && rowError ? (
+                      <p className="text-xs text-rose" role="alert">
+                        {rowError}
+                      </p>
+                    ) : null}
                     {mode === "review" ? (
                       <div className="mt-1 flex flex-wrap gap-1.5">
                         <Button
                           size="sm"
-                          disabled={busyId === s.id || !unlocked}
+                          disabled={busy || !unlocked}
                           title={
                             !unlocked
                               ? "Önce videoyu inceleyin"
@@ -276,7 +446,7 @@ function SaleTable({
                         <Button
                           size="sm"
                           variant="danger"
-                          disabled={busyId === s.id || !unlocked}
+                          disabled={busy || !unlocked}
                           title={
                             !unlocked
                               ? "Önce videoyu inceleyin"
@@ -292,7 +462,7 @@ function SaleTable({
                         <Button
                           size="sm"
                           variant="danger"
-                          disabled={busyId === s.id}
+                          disabled={busy}
                           onClick={() => onReview(s.id, "rejected")}
                         >
                           Satış değil
@@ -302,7 +472,7 @@ function SaleTable({
                       <div className="mt-1 flex flex-wrap gap-1.5">
                         <Button
                           size="sm"
-                          disabled={busyId === s.id}
+                          disabled={busy}
                           onClick={() => onReview(s.id, "confirmed")}
                         >
                           Satış olarak onayla
@@ -320,6 +490,25 @@ function SaleTable({
   );
 }
 
+function applyKpisToReport(
+  report: ReportDetail,
+  kpis: SaleKpiSnapshot | null | undefined,
+): ReportDetail {
+  if (!kpis) return report;
+  return {
+    ...report,
+    confirmedCount: kpis.confirmedCount,
+    needsReviewCount: kpis.needsReviewCount,
+    rejectedCount: kpis.rejectedCount,
+    saleCount: kpis.saleCount,
+    productsSoldCount: kpis.productsSoldCount,
+    productsSold: kpis.productsSold,
+    productsSoldSumTry: kpis.productsSoldSumTry,
+    totalSoldTry: kpis.totalSoldTry,
+    sumAmountTry: kpis.sumAmountTry,
+  };
+}
+
 export function ReportDetailPage() {
   const { recordingId = "" } = useParams();
   const [report, setReport] = useState<ReportDetail | null>(null);
@@ -328,8 +517,12 @@ export function ReportDetailPage() {
     unknown
   > | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draft, setDraft] = useState<EditDraft | null>(null);
+  const [rowError, setRowError] = useState<string | null>(null);
   const [techOpen, setTechOpen] = useState(false);
   const [player, setPlayer] = useState<{
     saleId: string;
@@ -338,21 +531,39 @@ export function ReportDetailPage() {
   /** Sales whose video was reviewed this session — unlocks Onayla/Reddet. */
   const [reviewedIds, setReviewedIds] = useState<Set<string>>(() => new Set());
 
-  async function load() {
+  async function load(opts?: { silent?: boolean }) {
     const [rep, rec] = await Promise.all([
       api.report(recordingId),
       api.recording(recordingId).catch(() => null),
     ]);
     const safe = rep?.report;
     if (!safe) throw new Error("Rapor yanıtı boş.");
-    setReport({
-      ...safe,
-      sales: Array.isArray(safe.sales) ? safe.sales : [],
-      jobs: Array.isArray(safe.jobs) ? safe.jobs : [],
-      eventCounts:
-        safe.eventCounts && typeof safe.eventCounts === "object"
-          ? safe.eventCounts
-          : {},
+    setReport((prev) => {
+      const nextSales = Array.isArray(safe.sales) ? safe.sales : [];
+      // Keep in-progress edit draft row stable across silent polls.
+      if (opts?.silent && editingId && prev) {
+        const edited = prev.sales.find((s) => s.id === editingId);
+        if (edited) {
+          return {
+            ...safe,
+            sales: nextSales.map((s) => (s.id === editingId ? edited : s)),
+            jobs: Array.isArray(safe.jobs) ? safe.jobs : [],
+            eventCounts:
+              safe.eventCounts && typeof safe.eventCounts === "object"
+                ? safe.eventCounts
+                : {},
+          };
+        }
+      }
+      return {
+        ...safe,
+        sales: nextSales,
+        jobs: Array.isArray(safe.jobs) ? safe.jobs : [],
+        eventCounts:
+          safe.eventCounts && typeof safe.eventCounts === "object"
+            ? safe.eventCounts
+            : {},
+      };
     });
     setRecordingMeta(
       rec?.recording && typeof rec.recording === "object"
@@ -366,6 +577,8 @@ export function ReportDetailPage() {
     setLoading(true);
     setReviewedIds(new Set());
     setPlayer(null);
+    setEditingId(null);
+    setDraft(null);
     load()
       .catch((e: Error) => {
         if (alive) setError(e.message);
@@ -374,13 +587,19 @@ export function ReportDetailPage() {
         if (alive) setLoading(false);
       });
     const t = setInterval(() => {
-      void load().catch(() => undefined);
+      void load({ silent: true }).catch(() => undefined);
     }, 5000);
     return () => {
       alive = false;
       clearInterval(t);
     };
   }, [recordingId]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 2800);
+    return () => clearTimeout(t);
+  }, [toast]);
 
   const sales = useMemo(
     () => (Array.isArray(report?.sales) ? report!.sales : []),
@@ -413,6 +632,27 @@ export function ReportDetailPage() {
   const analysisFailed = isAnalysisFailed(analysisRow);
   const analysisProgress = analysisProgressInfo(analysisRow);
 
+  function mergeSaleResponse(
+    saleRaw: Record<string, unknown>,
+    kpis: SaleKpiSnapshot | null | undefined,
+  ) {
+    const mapped = normalizeReportSale(saleRaw);
+    if (!mapped.id) return;
+    setReport((prev) => {
+      if (!prev) return prev;
+      const salesNext = prev.sales.map((s) =>
+        s.id === mapped.id
+          ? {
+              ...s,
+              ...mapped,
+              thumbnailUrl: mapped.thumbnailUrl ?? s.thumbnailUrl,
+            }
+          : s,
+      );
+      return applyKpisToReport({ ...prev, sales: salesNext }, kpis);
+    });
+  }
+
   async function review(saleId: string, status: string) {
     if (!saleId) {
       setError("Satış kimliği yok — işlem yapılamadı.");
@@ -426,11 +666,57 @@ export function ReportDetailPage() {
     }
     setBusyId(saleId);
     setError(null);
+    setRowError(null);
     try {
-      await api.reviewSale(saleId, status);
-      await load();
+      const res = await api.reviewSale(saleId, { status });
+      if (res?.sale) mergeSaleResponse(res.sale, res.kpis);
+      else await load();
+      setToast(
+        status === "confirmed"
+          ? "Satış onaylandı"
+          : status === "rejected"
+            ? "Satış değil olarak işaretlendi"
+            : "Durum güncellendi",
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function saveEdit(saleId: string) {
+    if (!draft) return;
+    const amount = parseOptionalTry(draft.amountTry);
+    if (amount === undefined) {
+      setRowError("Geçersiz satış tutarı");
+      return;
+    }
+    const ask = parseOptionalTry(draft.askAmount);
+    if (ask === undefined) {
+      setRowError("Geçersiz ask tutarı");
+      return;
+    }
+    const patch: SaleReviewPatch = {
+      buyerUsername: draft.buyerUsername.trim()
+        ? draft.buyerUsername.trim().replace(/^@+/, "")
+        : null,
+      amountTry: amount,
+      askAmount: ask,
+      method: draft.method || "manual",
+    };
+    setBusyId(saleId);
+    setRowError(null);
+    setError(null);
+    try {
+      const res = await api.reviewSale(saleId, patch);
+      if (res?.sale) mergeSaleResponse(res.sale, res.kpis);
+      else await load();
+      setEditingId(null);
+      setDraft(null);
+      setToast("Satır kaydedildi");
+    } catch (e) {
+      setRowError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusyId(null);
     }
@@ -481,7 +767,7 @@ export function ReportDetailPage() {
 
   if (loading && !report) {
     return (
-      <div className="mx-auto max-w-[1100px]">
+      <div className="mx-auto max-w-[1400px]">
         <LoadingState label="Satış analizi yükleniyor…" />
       </div>
     );
@@ -489,7 +775,7 @@ export function ReportDetailPage() {
 
   if (error && !report) {
     return (
-      <div className="mx-auto max-w-[1100px]">
+      <div className="mx-auto max-w-[1400px]">
         <ErrorState message={error} />
       </div>
     );
@@ -522,8 +808,32 @@ export function ReportDetailPage() {
           },
         ];
 
+  const tableProps = {
+    busyId,
+    editingId,
+    draft,
+    rowError,
+    reviewedIds,
+    playerSaleId: player?.saleId ?? null,
+    onOpen: (s: ReportSale) => void openEvidencePlayer(s),
+    onReview: (id: string, st: string) => void review(id, st),
+    onStartEdit: (s: ReportSale) => {
+      setEditingId(s.id);
+      setDraft(draftFromSale(s));
+      setRowError(null);
+    },
+    onCancelEdit: () => {
+      setEditingId(null);
+      setDraft(null);
+      setRowError(null);
+    },
+    onDraftChange: (patch: Partial<EditDraft>) =>
+      setDraft((d) => (d ? { ...d, ...patch } : d)),
+    onSaveEdit: (id: string) => void saveEdit(id),
+  };
+
   return (
-    <div className="mx-auto max-w-[1100px] animate-rise">
+    <div className="mx-auto max-w-[1400px] animate-rise">
       <p className="mb-3">
         <Link
           to="/reports"
@@ -552,6 +862,14 @@ export function ReportDetailPage() {
       />
 
       {error && <ErrorState message={error} className="mb-4" />}
+      {toast ? (
+        <div
+          className="mb-3 rounded-xl border border-mint/30 bg-mint/10 px-3 py-2 text-sm text-mint"
+          role="status"
+        >
+          {toast}
+        </div>
+      ) : null}
 
       {analysisFailed ? (
         <div
@@ -585,192 +903,219 @@ export function ReportDetailPage() {
         ))}
       </div>
 
-      {player && (
-        <EvidencePlayer
-          recordingId={report.recordingId}
-          offsetMs={player.offsetMs}
-          open
-          onClose={() => setPlayer(null)}
-          title="Kanıt videosu"
-          mediaPurged={
-            recordingMeta?.mediaPurged === true ||
-            (recordingMeta?.media_purged_at != null &&
-              String(recordingMeta.media_purged_at).trim() !== "")
-          }
-          mediaPurgedNoteTr={
-            recordingMeta?.mediaPurgedNoteTr != null
-              ? String(recordingMeta.mediaPurgedNoteTr)
-              : null
-          }
-        />
-      )}
-
-      <Card className="mb-4">
-        <CardHeader>
-          <CardTitle>Satış listesi</CardTitle>
-          <p className="text-sm text-fog">
-            Otomatik onaylanan satışlar — satıra tıklayınca video kanıtına
-            gidilir. İnceleme bekleyenler aşağıdaki ayrı bölümde.
-          </p>
-        </CardHeader>
-        <CardContent>
-          {!soldSales.length ? (
-            <EmptyState
-              title={
-                reviewSales.length
-                  ? "Onaylı satış yok"
-                  : "Satış adayı yok"
-              }
-              hint={
-                reviewSales.length
-                  ? `${reviewSales.length} aday inceleme bekliyor — onaylanınca burada ve KPI’da görünür.`
-                  : emptySalesHint(report, analysisFailed)
-              }
-            />
-          ) : (
-            <SaleTable
-              rows={soldSales}
-              busyId={busyId}
-              reviewedIds={reviewedIds}
-              playerSaleId={player?.saleId ?? null}
-              mode="sold"
-              onOpen={(s) => void openEvidencePlayer(s)}
-              onReview={(id, st) => void review(id, st)}
-            />
-          )}
-        </CardContent>
-      </Card>
-
-      <Card className="mb-4" data-section="needs-review">
-        <CardHeader>
-          <CardTitle>
-            İnceleme bekleyenler
-            {reviewSales.length ? (
-              <span className="ml-2 text-base font-semibold text-signal">
-                ({reviewSales.length})
-              </span>
-            ) : null}
-          </CardTitle>
-          <p className="text-sm text-fog">
-            Belirsiz adaylar (isimsiz sözlü onay, eşleşmeyen alıcı, ask’siz
-            aldım…). Satış KPI’sına dahil değil — her satırı{" "}
-            <strong className="font-semibold text-paper">Satış olarak onayla</strong>{" "}
-            veya <strong className="font-semibold text-paper">Satış değil</strong>{" "}
-            ile işaretleyin.
-          </p>
-        </CardHeader>
-        <CardContent>
-          {!reviewSales.length ? (
-            <EmptyState
-              title="İnceleme bekleyen yok"
-              hint="Belirsiz aday çıkarsa burada listelenir."
-            />
-          ) : (
-            <SaleTable
-              rows={reviewSales}
-              busyId={busyId}
-              reviewedIds={reviewedIds}
-              playerSaleId={player?.saleId ?? null}
-              mode="review"
-              onOpen={(s) => void openEvidencePlayer(s)}
-              onReview={(id, st) => void review(id, st)}
-            />
-          )}
-        </CardContent>
-      </Card>
-
-      {rejectedSales.length > 0 ? (
-        <Card className="mb-4">
-          <CardHeader>
-            <CardTitle>Satış değil ({rejectedSales.length})</CardTitle>
-            <p className="text-sm text-fog">
-              Operatörün reddettiği adaylar — KPI’ya dahil değil.
-            </p>
-          </CardHeader>
-          <CardContent>
-            <SaleTable
-              rows={rejectedSales}
-              busyId={busyId}
-              reviewedIds={reviewedIds}
-              playerSaleId={player?.saleId ?? null}
-              mode="rejected"
-              onOpen={(s) => void openEvidencePlayer(s)}
-              onReview={(id, st) => void review(id, st)}
-            />
-          </CardContent>
-        </Card>
-      ) : null}
-
-      <Card>
-        <CardHeader>
-          <button
-            type="button"
-            className="flex w-full items-center justify-between gap-2 text-left"
-            onClick={() => setTechOpen((v) => !v)}
-            aria-expanded={techOpen}
+      <div
+        className={
+          player
+            ? "lg:grid lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:items-start lg:gap-4"
+            : undefined
+        }
+        data-review-layout={player ? "split" : "list"}
+      >
+        {player ? (
+          <aside
+            className="mb-4 lg:order-2 lg:mb-0 lg:sticky lg:top-3 lg:z-20"
+            data-evidence-dock="1"
           >
-            <CardTitle>Teknik özet</CardTitle>
-            {techOpen ? (
-              <ChevronUp className="h-5 w-5 text-fog" />
-            ) : (
-              <ChevronDown className="h-5 w-5 text-fog" />
-            )}
-          </button>
-          <p className="text-sm text-fog">
-            İş kuyruğu ve sinyal sayıları — satış listesinin altında, isteğe bağlı.
-          </p>
-        </CardHeader>
-        {techOpen ? (
-          <CardContent>
-            <div className="mb-4 flex flex-wrap gap-3 text-sm text-fog">
-              <span>Durum: {statusTr(report.status)}</span>
-              <span>Transkript: {report.transcriptSegmentCount}</span>
-              <span>Yorum: {report.commentCount}</span>
-              <span>İnceleme: {report.needsReviewCount}</span>
-              <span>Ort. güven: {confidenceLabel(report.avgEventConfidence)}</span>
-            </div>
-            {!!Object.keys(report.eventCounts ?? {}).length && (
-              <p className="mb-4 text-xs text-fog">
-                Sinyaller:{" "}
-                {Object.entries(report.eventCounts ?? {})
-                  .map(([k, v]) => `${k}:${v}`)
-                  .join(" · ")}
-              </p>
-            )}
-            {!(report.jobs ?? []).length ? (
-              <EmptyState title="İş yok" />
-            ) : (
-              <div className="space-y-3">
-                {(report.jobs ?? []).map((j, i) => (
-                  <div key={`${j?.jobType ?? "job"}-${i}`}>
-                    <div className="mb-1 flex items-center justify-between gap-2">
-                      <strong className="text-sm">{j?.jobType ?? "—"}</strong>
-                      <Badge variant="muted">{statusTr(j?.status)}</Badge>
-                    </div>
-                    <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
-                      <i
-                        className="block h-full rounded-full bg-gradient-to-r from-mint to-signal transition-all"
-                        style={{ width: `${j?.progressPercent || 0}%` }}
-                      />
-                    </div>
-                    {j?.stage ? (
-                      <p className="mt-1 text-xs text-fog">{j.stage}</p>
-                    ) : null}
-                  </div>
-                ))}
+            {/* Mobile: sticky top dock so lists can scroll underneath */}
+            <div className="sticky top-0 z-30 lg:static">
+              <div className="mb-2 flex items-center justify-between gap-2 lg:hidden">
+                <span className="text-xs font-semibold uppercase tracking-wide text-fog">
+                  Kanıt videosu
+                </span>
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-fog hover:text-mint"
+                  onClick={() => setPlayer(null)}
+                >
+                  <X className="h-3.5 w-3.5" />
+                  Kapat
+                </button>
               </div>
-            )}
-            <p className="mt-4 text-xs text-fog">
-              <Link
-                to={`/recordings/${report.recordingId}`}
-                className="text-mint"
-              >
-                Kayıt detayı
-              </Link>
-            </p>
-          </CardContent>
+              <EvidencePlayer
+                recordingId={report.recordingId}
+                offsetMs={player.offsetMs}
+                open
+                onClose={() => setPlayer(null)}
+                title="Kanıt videosu"
+                mediaPurged={
+                  recordingMeta?.mediaPurged === true ||
+                  (recordingMeta?.media_purged_at != null &&
+                    String(recordingMeta.media_purged_at).trim() !== "")
+                }
+                mediaPurgedNoteTr={
+                  recordingMeta?.mediaPurgedNoteTr != null
+                    ? String(recordingMeta.mediaPurgedNoteTr)
+                    : null
+                }
+              />
+            </div>
+          </aside>
         ) : null}
-      </Card>
+
+        <div className={player ? "lg:order-1 min-w-0" : undefined}>
+          <Card className="mb-4">
+            <CardHeader>
+              <CardTitle>Satış listesi</CardTitle>
+              <p className="text-sm text-fog">
+                Otomatik onaylanan satışlar — satıra tıklayınca video sağda /
+                üstte sabit kalır. İnceleme bekleyenler aşağıdaki ayrı bölümde.
+              </p>
+            </CardHeader>
+            <CardContent>
+              {!soldSales.length ? (
+                <EmptyState
+                  title={
+                    reviewSales.length
+                      ? "Onaylı satış yok"
+                      : "Satış adayı yok"
+                  }
+                  hint={
+                    reviewSales.length
+                      ? `${reviewSales.length} aday inceleme bekliyor — onaylanınca burada ve KPI’da görünür.`
+                      : emptySalesHint(report, analysisFailed)
+                  }
+                />
+              ) : (
+                <SaleTable
+                  rows={soldSales}
+                  mode="sold"
+                  {...tableProps}
+                />
+              )}
+            </CardContent>
+          </Card>
+
+          <Card className="mb-4" data-section="needs-review">
+            <CardHeader>
+              <CardTitle>
+                İnceleme bekleyenler
+                {reviewSales.length ? (
+                  <span className="ml-2 text-base font-semibold text-signal">
+                    ({reviewSales.length})
+                  </span>
+                ) : null}
+              </CardTitle>
+              <p className="text-sm text-fog">
+                Belirsiz adaylar — alıcı / tutar / yöntemi satırda düzeltip
+                kaydedin, sonra{" "}
+                <strong className="font-semibold text-paper">
+                  Satış olarak onayla
+                </strong>{" "}
+                veya{" "}
+                <strong className="font-semibold text-paper">Satış değil</strong>.
+                KPI’ya ancak onay sonrası dahil.
+              </p>
+            </CardHeader>
+            <CardContent>
+              {!reviewSales.length ? (
+                <EmptyState
+                  title="İnceleme bekleyen yok"
+                  hint="Belirsiz aday çıkarsa burada listelenir."
+                />
+              ) : (
+                <SaleTable
+                  rows={reviewSales}
+                  mode="review"
+                  {...tableProps}
+                />
+              )}
+            </CardContent>
+          </Card>
+
+          {rejectedSales.length > 0 ? (
+            <Card className="mb-4">
+              <CardHeader>
+                <CardTitle>Satış değil ({rejectedSales.length})</CardTitle>
+                <p className="text-sm text-fog">
+                  Operatörün reddettiği adaylar — KPI’ya dahil değil.
+                </p>
+              </CardHeader>
+              <CardContent>
+                <SaleTable
+                  rows={rejectedSales}
+                  mode="rejected"
+                  {...tableProps}
+                />
+              </CardContent>
+            </Card>
+          ) : null}
+
+          <Card>
+            <CardHeader>
+              <button
+                type="button"
+                className="flex w-full items-center justify-between gap-2 text-left"
+                onClick={() => setTechOpen((v) => !v)}
+                aria-expanded={techOpen}
+              >
+                <CardTitle>Teknik özet</CardTitle>
+                {techOpen ? (
+                  <ChevronUp className="h-5 w-5 text-fog" />
+                ) : (
+                  <ChevronDown className="h-5 w-5 text-fog" />
+                )}
+              </button>
+              <p className="text-sm text-fog">
+                İş kuyruğu ve sinyal sayıları — satış listesinin altında, isteğe bağlı.
+              </p>
+            </CardHeader>
+            {techOpen ? (
+              <CardContent>
+                <div className="mb-4 flex flex-wrap gap-3 text-sm text-fog">
+                  <span>Durum: {statusTr(report.status)}</span>
+                  <span>Transkript: {report.transcriptSegmentCount}</span>
+                  <span>Yorum: {report.commentCount}</span>
+                  <span>İnceleme: {report.needsReviewCount}</span>
+                  <span>
+                    Ort. güven: {confidenceLabel(report.avgEventConfidence)}
+                  </span>
+                </div>
+                {!!Object.keys(report.eventCounts ?? {}).length && (
+                  <p className="mb-4 text-xs text-fog">
+                    Sinyaller:{" "}
+                    {Object.entries(report.eventCounts ?? {})
+                      .map(([k, v]) => `${k}:${v}`)
+                      .join(" · ")}
+                  </p>
+                )}
+                {!(report.jobs ?? []).length ? (
+                  <EmptyState title="İş yok" />
+                ) : (
+                  <div className="space-y-3">
+                    {(report.jobs ?? []).map((j, i) => (
+                      <div key={`${j?.jobType ?? "job"}-${i}`}>
+                        <div className="mb-1 flex items-center justify-between gap-2">
+                          <strong className="text-sm">
+                            {j?.jobType ?? "—"}
+                          </strong>
+                          <Badge variant="muted">{statusTr(j?.status)}</Badge>
+                        </div>
+                        <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
+                          <i
+                            className="block h-full rounded-full bg-gradient-to-r from-mint to-signal transition-all"
+                            style={{ width: `${j?.progressPercent || 0}%` }}
+                          />
+                        </div>
+                        {j?.stage ? (
+                          <p className="mt-1 text-xs text-fog">{j.stage}</p>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <p className="mt-4 text-xs text-fog">
+                  <Link
+                    to={`/recordings/${report.recordingId}`}
+                    className="text-mint"
+                  >
+                    Kayıt detayı
+                  </Link>
+                </p>
+              </CardContent>
+            ) : null}
+          </Card>
+        </div>
+      </div>
     </div>
   );
 }
