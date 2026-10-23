@@ -1770,6 +1770,103 @@ describe("Nunus numbered tray + descriptor claims", () => {
     expect(review[0]!.reason).toMatch(/weak_verbal|needs_review/);
   });
 
+  test("Nunus: «X hanımda PRICE» matches recent commenter without prior aldım", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "Bu da 800 lira",
+        amountTry: 800,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "c",
+        offsetMs: 5_000,
+        eventType: "bid",
+        matched: "beğeniyorum",
+        buyerHint: "denizpakova",
+        reason: "bid_phrase",
+        source: "comment",
+      }),
+      ev({
+        id: "vw",
+        offsetMs: 12_000,
+        eventType: "sold",
+        matched: "Bu Deniz hanımda 800.",
+        amountTry: 800,
+        spokenBuyerName: "Deniz",
+        reason: "verbal_win_named",
+        confidence: 0.84,
+      }),
+    ]);
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBe(1);
+    expect(confirmed[0]!.buyerUsername).toBe("denizpakova");
+    expect(confirmed[0]!.amountTry).toBe(800);
+    expect(confirmed[0]!.saleMethod).toBe("verbal_win_confirm");
+  });
+
+  test("Nunus: bare ask-price comment is soft claim; «Bu da sizde» confirms", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "800 kolye",
+        amountTry: 800,
+        reason: "seller_price_line",
+        productHint: "kolye",
+        descriptorTokens: ["kolye"],
+      }),
+      ev({
+        id: "c",
+        offsetMs: 8_000,
+        eventType: "bid",
+        matched: "800",
+        amountTry: 800,
+        buyerHint: "joelleancel",
+        reason: "comment_number_bid",
+        source: "comment",
+      }),
+      ev({
+        id: "vw",
+        offsetMs: 15_000,
+        eventType: "sold",
+        matched: "Bu da sizde.",
+        reason: "verbal_win_bare",
+        confidence: 0.62,
+      }),
+    ]);
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBe(1);
+    expect(confirmed[0]!.buyerUsername).toBe("joelleancel");
+    expect(confirmed[0]!.amountTry).toBe(800);
+  });
+
+  test("parse: Nunus hanımda / soft sizde / hayırlı uğurlu", () => {
+    const h = parseAuctionText("Bu Deniz hanımda 800.", {
+      source: "transcript",
+    });
+    expect(h?.eventType).toBe("sold");
+    expect(h?.spokenBuyerName?.toLowerCase()).toBe("deniz");
+    expect(h?.amountTry).toBe(800);
+
+    expect(
+      parseAuctionText("Bu banu hanımda.", { source: "transcript" })
+        ?.spokenBuyerName?.toLowerCase(),
+    ).toBe("banu");
+
+    expect(
+      parseAuctionText("Bu da sizde.", { source: "transcript" })?.reason,
+    ).toBe("verbal_win_bare");
+
+    expect(
+      parseAuctionText("Hayırlı uğurlu olsun.", { source: "transcript" })
+        ?.eventType,
+    ).toBe("sold");
+  });
+
   test("same-price «bu da 800» opens distinct offered lots", () => {
     const lots = summarizeOfferWindows([
       ev({

@@ -102,7 +102,7 @@ const VERBAL_WIN_NAME_SIZDE_RE = new RegExp(
 );
 const VERBAL_WIN_NAME_ONLY_SIZDE_RE =
   /^([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\s+sizde[.!?…]*$/i;
-const VERBAL_WIN_HAYIRLI_RE = /hay[ıi]rl[ıi]\s+olsun/i;
+const VERBAL_WIN_HAYIRLI_RE = /hay[ıi]rl[ıi](?:\s+u[gğ]urlu)?\s+olsun/i;
 const VERBAL_WIN_BRAVO_RE =
   /\bbravo\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\b/i;
 const VERBAL_WIN_GULE_RE =
@@ -135,7 +135,24 @@ const VERBAL_WIN_SIZIN_OLACAK_RE =
 
 /** Soft confirm without a spoken name — only closes a lot that already has an aldım/bid. */
 const VERBAL_WIN_BARE_RE =
-  /^(?:tamam[,.]?\s+)?(?:hay[ıi]rl[ıi]\s+olsun(?:\s+can[ıi]m)?|g[uü]le\s+g[uü]le\s+(?:iyi\s+g[uü]nlerde\s+)?(?:kullan|tak[ıi]n?|giy)(?:\s+\S+){0,6}|ikisi\s+de\s+sizin\s+olacak|sizin\s+olacak)[.!?…]*$/i;
+  /^(?:tamam[,.]?\s+)?(?:hay[ıi]rl[ıi](?:\s+u[gğ]urlu)?\s+olsun(?:\s+can[ıi]m)?|g[uü]le\s+g[uü]le\s+(?:iyi\s+g[uü]nlerde\s+)?(?:kullan|tak[ıi]n?|giy)(?:\s+\S+){0,6}|ikisi\s+de\s+sizin\s+olacak|sizin\s+olacak|(?:bu\s+da\s+|o\s+da\s+)?sizde)[.!?…]*$/i;
+
+/**
+ * Nunus packing: «Bu Deniz hanımda», «Banu hanımda 800», «Bano hanımda 1500».
+ * Locative hanımda/beyde — not «sizde».
+ */
+const VERBAL_WIN_HANIMDA_RE = new RegExp(
+  `${TR_NAME_LEAD}${TR_NAME}\\s+(?:${HONORIFIC})da${TR_END}`,
+  "i",
+);
+
+/** «Tamam sizde Cihayranımcım» / «Bu da sizde.» / bare «Sizde.» */
+const VERBAL_WIN_SOFT_SIZDE_RE =
+  /^(?:tamam[,.]?\s+)?(?:bu\s+da\s+|o\s+da\s+)?sizde(?:\s+[A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24}(?:\s+(?:han[ıi]m(?:c[ıi][gğ]?[ıi]m)?|bey))?)?[.!…]*$/i;
+
+/** Product sold chatter «Kolye gitti» — only with an open claimed lot. */
+const VERBAL_WIN_PRODUCT_GITTI_RE =
+  /\b(?:kolye|kolyo|k[uü]pe|bro[sş]|bilezik|bileklik|y[uü]z[uü]k|set|u[cç])\s+gitti\b/i;
 
 /** Foreign currency chatter must not open a TRY lot. */
 const FOREIGN_CURRENCY_RE =
@@ -474,12 +491,22 @@ const SPOKEN_NAME_STOP = new Set(
     "satildi",
     "satın",
     "satin",
+    "senin",
+    "benim",
+    "bunlar",
+    "bagno",
+    "bagin",
   ].map(foldTrToken),
 );
 
 function acceptSpokenName(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
-  const name = raw.trim();
+  // ASR often glues honorific: «Cihayranımcım» → Cihayra, «Banuhanım» → Banu
+  let name = raw.trim();
+  name = name.replace(/c[ıi][gğ]?[ıi]m$/i, "").trim();
+  name = name.replace(/han[ıi]m$/i, "").trim();
+  name = name.replace(/(?:bey|abla|abi)$/i, "").trim();
+  if (name.length < 3) name = raw.trim();
   if (name.length < 3) return undefined;
   if (SPOKEN_NAME_STOP.has(foldTrToken(name))) return undefined;
   if (/^\d/.test(name)) return undefined;
@@ -505,6 +532,9 @@ export function isVerbalWinPhrase(text: string): boolean {
   if (VERBAL_WIN_SIZDE_KALDI_RE.test(t)) return true;
   if (VERBAL_WIN_NAME_SIZDE_RE.test(t)) return true;
   if (VERBAL_WIN_NAME_ONLY_SIZDE_RE.test(t)) return true;
+  if (VERBAL_WIN_HANIMDA_RE.test(t) && !/\bsenin\s+han/i.test(t)) return true;
+  if (VERBAL_WIN_SOFT_SIZDE_RE.test(t)) return true;
+  if (VERBAL_WIN_PRODUCT_GITTI_RE.test(t) && t.length <= 60) return true;
   if (VERBAL_WIN_BRAVO_RE.test(t)) return true;
   if (VERBAL_WIN_ALDIM_GELDI_RE.test(t)) return true;
   if (VERBAL_WIN_SIZ_BUNU_ALDI_RE.test(t)) return true;
@@ -528,7 +558,11 @@ export function isVerbalWinPhrase(text: string): boolean {
 
 /** Soft verbal confirm with no recoverable spoken name. */
 export function isBareVerbalWin(text: string): boolean {
-  return VERBAL_WIN_BARE_RE.test(text.trim());
+  const t = text.trim();
+  if (VERBAL_WIN_BARE_RE.test(t)) return true;
+  if (VERBAL_WIN_SOFT_SIZDE_RE.test(t) && !parseSpokenBuyerName(t)) return true;
+  if (VERBAL_WIN_PRODUCT_GITTI_RE.test(t) && t.length <= 60) return true;
+  return false;
 }
 
 /**
@@ -540,19 +574,22 @@ export function parseSpokenBuyerName(text: string): string | undefined {
   const patterns = [
     VERBAL_WIN_ALDIM_GELDI_RE,
     VERBAL_WIN_SIZ_BUNU_ALDI_RE,
+    VERBAL_WIN_HANIMDA_RE,
     new RegExp(
       `\\b([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\\s+(?:${HONORIFIC})\\s+(?:sizindir|sizin\\s*dir|sizde)\\b`,
       "i",
     ),
     new RegExp(
-      `\\b([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\\s+(?:${HONORIFIC})\\s+hay[ıi]rl[ıi]\\s+olsun`,
+      `\\b([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\\s+(?:${HONORIFIC})\\s+hay[ıi]rl[ıi](?:\\s+u[gğ]urlu)?\\s+olsun`,
       "i",
     ),
-    /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})['']?[ea]\s+hay[ıi]rl[ıi]\s+olsun/i,
-    /hay[ıi]rl[ıi]\s+olsun\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})/i,
+    /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})['']?[ea]\s+hay[ıi]rl[ıi](?:\s+u[gğ]urlu)?\s+olsun/i,
+    /hay[ıi]rl[ıi](?:\s+u[gğ]urlu)?\s+olsun\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})/i,
     /\bbravo\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\b/i,
     /([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\s+de\s+sizin(?:dir|\s+hay)/i,
     /^([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\s+sizde[.!?…]*$/i,
+    // «Tamam sizde Cihayra…»
+    /^tamam[,.]?\s+sizde\s+([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})/i,
     // «güle güle … kullanınız güneş hanımcığım»
     new RegExp(
       `g[uü]le\\s+g[uü]le[\\s\\S]{0,60}?\\b([A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû]{2,24})\\s+(?:${HONORIFIC})\\b`,
@@ -1605,6 +1642,13 @@ export function reconcileMezatWindows(
   /** Recent sane asks for filling needs_review amounts when the lot window is gone. */
   const recentAsks: Array<{ offsetMs: number; amountTry: number; hint?: string }> =
     [];
+  /** Rolling commenter pool for «X hanımda» name→@handle matching (Nunus). */
+  const recentCommenters: Array<{
+    buyerHint: string;
+    offsetMs: number;
+    eventId?: string;
+    amountTry?: number;
+  }> = [];
   /** Aldım comments that arrived with no open lot (often just before the ask). */
   const orphanClaims: Array<{
     buyer: string;
@@ -2212,6 +2256,50 @@ export function reconcileMezatWindows(
       const descTokens =
         ev.descriptorTokens ?? extractDescriptorTokens(ev.matched);
 
+      // Track commenters for later verbal «X hanımda» matching.
+      if (ev.source === "comment" && ev.buyerHint) {
+        recentCommenters.push({
+          buyerHint: ev.buyerHint,
+          offsetMs: ev.offsetMs,
+          eventId: ev.id,
+          amountTry: ev.amountTry,
+        });
+        if (recentCommenters.length > 80) recentCommenters.shift();
+      }
+
+      // Nunus: bare price comment matching the open ask («800» after «800 lira»)
+      // is a soft take-it claim (buyers often omit «aldım»).
+      if (
+        ev.source === "comment" &&
+        ev.buyerHint &&
+        win &&
+        !win.closed &&
+        !win.aldimClaim &&
+        reason === "comment_number_bid" &&
+        ev.amountTry != null &&
+        lotSaleAsk(win) != null &&
+        (ev.amountTry === lotSaleAsk(win) ||
+          amountsNear(ev.amountTry, lotSaleAsk(win)!)) &&
+        ev.offsetMs - win.openMs <= ALDIM_CLAIM_WINDOW_MS
+      ) {
+        claimLot(win, {
+          buyer: ev.buyerHint,
+          offsetMs: ev.offsetMs,
+          eventId: ev.id,
+          amountTry: lotSaleAsk(win),
+          matched: ev.matched,
+        });
+        win.bids.push({
+          offsetMs: ev.offsetMs,
+          amountTry: ev.amountTry,
+          buyerHint: ev.buyerHint,
+          source: ev.source,
+          reason: "price_match_claim",
+          eventId: ev.id,
+        });
+        continue;
+      }
+
       // Nunus tray: bare «1» / «3» claims the matching open number (first buyer wins).
       if (
         ev.source === "comment" &&
@@ -2638,7 +2726,7 @@ export function reconcileMezatWindows(
           }
         }
 
-        // Verbal win: match spoken name → recent aldım / bid username
+        // Verbal win: match spoken name → lot bids, then recent commenters (Nunus «hanımda»).
         if (!buyer && isVerbal && ev.spokenBuyerName) {
           const pool: Array<{ buyerHint?: string; displayName?: string }> = [];
           if (openWin.aldimClaim) {
@@ -2650,6 +2738,16 @@ export function reconcileMezatWindows(
               displayName: b.displayName,
             });
           }
+          for (const c of recentCommenters) {
+            if (ev.offsetMs - c.offsetMs > SALE_BID_LOOKBACK_MS * 2) continue;
+            if (c.offsetMs > ev.offsetMs + 5_000) continue;
+            pool.push({ buyerHint: c.buyerHint });
+          }
+          for (const o of orphanClaims) {
+            if (Math.abs(ev.offsetMs - o.offsetMs) > SALE_BID_LOOKBACK_MS * 2)
+              continue;
+            pool.push({ buyerHint: o.buyer });
+          }
           const hits = matchSpokenNameHits(ev.spokenBuyerName, pool);
           if (hits.length === 1) {
             buyer = hits[0]!;
@@ -2659,6 +2757,16 @@ export function reconcileMezatWindows(
             }
             if (openWin.aldimClaim?.buyer === buyer) {
               evidence.push(openWin.aldimClaim.eventId);
+            }
+            // Name confirm without prior aldım still freezes the ask (Nunus packing).
+            if (!openWin.aldimClaim) {
+              claimLot(openWin, {
+                buyer,
+                offsetMs: ev.offsetMs,
+                eventId: ev.id,
+                amountTry: amount ?? lotAsk,
+                matched: ev.matched,
+              });
             }
           } else if (hits.length > 1) {
             // Near-miss: multiple handles match the spoken name → operator picks.
@@ -2807,8 +2915,8 @@ export function reconcileMezatWindows(
         continue;
       }
 
-      // Named verbal with no open lot — still review if we can attach a price.
-      // Skip repeats that already confirmed the same spoken/buyer recently.
+      // Named verbal with no open lot — match recent commenters; confirm when
+      // price is known («Deniz hanımda 800»), else needs_review.
       if (isVerbal && ev.spokenBuyerName && !openWin) {
         const spokenFold = foldTrToken(ev.spokenBuyerName);
         const alreadyConfirmed = sales.some(
@@ -2822,17 +2930,51 @@ export function reconcileMezatWindows(
         );
         if (alreadyConfirmed) continue;
         const near = nearestRecentAsk(ev.offsetMs);
-        if (near != null || amount != null) {
-          pushNeedsReview({
+        const priced = amount ?? near?.amountTry;
+        const pool = recentCommenters
+          .filter(
+            (c) =>
+              ev.offsetMs - c.offsetMs <= SALE_BID_LOOKBACK_MS * 2 &&
+              c.offsetMs <= ev.offsetMs + 5_000,
+          )
+          .map((c) => ({ buyerHint: c.buyerHint }));
+        for (const o of orphanClaims) {
+          if (Math.abs(ev.offsetMs - o.offsetMs) <= SALE_BID_LOOKBACK_MS * 2) {
+            pool.push({ buyerHint: o.buyer });
+          }
+        }
+        const hits = matchSpokenNameHits(ev.spokenBuyerName, pool);
+        if (hits.length === 1 && priced != null && saneAsk(priced) != null) {
+          sales.push({
             offsetMs: ev.offsetMs,
-            amountTry: amount ?? near?.amountTry,
+            amountTry: priced,
+            buyerUsername: hits[0],
             spokenBuyerName: ev.spokenBuyerName,
-            confidence: 0.48,
-            reason: "verbal_win_no_lot_needs_review",
+            confidence: 0.86,
+            reason: "verbal_hanimda_no_lot+name_match",
             saleMethod: "verbal_win_confirm",
             evidenceEventIds: [ev.id],
             productHint: near?.hint ?? ev.matched.slice(0, 120),
-            askAmountTry: amount ?? near?.amountTry,
+            askAmountTry: priced,
+            evidenceQuote: ev.matched.slice(0, 200),
+          });
+          continue;
+        }
+        if (priced != null) {
+          pushNeedsReview({
+            offsetMs: ev.offsetMs,
+            amountTry: priced,
+            buyerUsername: hits[0],
+            spokenBuyerName: ev.spokenBuyerName,
+            confidence: 0.5,
+            reason:
+              hits.length > 1
+                ? "verbal_win_no_lot_ambiguous_needs_review"
+                : "verbal_win_no_lot_needs_review",
+            saleMethod: "verbal_win_confirm",
+            evidenceEventIds: [ev.id],
+            productHint: near?.hint ?? ev.matched.slice(0, 120),
+            askAmountTry: priced,
             evidenceQuote: ev.matched.slice(0, 200),
           });
         }
