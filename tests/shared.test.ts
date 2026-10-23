@@ -1119,11 +1119,20 @@ describe("mezat window reconcile", () => {
         reason: "price_mention",
       }),
     ]);
-    expect(sales.length).toBe(2);
-    expect(sales.map((s) => [s.buyerUsername, s.amountTry])).toEqual([
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.map((s) => [s.buyerUsername, s.amountTry])).toEqual([
       ["z.g.sahsuvaroglu", 3000],
       ["draylingunbay", 1000],
     ]);
+    // Second claimer also surfaces as needs_review on the first lot (priced).
+    expect(
+      sales.some(
+        (s) =>
+          s.needsReview &&
+          s.buyerUsername === "draylingunbay" &&
+          s.amountTry === 3000,
+      ),
+    ).toBe(true);
   });
 
   test("pey number comment + bare hayırlı olsun confirms sale", () => {
@@ -1683,6 +1692,78 @@ describe("Nunus numbered tray + descriptor claims", () => {
         true,
       );
     }
+  });
+
+  test("second aldım claim surfaces needs_review with ask price", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "Bu da 900 lira",
+        amountTry: 900,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "c1",
+        offsetMs: 5_000,
+        eventType: "bid",
+        matched: "aldım",
+        buyerHint: "first.buyer",
+        reason: "aldim_claim",
+        source: "comment",
+      }),
+      ev({
+        id: "c2",
+        offsetMs: 8_000,
+        eventType: "bid",
+        matched: "aldım",
+        buyerHint: "second.buyer",
+        reason: "aldim_claim",
+        source: "comment",
+      }),
+      ev({
+        id: "next",
+        offsetMs: 60_000,
+        eventType: "price_mention",
+        matched: "Bu da 1200 lira",
+        amountTry: 1200,
+        reason: "seller_price_line",
+      }),
+    ]);
+    const review = sales.filter((s) => s.needsReview);
+    expect(review.some((s) => s.buyerUsername === "second.buyer")).toBe(true);
+    expect(
+      review.find((s) => s.buyerUsername === "second.buyer")!.amountTry,
+    ).toBe(900);
+    expect(sales.some((s) => !s.needsReview && s.buyerUsername === "first.buyer")).toBe(
+      true,
+    );
+  });
+
+  test("weak bare verbal on open ask → needs_review with price", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "Bu da 1500 lira",
+        amountTry: 1500,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "vw",
+        offsetMs: 10_000,
+        eventType: "sold",
+        matched: "Hayırlı olsun",
+        reason: "verbal_win_bare",
+        confidence: 0.62,
+      }),
+    ]);
+    const review = sales.filter((s) => s.needsReview);
+    expect(review.length).toBeGreaterThanOrEqual(1);
+    expect(review[0]!.amountTry ?? review[0]!.askAmountTry).toBe(1500);
+    expect(review[0]!.reason).toMatch(/weak_verbal|needs_review/);
   });
 
   test("same-price «bu da 800» opens distinct offered lots", () => {

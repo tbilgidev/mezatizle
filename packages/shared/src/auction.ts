@@ -616,12 +616,13 @@ function nameTokenMatchesSpoken(spoken: string, token: string): boolean {
  * Match a spoken first name to a single recent commenter username / display name.
  * Ambiguous or no match → undefined (prefer unknown over inventing).
  */
-export function matchSpokenNameToBuyer(
+/** All username hits for a spoken name (unique). Empty / multi = ambiguous. */
+export function matchSpokenNameHits(
   spoken: string,
   candidates: Array<{ buyerHint?: string; displayName?: string }>,
-): string | undefined {
+): string[] {
   const name = foldTrToken(spoken.trim());
-  if (name.length < 3) return undefined;
+  if (name.length < 3) return [];
   const hits: string[] = [];
   for (const c of candidates) {
     const user = (c.buyerHint ?? "").trim().replace(/^@/, "").toLowerCase();
@@ -659,7 +660,14 @@ export function matchSpokenNameToBuyer(
     }
     if (ok) hits.push(user);
   }
-  const uniq = [...new Set(hits)];
+  return [...new Set(hits)];
+}
+
+export function matchSpokenNameToBuyer(
+  spoken: string,
+  candidates: Array<{ buyerHint?: string; displayName?: string }>,
+): string | undefined {
+  const uniq = matchSpokenNameHits(spoken, candidates);
   return uniq.length === 1 ? uniq[0] : undefined;
 }
 
@@ -1695,6 +1703,34 @@ export function reconcileMezatWindows(
 
   const parkUnclaimedLot = (lot: LotWindow, atMs: number) => {
     if (lot.closed || lot.aldimClaim) return;
+    // Bids without a confident aldım/verbal confirm → operator review (priced).
+    const ask = lotSaleAsk(lot);
+    const bidBuyers = lot.bids
+      .filter((b) => b.buyerHint && b.source === "comment")
+      .map((b) => ({
+        buyer: b.buyerHint!,
+        offsetMs: b.offsetMs,
+        eventId: b.eventId,
+        amountTry: b.amountTry,
+      }));
+    if (ask != null && bidBuyers.length > 0 && !lot.namedMissReview) {
+      const last = bidBuyers[bidBuyers.length - 1]!;
+      pushNeedsReview({
+        offsetMs: last.offsetMs,
+        amountTry: saneAsk(last.amountTry) ?? ask,
+        buyerUsername: last.buyer,
+        confidence: 0.52,
+        reason: "bid_without_confirm_needs_review",
+        saleMethod: "bid_win_confirm",
+        evidenceEventIds: [
+          ...lot.openEventIds,
+          ...(last.eventId ? [last.eventId] : []),
+        ],
+        productHint: lot.productHint,
+        askAmountTry: ask,
+        evidenceQuote: `@${last.buyer} teklif / onay belirsiz → ${ask} TRY`,
+      });
+    }
     lot.closed = true;
     pendingUnclaimed.push(lot);
     // End-of-timeline (MAX_SAFE_INTEGER) must keep parked lots so named-miss /
@@ -2161,26 +2197,63 @@ export function reconcileMezatWindows(
         ev.buyerHint &&
         ev.lotNumber != null &&
         (reason === "comment_lot_number_or_bid" ||
-          reason === "comment_number_bid") &&
-        trayLots.has(ev.lotNumber)
+          reason === "comment_number_bid")
       ) {
-        const lot = trayLots.get(ev.lotNumber)!;
-        if (!lot.closed && !lot.aldimClaim) {
-          claimLot(lot, {
-            buyer: ev.buyerHint,
+        if (trayLots.has(ev.lotNumber)) {
+          const lot = trayLots.get(ev.lotNumber)!;
+          if (!lot.closed && !lot.aldimClaim) {
+            claimLot(lot, {
+              buyer: ev.buyerHint,
+              offsetMs: ev.offsetMs,
+              eventId: ev.id,
+              amountTry: lotSaleAsk(lot) ?? ev.amountTry,
+              matched: ev.matched,
+              descriptorTokens: descTokens,
+            });
+            lot.bids.push({
+              offsetMs: ev.offsetMs,
+              amountTry: lotSaleAsk(lot),
+              buyerHint: ev.buyerHint,
+              source: ev.source,
+              reason: "numbered_lot_claim",
+              eventId: ev.id,
+            });
+            continue;
+          }
+          if (lot.aldimClaim && lot.aldimClaim.buyer !== ev.buyerHint) {
+            const ask = lotSaleAsk(lot);
+            pushNeedsReview({
+              offsetMs: ev.offsetMs,
+              amountTry: ask,
+              buyerUsername: ev.buyerHint,
+              confidence: 0.5,
+              reason: "numbered_lot_second_claim_needs_review",
+              saleMethod: "aldim_first_comment",
+              evidenceEventIds: [...lot.openEventIds, ev.id],
+              productHint: lot.productHint ?? `${ev.lotNumber} numara`,
+              askAmountTry: ask,
+              evidenceQuote: ev.matched.slice(0, 200),
+            });
+            continue;
+          }
+        } else if (trayLots.size > 0) {
+          // Tray is open but this digit does not match any slot.
+          const near = nearestRecentAsk(ev.offsetMs);
+          const openAsk =
+            [...trayLots.values()]
+              .map((l) => lotSaleAsk(l))
+              .find((a) => a != null) ?? near?.amountTry;
+          pushNeedsReview({
             offsetMs: ev.offsetMs,
-            eventId: ev.id,
-            amountTry: lotSaleAsk(lot) ?? ev.amountTry,
-            matched: ev.matched,
-            descriptorTokens: descTokens,
-          });
-          lot.bids.push({
-            offsetMs: ev.offsetMs,
-            amountTry: lotSaleAsk(lot),
-            buyerHint: ev.buyerHint,
-            source: ev.source,
-            reason: "numbered_lot_claim",
-            eventId: ev.id,
+            amountTry: openAsk,
+            buyerUsername: ev.buyerHint,
+            confidence: 0.48,
+            reason: "unmatched_lot_number_needs_review",
+            saleMethod: "aldim_first_comment",
+            evidenceEventIds: [ev.id],
+            productHint: `${ev.lotNumber} numara (eşleşmedi)`,
+            askAmountTry: openAsk,
+            evidenceQuote: ev.matched.slice(0, 200),
           });
           continue;
         }
@@ -2369,7 +2442,7 @@ export function reconcileMezatWindows(
           win.aldimClaim &&
           win.aldimClaim.buyer !== ev.buyerHint
         ) {
-          // Second follower — try parked lot, else orphan for a near-future ask.
+          // Second follower — try parked lot, else review + orphan for a near-future ask.
           const parked = findPendingMatch({
             offsetMs: ev.offsetMs,
             amountTry: saneAsk(ev.amountTry),
@@ -2387,6 +2460,20 @@ export function reconcileMezatWindows(
             emitAldimSale(parked);
             parked.closed = true;
           } else {
+            const ask = lotSaleAsk(win);
+            const priced = saneAsk(ev.amountTry) ?? ask;
+            pushNeedsReview({
+              offsetMs: ev.offsetMs,
+              amountTry: priced,
+              buyerUsername: ev.buyerHint,
+              confidence: 0.54,
+              reason: "second_claim_needs_review",
+              saleMethod: "aldim_first_comment",
+              evidenceEventIds: [...win.openEventIds, ev.id],
+              productHint: win.productHint ?? ev.matched.slice(0, 120),
+              askAmountTry: priced,
+              evidenceQuote: ev.matched.slice(0, 200),
+            });
             orphanClaims.push({
               buyer: ev.buyerHint,
               offsetMs: ev.offsetMs,
@@ -2542,9 +2629,9 @@ export function reconcileMezatWindows(
               displayName: b.displayName,
             });
           }
-          const matched = matchSpokenNameToBuyer(ev.spokenBuyerName, pool);
-          if (matched) {
-            buyer = matched;
+          const hits = matchSpokenNameHits(ev.spokenBuyerName, pool);
+          if (hits.length === 1) {
+            buyer = hits[0]!;
             method = "verbal_win_confirm";
             for (const b of openWin.bids) {
               if (b.eventId && b.buyerHint === buyer) evidence.push(b.eventId);
@@ -2552,6 +2639,22 @@ export function reconcileMezatWindows(
             if (openWin.aldimClaim?.buyer === buyer) {
               evidence.push(openWin.aldimClaim.eventId);
             }
+          } else if (hits.length > 1) {
+            // Near-miss: multiple handles match the spoken name → operator picks.
+            pushNeedsReview({
+              offsetMs: ev.offsetMs,
+              amountTry: amount ?? lotAsk,
+              buyerUsername: hits[0],
+              spokenBuyerName: ev.spokenBuyerName,
+              confidence: 0.56,
+              reason: "verbal_win_ambiguous_buyer_needs_review",
+              saleMethod: "verbal_win_confirm",
+              evidenceEventIds: [...new Set(evidence)],
+              productHint: openWin.productHint ?? ev.matched.slice(0, 120),
+              askAmountTry: lotAsk ?? amount,
+              evidenceQuote: `${ev.matched.slice(0, 120)} (aday: ${hits.slice(0, 3).join(", ")})`,
+            });
+            continue;
           } else {
             // Named confirm that doesn't match any commenter → prefer unknown
             // (do not invent / do not steal a different aldım claimer).
@@ -2662,7 +2765,60 @@ export function reconcileMezatWindows(
         continue;
       }
 
-      // Unmatched bare / named verbal with no open lot: ignore
+      // Weak verbal (bare hayırlı / named with no matchable handle) on an open
+      // ask — surface for review with price filled rather than silent drop.
+      if (isVerbal && openWin && (lotAsk != null || amount != null)) {
+        pushNeedsReview({
+          offsetMs: ev.offsetMs,
+          amountTry: amount ?? lotAsk,
+          buyerUsername: buyer,
+          spokenBuyerName: ev.spokenBuyerName,
+          confidence: 0.5,
+          reason: ev.spokenBuyerName
+            ? "weak_verbal_named_needs_review"
+            : "weak_verbal_bare_needs_review",
+          saleMethod: "verbal_win_confirm",
+          evidenceEventIds: [...new Set(evidence)],
+          productHint: openWin.productHint ?? ev.matched.slice(0, 120),
+          askAmountTry: lotAsk ?? amount,
+          evidenceQuote: ev.matched.slice(0, 200),
+        });
+        continue;
+      }
+
+      // Named verbal with no open lot — still review if we can attach a price.
+      // Skip repeats that already confirmed the same spoken/buyer recently.
+      if (isVerbal && ev.spokenBuyerName && !openWin) {
+        const spokenFold = foldTrToken(ev.spokenBuyerName);
+        const alreadyConfirmed = sales.some(
+          (s) =>
+            !s.needsReview &&
+            Math.abs(s.offsetMs - ev.offsetMs) <= SALE_DEDUP_WINDOW_MS &&
+            ((s.spokenBuyerName &&
+              foldTrToken(s.spokenBuyerName) === spokenFold) ||
+              (s.buyerUsername != null &&
+                foldTrToken(s.buyerUsername).includes(spokenFold))),
+        );
+        if (alreadyConfirmed) continue;
+        const near = nearestRecentAsk(ev.offsetMs);
+        if (near != null || amount != null) {
+          pushNeedsReview({
+            offsetMs: ev.offsetMs,
+            amountTry: amount ?? near?.amountTry,
+            spokenBuyerName: ev.spokenBuyerName,
+            confidence: 0.48,
+            reason: "verbal_win_no_lot_needs_review",
+            saleMethod: "verbal_win_confirm",
+            evidenceEventIds: [ev.id],
+            productHint: near?.hint ?? ev.matched.slice(0, 120),
+            askAmountTry: amount ?? near?.amountTry,
+            evidenceQuote: ev.matched.slice(0, 200),
+          });
+        }
+        continue;
+      }
+
+      // Unmatched bare verbal with no open lot: ignore
       // (repeat hayırlı after close must not invent extra needs_review rows).
       if (isVerbal) continue;
 

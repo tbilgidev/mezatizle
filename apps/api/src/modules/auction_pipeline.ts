@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readdir } from "node:fs/promises";
+import { copyFile, mkdir, readdir, access } from "node:fs/promises";
 import { join } from "node:path";
 import type { Sql } from "@mezatizle/db";
 import {
@@ -10,24 +10,132 @@ import {
   type TimelineEvent,
 } from "@mezatizle/shared";
 
+/**
+ * Map a timeline offset onto a sparse OCR frame index.
+ * Long lives extract ~OCR_MAX_FRAMES frames at fps≈N/duration — never assume 1fps.
+ */
+export function pickFrameIndexForOffset(opts: {
+  offsetMs: number;
+  frameCount: number;
+  durationSeconds?: number | null;
+  /** Optional explicit extraction fps (overrides duration mapping). */
+  frameFps?: number | null;
+}): number {
+  const n = Math.max(1, Math.floor(opts.frameCount));
+  if (n === 1) return 1;
+  const offsetSec = Math.max(0, opts.offsetMs / 1000);
+  const fps =
+    opts.frameFps != null &&
+    Number.isFinite(opts.frameFps) &&
+    opts.frameFps > 0
+      ? opts.frameFps
+      : opts.durationSeconds != null &&
+          Number.isFinite(opts.durationSeconds) &&
+          opts.durationSeconds > 1
+        ? (n - 1) / Number(opts.durationSeconds)
+        : null;
+  if (fps != null && fps > 0) {
+    const idx = Math.round(offsetSec * fps) + 1;
+    return Math.min(n, Math.max(1, idx));
+  }
+  // No duration → proportional guess across the set
+  const durGuess = Math.max(offsetSec, 1);
+  const idx = Math.round((offsetSec / durGuess) * (n - 1)) + 1;
+  return Math.min(n, Math.max(1, idx));
+}
+
+async function extractFrameAtOffset(
+  ffmpegPath: string,
+  videoPath: string,
+  offsetMs: number,
+  destPath: string,
+): Promise<boolean> {
+  const sec = Math.max(0, offsetMs / 1000);
+  const proc = Bun.spawn(
+    [
+      ffmpegPath,
+      "-y",
+      "-ss",
+      String(sec),
+      "-i",
+      videoPath,
+      "-frames:v",
+      "1",
+      "-q:v",
+      "4",
+      destPath,
+    ],
+    { stdout: "ignore", stderr: "pipe" },
+  );
+  const code = await proc.exited;
+  if (code !== 0) return false;
+  try {
+    await access(destPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function attachProductImage(
   storageRoot: string,
   recordingId: string,
   productId: string,
   offsetMs: number | null = null,
+  opts?: {
+    durationSeconds?: number | null;
+    videoPath?: string | null;
+    frameFps?: number | null;
+  },
 ) {
   const framesDir = join(storageRoot, "frames", recordingId);
   const outDir = join(storageRoot, "products");
   await mkdir(outDir, { recursive: true });
+  const dest = join(outDir, `${productId}.jpg`);
+  const ffmpegPath = process.env.FFMPEG_PATH ?? "ffmpeg";
+
+  // Prefer a still from the master at this lot's offset (distinct thumbs on long lives).
+  if (
+    opts?.videoPath &&
+    offsetMs != null &&
+    Number.isFinite(offsetMs)
+  ) {
+    try {
+      await access(opts.videoPath);
+      const ok = await extractFrameAtOffset(
+        ffmpegPath,
+        opts.videoPath,
+        offsetMs,
+        dest,
+      );
+      if (ok) return `products/${productId}.jpg`;
+    } catch {
+      // fall through to OCR frame bank
+    }
+  }
+
   try {
     const files = (await readdir(framesDir))
       .filter((f) => f.endsWith(".jpg"))
       .sort();
     if (!files[0]) return null;
-    const fps = Number(process.env.OCR_FPS ?? process.env.FRAME_FPS ?? "1");
+    const indices = files
+      .map((f) => {
+        const m = f.match(/(\d+)/);
+        return m ? Number(m[1]) : NaN;
+      })
+      .filter((n) => Number.isFinite(n));
+    const frameCount = indices.length
+      ? Math.max(...indices)
+      : files.length;
     let pick = files[0]!;
-    if (offsetMs != null && Number.isFinite(offsetMs) && fps > 0) {
-      const targetIdx = Math.max(1, Math.round((offsetMs / 1000) * fps) + 1);
+    if (offsetMs != null && Number.isFinite(offsetMs)) {
+      const targetIdx = pickFrameIndexForOffset({
+        offsetMs,
+        frameCount,
+        durationSeconds: opts?.durationSeconds,
+        frameFps: opts?.frameFps,
+      });
       let best = files[0]!;
       let bestDist = Infinity;
       for (const f of files) {
@@ -42,7 +150,6 @@ async function attachProductImage(
       }
       pick = best;
     }
-    const dest = join(outDir, `${productId}.jpg`);
     await copyFile(join(framesDir, pick), dest);
     return `products/${productId}.jpg`;
   } catch {
@@ -174,12 +281,28 @@ export async function reconcileSales(
   recordingId: string,
   storageRoot = process.env.STORAGE_ROOT ?? "./storage",
 ) {
-  const rec = await sql<{ seller_id: string; recorded_at: Date | string }[]>`
-    SELECT seller_id, recorded_at FROM recordings WHERE id = ${recordingId}
+  const rec = await sql<
+    {
+      seller_id: string;
+      recorded_at: Date | string;
+      duration_seconds: number | null;
+      storage_path: string | null;
+    }[]
+  >`
+    SELECT seller_id, recorded_at, duration_seconds, storage_path
+    FROM recordings WHERE id = ${recordingId}
   `;
   if (!rec[0]) throw new Error("recording not found");
   const sellerId = rec[0].seller_id;
   const recordedAt = new Date(rec[0].recorded_at);
+  const durationSeconds =
+    rec[0].duration_seconds != null &&
+    Number.isFinite(Number(rec[0].duration_seconds))
+      ? Number(rec[0].duration_seconds)
+      : null;
+  const videoPath = rec[0].storage_path
+    ? join(storageRoot, rec[0].storage_path)
+    : null;
 
   const minConf = Number(
     process.env.SALE_MIN_CONFIDENCE ?? SALE_MIN_CONFIDENCE,
@@ -409,6 +532,7 @@ export async function reconcileSales(
       recordingId,
       product[0]!.id,
       offsetMs,
+      { durationSeconds, videoPath },
     );
     if (imagePath) {
       await sql`
