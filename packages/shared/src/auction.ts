@@ -2907,6 +2907,25 @@ export function reconcileMezatWindows(
           winAsk == null ||
           ev.amountTry === winAsk ||
           amountsNear(ev.amountTry, winAsk);
+        // Priced «32 aldım» for a different open ask → orphan for the next lot
+        // (do not steal the prior 27500 window and "pey" it at 32k).
+        if (
+          ev.amountTry != null &&
+          winAsk != null &&
+          !amountFits &&
+          saneAsk(ev.amountTry) != null
+        ) {
+          orphanClaims.push({
+            buyer: buyerHint,
+            offsetMs: ev.offsetMs,
+            eventId: ev.id,
+            amountTry: saneAsk(ev.amountTry) ?? ev.amountTry,
+            matched: ev.matched,
+            descriptorTokens: descTokens,
+            lotNumber: ev.lotNumber,
+          });
+          continue;
+        }
         const preferParked =
           (descTokens.length > 0 && descScore < 1) ||
           (ev.amountTry != null && winAsk != null && !amountFits);
