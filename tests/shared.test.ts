@@ -5,7 +5,10 @@ import {
   explainSaleTr,
   isAuctionNoise,
   isSaleWorthy,
+  isFollowerAldimClaimText,
   isSellerAcceptPhrase,
+  isSellerFlowerLotEnd,
+  isSellerSideHandle,
   isVerbalWinPhrase,
   matchSpokenNameHits,
   matchSpokenNameToBuyer,
@@ -747,6 +750,209 @@ describe("mezat window reconcile", () => {
     expect(sales[0]!.buyerUsername).toBe("canan_v");
     expect(sales[0]!.amountTry).toBe(18000);
     expect(sales[0]!.saleMethod).toBe("counter_accept");
+  });
+
+  test("fusus ~85min: pey escalate + flower → highest bid wins", () => {
+    expect(parseAuctionText("32 aldim", { source: "comment" })?.amountTry).toBe(
+      32000,
+    );
+    expect(isSellerFlowerLotEnd("🌸")).toBe(true);
+    expect(
+      parseAuctionText("🌸", { source: "comment" })?.reason,
+    ).toBe("seller_flower_end");
+    expect(
+      parseAuctionText("Sitrin 32500", { source: "comment" })?.amountTry,
+    ).toBe(32500);
+
+    const sales = reconcileMezatWindows(
+      [
+        ev({
+          id: "ask",
+          offsetMs: 5_069_340,
+          eventType: "price_mention",
+          matched: "32.000 TL.",
+          amountTry: 32000,
+          reason: "seller_price_line",
+        }),
+        ev({
+          id: "c32",
+          offsetMs: 5_070_317,
+          eventType: "bid",
+          matched: "32 aldim",
+          amountTry: 32000,
+          buyerHint: "bilgosh",
+          reason: "aldim_claim",
+          source: "comment",
+          confidence: 0.65,
+        }),
+        ev({
+          id: "c325",
+          offsetMs: 5_078_317,
+          eventType: "bid",
+          matched: "Sitrin 32500",
+          amountTry: 32500,
+          buyerHint: "__hilalce__",
+          reason: "comment_named_price_bid",
+          source: "comment",
+        }),
+        ev({
+          id: "c340",
+          offsetMs: 5_113_317,
+          eventType: "bid",
+          matched: "34000",
+          amountTry: 34000,
+          buyerHint: "__hilalce__",
+          reason: "comment_number_bid",
+          source: "comment",
+        }),
+        ev({
+          id: "c355",
+          offsetMs: 5_131_317,
+          eventType: "bid",
+          matched: "35500",
+          amountTry: 35500,
+          buyerHint: "__hilalce__",
+          reason: "comment_number_bid",
+          source: "comment",
+        }),
+        ev({
+          id: "flower",
+          offsetMs: 5_135_317,
+          eventType: "sold",
+          matched: "🌸",
+          reason: "seller_flower_end",
+          source: "comment",
+          confidence: 0.86,
+        }),
+      ],
+      { sellerUsernames: "fususvintage" },
+    );
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.length).toBe(1);
+    expect(confirmed[0]!.buyerUsername).toBe("__hilalce__");
+    expect(confirmed[0]!.amountTry).toBe(35500);
+    expect(confirmed[0]!.saleMethod).toBe("bid_win_confirm");
+  });
+
+  test("fusus ~105min: geç kaldım is not aldım; no phantom 100k sale", () => {
+    const chatter = "Kolyelere baka bilir miyim gec kaldim🫢";
+    expect(isFollowerAldimClaimText(chatter)).toBe(false);
+    expect(parseAuctionText(chatter, { source: "comment" })).toBeNull();
+    expect(isFollowerAldimClaimText("kaldım")).toBe(false);
+    expect(isFollowerAldimClaimText("aldım")).toBe(true);
+
+    const sales = reconcileMezatWindows(
+      [
+        ev({
+          id: "phantom-ask",
+          offsetMs: 6_274_500,
+          eventType: "price_mention",
+          matched: "100000 TL.",
+          amountTry: 100000,
+          reason: "seller_price_line",
+        }),
+        ev({
+          id: "late",
+          offsetMs: 6_315_317,
+          eventType: "bid",
+          matched: chatter,
+          buyerHint: "dr.zulfiyya_guluzade",
+          // Even if a bad segment slipped through, reconcile must not invent.
+          reason: "descriptor_aldim_claim",
+          source: "comment",
+          confidence: 0.66,
+        }),
+        ev({
+          id: "next",
+          offsetMs: 6_367_890,
+          eventType: "price_mention",
+          matched: "2000 TL.",
+          amountTry: 2000,
+          reason: "seller_price_line",
+        }),
+      ],
+      { sellerUsernames: "fususvintage" },
+    );
+    const phantom = sales.filter(
+      (s) =>
+        s.amountTry === 100000 ||
+        s.buyerUsername === "dr.zulfiyya_guluzade",
+    );
+    expect(phantom.length).toBe(0);
+  });
+
+  test("never attribute sale to seller or brand sibling handles", () => {
+    expect(isSellerSideHandle("fususvintage", "fususvintage")).toBe(true);
+    expect(isSellerSideHandle("fususvintage.design", "fususvintage")).toBe(
+      true,
+    );
+    expect(isSellerSideHandle("bilgosh", "fususvintage")).toBe(false);
+
+    const sales = reconcileMezatWindows(
+      [
+        ev({
+          id: "ask1",
+          offsetMs: 6_726_320,
+          eventType: "price_mention",
+          matched: "9500 TL.",
+          amountTry: 9500,
+          reason: "seller_price_line",
+        }),
+        ev({
+          id: "seller-ask-comment",
+          offsetMs: 6_740_317,
+          eventType: "bid",
+          matched: "9500",
+          amountTry: 9500,
+          buyerHint: "fususvintage",
+          reason: "comment_number_bid",
+          source: "comment",
+        }),
+        ev({
+          id: "ask2",
+          offsetMs: 7_931_300,
+          eventType: "price_mention",
+          matched: "Bu alttaki 4000 TL.",
+          amountTry: 4000,
+          reason: "seller_price_line",
+        }),
+        ev({
+          id: "brand",
+          offsetMs: 7_947_317,
+          eventType: "bid",
+          matched: "4000",
+          amountTry: 4000,
+          buyerHint: "fususvintage.design",
+          reason: "comment_number_bid",
+          source: "comment",
+        }),
+        ev({
+          id: "real",
+          offsetMs: 7_961_317,
+          eventType: "bid",
+          matched: "Aldim",
+          buyerHint: "evrimalev",
+          reason: "aldim_claim",
+          source: "comment",
+          confidence: 0.6,
+        }),
+        ev({
+          id: "close",
+          offsetMs: 8_100_000,
+          eventType: "price_mention",
+          matched: "sıradaki 2000",
+          amountTry: 2000,
+          reason: "seller_price_line",
+        }),
+      ],
+      { sellerUsernames: "fususvintage" },
+    );
+    const sellerish = sales.filter((s) =>
+      isSellerSideHandle(s.buyerUsername, "fususvintage"),
+    );
+    expect(sellerish.length).toBe(0);
+    const confirmed = sales.filter((s) => !s.needsReview);
+    expect(confirmed.some((s) => s.buyerUsername === "evrimalev")).toBe(true);
   });
 
   test("unsold pass yields no sale", () => {

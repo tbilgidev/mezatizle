@@ -6,12 +6,16 @@
  * - Seller «aldım X lira» / ask price → **listing / opening price**, NEVER a sale by itself
  * - After ask: first follower comment «aldım» (OCR, with username) → buyer at listed price
  * - Bidding: opening → OCR bids («X», «X veririm») → seller win confirm → sale
+ * - Pey escalate: early «32 aldım» (bin shorthand) can be outbid; highest bid before
+ *   seller end-marker wins (not the first claimer)
+ * - Seller flower emoji (çiçek: 🌸/💐/…) as a comment closes that lot
  * - Counter: buyer «18 veririm» + seller accept → sale at 18 (not ask)
  * - Verbal win (ASR): «X hanım sizindir» / «Y bey sizde» / «hayırlı olsun Z» —
  *   match spoken name to recent aldım/bid username; seller need not reply in comments
  * - Repeated verbal confirms on the same lot → **one** sale (dedup)
  * - Spoken first name without @ → never buyer_username (unless matched to a commenter)
- * - Prefer unknown / no sale over inventing from seller chatter
+ * - Never attribute a sale to the seller account or sibling/brand handles (same root)
+ * - Prefer unknown / no sale over inventing from seller chatter / phantom asks
  */
 
 export type AuctionEventType =
@@ -182,8 +186,24 @@ const ACCEPT_STRONG_RE =
 const ACCEPT_LEAD_RE =
   /^(tamam|olur|okey|okay|kabul)(?:[.!?…]*|\s+(?:olur|okey|okay|kabul|peki|edir|dir|\d|[a-zçğıöşü]*\s*bin).*|$)/i;
 
+/**
+ * True «aldım» token — must NOT match inside «kaldım» / «kaldim» (geç kaldım chatter).
+ * ASCII `\b` breaks on Turkish letters, so use letter lookarounds.
+ */
+export const ALDIM_WORD_RE =
+  /(?<![A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû])ald[ıi]m(?![A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû])/i;
+
+/** «Geç kaldım» / late-to-live chatter is never a take-it claim. */
+const GEC_KALDIM_RE = /\bge[cç]\s+kald[ıi]m\b/i;
+
+/**
+ * Seller end-of-lot marker: flower / bouquet emoji comment (optionally with
+ * hearts/prayer). Bare 🌸 closes the open pey or claimed lot.
+ */
+const FLOWER_EMOJI_RE = /[🌸🌺🌹🌻🌼💐🌷💮🏵🥀]/u;
+
 const BID_RE =
-  /(ald[ıi]m|al[ıi]yorum|ben\s+ald[ıi]m|ben\s*[-:]?\s*\d+|^\s*\+?\s*\d{2,7}\s*(tl|₺|try)?\s*$|artt[ıi]r(?:d[ıi]m)?|arttir|veriyorum|veririm|\+\s*\d{2,7}|bid|benim|üstüne|ustune)/i;
+  /((?<![A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû])ald[ıi]m(?![A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû])|al[ıi]yorum|ben\s+ald[ıi]m|ben\s*[-:]?\s*\d+|^\s*\+?\s*\d{2,7}\s*(tl|₺|try)?\s*$|artt[ıi]r(?:d[ıi]m)?|arttir|veriyorum|veririm|\+\s*\d{2,7}|bid|benim|üstüne|ustune)/i;
 
 /** Co-host / seller comment posting the ask («Aldım 50.000₺ dir», «Aldım diyene 11 bin»). */
 const COMMENT_SELLER_ASK_RE =
@@ -208,6 +228,8 @@ export function isAuctionNoise(text: string): boolean {
   const t = text.trim();
   // Bare pey numbers («9», «10», «6,5») are valid comment bids
   if (/^\d{1,7}([.,]\d{1,3})?$/.test(t)) return false;
+  // Seller flower / bouquet lot-end is intentional signal, not HUD noise.
+  if (isSellerFlowerLotEnd(t)) return false;
   if (t.length < 2) return true;
   if (t.length > 280) return true;
   const letters = (t.match(/[A-Za-zÀ-ÿĞğÜüŞşİıÖöÇç]/g) || []).length;
@@ -438,9 +460,53 @@ export function normalizeClaimOrthography(text: string): string {
   return t;
 }
 
+/** Seller flower / bouquet comment that ends the current lot. */
+export function isSellerFlowerLotEnd(text: string): boolean {
+  const t = text.trim();
+  if (!t || !FLOWER_EMOJI_RE.test(t)) return false;
+  // Allow flowers + hearts / sparkles / prayer — reject if real words remain.
+  const rest = t
+    .replace(FLOWER_EMOJI_RE, "")
+    .replace(/[\uFE0F\u200D]/g, "")
+    .replace(/[❤️🧡💛💚💙💜🤍🤎🖤💕💖💗💓💞💘💝✨🙏👏🏻👏👍💯🔥⭐🌟\s]/gu, "");
+  return rest.length === 0;
+}
+
+/**
+ * True when `username` is the seller or a sibling/brand handle sharing the same
+ * root (e.g. fususvintage ↔ fususvintage.design). Never a sale buyer.
+ */
+export function isSellerSideHandle(
+  username: string | undefined | null,
+  sellerUsernames: string | readonly string[] | undefined | null,
+): boolean {
+  if (!username) return false;
+  const sellers = (
+    Array.isArray(sellerUsernames)
+      ? sellerUsernames
+      : sellerUsernames
+        ? [sellerUsernames]
+        : []
+  )
+    .map((s) => String(s).trim().replace(/^@/, "").toLowerCase())
+    .filter((s) => s.length >= 2);
+  if (!sellers.length) return false;
+  const u = username.trim().replace(/^@/, "").toLowerCase();
+  if (!u) return false;
+  for (const s of sellers) {
+    if (u === s) return true;
+    if (u.startsWith(`${s}.`) || s.startsWith(`${u}.`)) return true;
+    const uRoot = u.split(".")[0] ?? u;
+    const sRoot = s.split(".")[0] ?? s;
+    if (uRoot.length >= 4 && uRoot === sRoot) return true;
+  }
+  return false;
+}
+
 export function isFollowerAldimClaimText(text: string): boolean {
   const t = normalizeClaimOrthography(text.trim());
-  if (!t || !/ald[ıi]m/i.test(t)) return false;
+  if (!t || !ALDIM_WORD_RE.test(t)) return false;
+  if (GEC_KALDIM_RE.test(t)) return false;
   if (/\?/.test(t)) return false;
   if (/\bacaba\b/i.test(t)) return false;
   if (/\b(?:mi|mı|mü|mu)\s+ald[ıi]m\b/i.test(t)) return false;
@@ -1104,6 +1170,16 @@ export function parseAuctionText(
   const t =
     opts?.source === "comment" ? normalizeClaimOrthography(raw) : raw;
 
+  // Seller çiçek emoji = lot end (before other heuristics).
+  if (opts?.source === "comment" && isSellerFlowerLotEnd(raw)) {
+    return {
+      eventType: "sold",
+      confidence: 0.86,
+      matched: raw,
+      reason: "seller_flower_end",
+    };
+  }
+
   if (CORRECTION_RE.test(t)) {
     return {
       eventType: "pass",
@@ -1127,7 +1203,7 @@ export function parseAuctionText(
 
   const hasCurrency = hasCurrencyMarker(t);
   const amountTryRaw = parsePriceTry(t);
-  const amountTry = normalizeAldimDiyeneAmount(t, amountTryRaw) ?? amountTryRaw;
+  let amountTry = normalizeAldimDiyeneAmount(t, amountTryRaw) ?? amountTryRaw;
   const buyerHint = parseBuyerHint(t);
   const spokenBuyerName = parseSpokenBuyerName(t);
   const source = opts?.source;
@@ -1261,7 +1337,7 @@ export function parseAuctionText(
   // Transcript bare «Aldım.» / «Aldım ne dedi?» / «Bu olarak aldım.» — seller talk, not claim
   if (
     source === "transcript" &&
-    /ald[ıi]m/i.test(t) &&
+    ALDIM_WORD_RE.test(t) &&
     amountTry == null &&
     !buyerHint &&
     !SOLD_RE.test(t)
@@ -1313,13 +1389,30 @@ export function parseAuctionText(
         };
       }
     }
+    // «Sitrin 32500» / product-name + pey amount (not a descriptor aldım).
+    const namedPey = t.match(
+      /^\s*[A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû][A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû0-9._\-]{1,40}\s+(\d{4,7})\s*$/u,
+    );
+    if (namedPey?.[1] && !ALDIM_WORD_RE.test(t)) {
+      const amt = clampPriceTry(Number(namedPey[1]));
+      if (amt != null) {
+        return {
+          eventType: "bid",
+          amountTry: amt,
+          buyerHint,
+          confidence: 0.63,
+          matched: t,
+          reason: "comment_named_price_bid",
+        };
+      }
+    }
   }
 
   // Follower / OCR bids (incl. bare comment «aldım», «18 veririm»)
   if (BID_RE.test(t) || COUNTER_RE.test(t)) {
     const isCounter = COUNTER_RE.test(t);
-    const isAldim = /ald[ıi]m/i.test(t);
-    // Questions («Acaba senden mi aldım?») must not claim a lot.
+    const isAldim = ALDIM_WORD_RE.test(t);
+    // «geç kaldım» / questions must not claim a lot.
     if (
       source === "comment" &&
       isAldim &&
@@ -1327,6 +1420,18 @@ export function parseAuctionText(
       !isFollowerAldimClaimText(t)
     ) {
       return null;
+    }
+    // «32 aldım» bin shorthand (same as bare «32» pey) when no currency/bin word.
+    if (
+      isAldim &&
+      source === "comment" &&
+      amountTry != null &&
+      amountTry > 0 &&
+      amountTry < 100 &&
+      !hasCurrency &&
+      !/\bbin\b/i.test(t)
+    ) {
+      amountTry = amountTry * 1000;
     }
     const descClaim =
       isAldim &&
@@ -1730,14 +1835,25 @@ export function dedupeSaleCandidates(sales: SaleCandidate[]): SaleCandidate[] {
   return out;
 }
 
+export type ReconcileMezatOpts = {
+  /** Seller IG handle(s); never become buyerUsername (incl. sibling brand roots). */
+  sellerUsernames?: string | readonly string[];
+};
+
 /**
  * Product-window reconcile: seller ask ≠ sale; first comment aldım wins;
+ * pey escalate to highest bid before seller end-marker; flower emoji closes lot;
  * bid+confirm; verbal win («sizindir»); counter+accept.
  * Prefer no sale over inventing. Repeated verbal confirms → one sale.
+ * Never attribute a sale to the seller / brand sibling handles.
  */
 export function reconcileMezatWindows(
   events: TimelineEvent[],
+  opts?: ReconcileMezatOpts,
 ): SaleCandidate[] {
+  const sellerUsernames = opts?.sellerUsernames;
+  const isSellerBuyer = (u: string | undefined | null) =>
+    isSellerSideHandle(u, sellerUsernames);
   const sorted = [...events].sort((a, b) => a.offsetMs - b.offsetMs);
   const sales: SaleCandidate[] = [];
   let win: LotWindow | null = null;
@@ -1850,13 +1966,84 @@ export function reconcileMezatWindows(
     emitNamedMiss(win);
   };
 
+  /**
+   * Highest follower pey above the ask/claim floor. When present, that bidder
+   * outranks an earlier «32 aldım» claim (fusus ~85min).
+   */
+  const pickHighestPeyBid = (
+    lot: LotWindow,
+  ): {
+    buyer: string;
+    amountTry: number;
+    offsetMs: number;
+    eventId?: string;
+  } | null => {
+    const floor =
+      lotSaleAsk(lot) ??
+      (lot.aldimClaim?.amountTry != null
+        ? saneAskAmount(lot.aldimClaim.amountTry)
+        : undefined);
+    let best: {
+      buyer: string;
+      amountTry: number;
+      offsetMs: number;
+      eventId?: string;
+    } | null = null;
+    for (const b of lot.bids) {
+      if (b.source !== "comment" || !b.buyerHint || b.amountTry == null) continue;
+      if (isSellerBuyer(b.buyerHint)) continue;
+      const amt = saneAskAmount(b.amountTry);
+      if (amt == null) continue;
+      if (floor != null && amt <= floor) continue;
+      if (
+        !best ||
+        amt > best.amountTry ||
+        (amt === best.amountTry && b.offsetMs >= best.offsetMs)
+      ) {
+        best = {
+          buyer: b.buyerHint,
+          amountTry: amt,
+          offsetMs: b.offsetMs,
+          eventId: b.eventId,
+        };
+      }
+    }
+    return best;
+  };
+
   const emitAldimSale = (lot: LotWindow) => {
     const hasCounter = lot.bids.some((b) => b.reason === "counter_offer");
     const saleAsk =
       lotSaleAsk(lot) ??
       lot.aldimClaim?.amountTry ??
       saneAskAmount(lot.aldimClaim?.amountTry);
+    const pey = pickHighestPeyBid(lot);
+    // Pey escalate: later higher bids beat the first priced aldım claim.
+    if (pey && !hasCounter) {
+      sales.push({
+        offsetMs: pey.offsetMs,
+        amountTry: pey.amountTry,
+        buyerUsername: pey.buyer,
+        confidence: 0.9,
+        reason: "pey_escalate_highest_bid",
+        saleMethod: "bid_win_confirm",
+        evidenceEventIds: [
+          ...lot.openEventIds,
+          ...(lot.aldimClaim ? [lot.aldimClaim.eventId] : []),
+          ...(pey.eventId ? [pey.eventId] : []),
+        ],
+        productHint: lot.productHint,
+        askAmountTry: lot.openingAskTry ?? saleAsk ?? pey.amountTry,
+        evidenceQuote: `@${pey.buyer} pey ${pey.amountTry} TRY (çiçek/en yüksek)`,
+      });
+      lot.namedMissReview = undefined;
+      return true;
+    }
     if (lot.aldimClaim && saleAsk != null && !hasCounter) {
+      if (isSellerBuyer(lot.aldimClaim.buyer)) {
+        emitNamedMiss(lot);
+        return false;
+      }
       sales.push({
         offsetMs: lot.aldimClaim.offsetMs,
         amountTry: saleAsk,
@@ -1887,7 +2074,12 @@ export function reconcileMezatWindows(
     // Bids without a confident aldım/verbal confirm → operator review (priced).
     const ask = lotSaleAsk(lot);
     const bidBuyers = lot.bids
-      .filter((b) => b.buyerHint && b.source === "comment")
+      .filter(
+        (b) =>
+          b.buyerHint &&
+          b.source === "comment" &&
+          !isSellerBuyer(b.buyerHint),
+      )
       .map((b) => ({
         buyer: b.buyerHint!,
         offsetMs: b.offsetMs,
@@ -2380,23 +2572,26 @@ export function reconcileMezatWindows(
     }
 
     if (ev.eventType === "bid") {
+      // Re-validate claim text so stale/bad segments («gec kaldim») cannot invent sales.
+      const claimTextOk = isFollowerAldimClaimText(ev.matched);
       const isAldimClaim =
-        reason === "aldim_claim" ||
-        reason === "descriptor_aldim_claim" ||
-        (/ald[ıi]m/i.test(ev.matched) &&
-          ev.amountTry == null &&
-          isFollowerAldimClaimText(ev.matched));
+        claimTextOk &&
+        (reason === "aldim_claim" ||
+          reason === "descriptor_aldim_claim" ||
+          (ALDIM_WORD_RE.test(ev.matched) && ev.amountTry == null));
       const dualSum =
         ev.source === "comment" ? parseDualClaimSum(ev.matched) : undefined;
       const dualAldim =
         ev.source === "comment" && isDualAldimClaimText(ev.matched);
       const descTokens =
         ev.descriptorTokens ?? extractDescriptorTokens(ev.matched);
+      // Seller / brand sibling comments are asks or chatter — never buyer evidence.
+      const buyerHint = isSellerBuyer(ev.buyerHint) ? undefined : ev.buyerHint;
 
       // Track commenters for later verbal «X hanımda» matching.
-      if (ev.source === "comment" && ev.buyerHint) {
+      if (ev.source === "comment" && buyerHint) {
         recentCommenters.push({
-          buyerHint: ev.buyerHint,
+          buyerHint,
           offsetMs: ev.offsetMs,
           eventId: ev.id,
           amountTry: ev.amountTry,
@@ -2408,7 +2603,7 @@ export function reconcileMezatWindows(
       // is a soft take-it claim (buyers often omit «aldım»).
       if (
         ev.source === "comment" &&
-        ev.buyerHint &&
+        buyerHint &&
         win &&
         !win.closed &&
         !win.aldimClaim &&
@@ -2420,7 +2615,7 @@ export function reconcileMezatWindows(
         ev.offsetMs - win.openMs <= ALDIM_CLAIM_WINDOW_MS
       ) {
         claimLot(win, {
-          buyer: ev.buyerHint,
+          buyer: buyerHint,
           offsetMs: ev.offsetMs,
           eventId: ev.id,
           amountTry: lotSaleAsk(win),
@@ -2429,7 +2624,7 @@ export function reconcileMezatWindows(
         win.bids.push({
           offsetMs: ev.offsetMs,
           amountTry: ev.amountTry,
-          buyerHint: ev.buyerHint,
+          buyerHint: buyerHint,
           source: ev.source,
           reason: "price_match_claim",
           eventId: ev.id,
@@ -2440,7 +2635,7 @@ export function reconcileMezatWindows(
       // Nunus tray: bare «1» / «3» claims the matching open number (first buyer wins).
       if (
         ev.source === "comment" &&
-        ev.buyerHint &&
+        buyerHint &&
         ev.lotNumber != null &&
         (reason === "comment_lot_number_or_bid" ||
           reason === "comment_number_bid")
@@ -2449,7 +2644,7 @@ export function reconcileMezatWindows(
           const lot = trayLots.get(ev.lotNumber)!;
           if (!lot.closed && !lot.aldimClaim) {
             claimLot(lot, {
-              buyer: ev.buyerHint,
+              buyer: buyerHint,
               offsetMs: ev.offsetMs,
               eventId: ev.id,
               amountTry: lotSaleAsk(lot) ?? ev.amountTry,
@@ -2459,19 +2654,19 @@ export function reconcileMezatWindows(
             lot.bids.push({
               offsetMs: ev.offsetMs,
               amountTry: lotSaleAsk(lot),
-              buyerHint: ev.buyerHint,
+              buyerHint: buyerHint,
               source: ev.source,
               reason: "numbered_lot_claim",
               eventId: ev.id,
             });
             continue;
           }
-          if (lot.aldimClaim && lot.aldimClaim.buyer !== ev.buyerHint) {
+          if (lot.aldimClaim && lot.aldimClaim.buyer !== buyerHint) {
             const ask = lotSaleAsk(lot);
             pushNeedsReview({
               offsetMs: ev.offsetMs,
               amountTry: ask,
-              buyerUsername: ev.buyerHint,
+              buyerUsername: buyerHint,
               confidence: 0.5,
               reason: "numbered_lot_second_claim_needs_review",
               saleMethod: "aldim_first_comment",
@@ -2492,7 +2687,7 @@ export function reconcileMezatWindows(
           pushNeedsReview({
             offsetMs: ev.offsetMs,
             amountTry: openAsk,
-            buyerUsername: ev.buyerHint,
+            buyerUsername: buyerHint,
             confidence: 0.48,
             reason: "unmatched_lot_number_needs_review",
             saleMethod: "aldim_first_comment",
@@ -2506,13 +2701,13 @@ export function reconcileMezatWindows(
       }
 
       // «2000+2500=4500» / Nunus «800+800» — two sell legs for the same buyer.
-      if (dualSum && ev.buyerHint && ev.source === "comment") {
+      if (dualSum && buyerHint && ev.source === "comment") {
         const claimAsk = win && !win.closed ? lotSaleAsk(win) : undefined;
         const alreadyConfirmed = sales
           .filter(
             (s) =>
               !s.needsReview &&
-              s.buyerUsername === ev.buyerHint &&
+              s.buyerUsername === buyerHint &&
               s.amountTry != null,
           )
           .map((s) => s.amountTry!);
@@ -2534,7 +2729,7 @@ export function reconcileMezatWindows(
             unit;
           if (win && !win.closed && !win.aldimClaim) {
             claimLot(win, {
-              buyer: ev.buyerHint,
+              buyer: buyerHint,
               offsetMs: ev.offsetMs,
               eventId: ev.id,
               amountTry: priced,
@@ -2547,7 +2742,7 @@ export function reconcileMezatWindows(
             pushNeedsReview({
               offsetMs: ev.offsetMs + 1,
               amountTry: priced,
-              buyerUsername: ev.buyerHint,
+              buyerUsername: buyerHint,
               confidence: 0.72,
               reason: "dual_same_price_second_leg",
               saleMethod: "aldim_first_comment",
@@ -2561,7 +2756,7 @@ export function reconcileMezatWindows(
               sales.push({
                 offsetMs: ev.offsetMs + leg,
                 amountTry: priced,
-                buyerUsername: ev.buyerHint,
+                buyerUsername: buyerHint,
                 confidence: 0.8,
                 reason: `dual_same_price_leg_${leg + 1}`,
                 saleMethod: "aldim_first_comment",
@@ -2575,7 +2770,7 @@ export function reconcileMezatWindows(
             pushNeedsReview({
               offsetMs: ev.offsetMs,
               amountTry: priced,
-              buyerUsername: ev.buyerHint,
+              buyerUsername: buyerHint,
               confidence: 0.56,
               reason: "dual_same_price_second_needs_review",
               saleMethod: "aldim_first_comment",
@@ -2622,7 +2817,7 @@ export function reconcileMezatWindows(
             amountsNear(claimAsk, dualSum.b)
           ) {
             claimLot(win, {
-              buyer: ev.buyerHint,
+              buyer: buyerHint,
               offsetMs: ev.offsetMs,
               eventId: ev.id,
               amountTry: claimAsk,
@@ -2636,7 +2831,7 @@ export function reconcileMezatWindows(
         pushNeedsReview({
           offsetMs: ev.offsetMs,
           amountTry: second,
-          buyerUsername: ev.buyerHint,
+          buyerUsername: buyerHint,
           confidence: 0.56,
           reason: "dual_claim_sum_needs_review",
           saleMethod: "aldim_first_comment",
@@ -2653,7 +2848,7 @@ export function reconcileMezatWindows(
 
       if (!win || win.closed) {
         // Try parked sequential intros (descriptor / amount match) before orphaning.
-        if (isAldimClaim && ev.buyerHint && ev.source === "comment") {
+        if (isAldimClaim && buyerHint && ev.source === "comment") {
           const parked = findPendingMatch({
             offsetMs: ev.offsetMs,
             amountTry: saneAsk(ev.amountTry),
@@ -2661,7 +2856,7 @@ export function reconcileMezatWindows(
           });
           if (parked) {
             claimLot(parked, {
-              buyer: ev.buyerHint,
+              buyer: buyerHint,
               offsetMs: ev.offsetMs,
               eventId: ev.id,
               amountTry: saneAsk(ev.amountTry),
@@ -2672,7 +2867,7 @@ export function reconcileMezatWindows(
             parked.closed = true;
             if (dualAldim) {
               pendingDualReview = {
-                buyer: ev.buyerHint,
+                buyer: buyerHint,
                 offsetMs: ev.offsetMs,
                 eventId: ev.id,
                 matched: ev.matched,
@@ -2681,7 +2876,7 @@ export function reconcileMezatWindows(
             continue;
           }
           orphanClaims.push({
-            buyer: ev.buyerHint,
+            buyer: buyerHint,
             offsetMs: ev.offsetMs,
             eventId: ev.id,
             amountTry: saneAsk(ev.amountTry) ?? ev.amountTry,
@@ -2691,7 +2886,7 @@ export function reconcileMezatWindows(
           });
           if (dualAldim) {
             pendingDualReview = {
-              buyer: ev.buyerHint,
+              buyer: buyerHint,
               offsetMs: ev.offsetMs,
               eventId: ev.id,
               matched: ev.matched,
@@ -2700,7 +2895,7 @@ export function reconcileMezatWindows(
         }
         continue;
       }
-      if (isAldimClaim && ev.buyerHint && ev.source === "comment") {
+      if (isAldimClaim && buyerHint && ev.source === "comment") {
         // Prefer descriptor match against another parked lot when current win
         // is a poor fit (sequential A/B/C intros, claim arrives on B's window).
         const winDesc = win.descriptorTokens ??
@@ -2726,7 +2921,7 @@ export function reconcileMezatWindows(
               lotSaleAsk(parked) != null &&
               amountsNear(saneAsk(ev.amountTry)!, lotSaleAsk(parked)!)))) {
             claimLot(parked, {
-              buyer: ev.buyerHint,
+              buyer: buyerHint,
               offsetMs: ev.offsetMs,
               eventId: ev.id,
               amountTry: saneAsk(ev.amountTry),
@@ -2743,7 +2938,7 @@ export function reconcileMezatWindows(
           ev.offsetMs - win.openMs <= ALDIM_CLAIM_WINDOW_MS
         ) {
           claimLot(win, {
-            buyer: ev.buyerHint,
+            buyer: buyerHint,
             offsetMs: ev.offsetMs,
             eventId: ev.id,
             amountTry: saneAsk(ev.amountTry),
@@ -2752,7 +2947,7 @@ export function reconcileMezatWindows(
           });
           if (dualAldim) {
             win.dualClaimPending = {
-              buyer: ev.buyerHint,
+              buyer: buyerHint,
               offsetMs: ev.offsetMs,
               eventId: ev.id,
               matched: ev.matched,
@@ -2761,7 +2956,7 @@ export function reconcileMezatWindows(
           }
         } else if (
           win.aldimClaim &&
-          win.aldimClaim.buyer !== ev.buyerHint
+          win.aldimClaim.buyer !== buyerHint
         ) {
           // Second follower — try parked lot, else review + orphan for a near-future ask.
           const parked = findPendingMatch({
@@ -2771,7 +2966,7 @@ export function reconcileMezatWindows(
           });
           if (parked) {
             claimLot(parked, {
-              buyer: ev.buyerHint,
+              buyer: buyerHint,
               offsetMs: ev.offsetMs,
               eventId: ev.id,
               amountTry: saneAsk(ev.amountTry),
@@ -2786,7 +2981,7 @@ export function reconcileMezatWindows(
             pushNeedsReview({
               offsetMs: ev.offsetMs,
               amountTry: priced,
-              buyerUsername: ev.buyerHint,
+              buyerUsername: buyerHint,
               confidence: 0.54,
               reason: "second_claim_needs_review",
               saleMethod: "aldim_first_comment",
@@ -2796,7 +2991,7 @@ export function reconcileMezatWindows(
               evidenceQuote: ev.matched.slice(0, 200),
             });
             orphanClaims.push({
-              buyer: ev.buyerHint,
+              buyer: buyerHint,
               offsetMs: ev.offsetMs,
               eventId: ev.id,
               amountTry: saneAsk(ev.amountTry) ?? ev.amountTry,
@@ -2807,12 +3002,12 @@ export function reconcileMezatWindows(
           }
         } else if (
           win.aldimClaim &&
-          win.aldimClaim.buyer === ev.buyerHint &&
+          win.aldimClaim.buyer === buyerHint &&
           dualAldim
         ) {
           // Same buyer «ikisini de aldım» after first claim → second item review.
           win.dualClaimPending = {
-            buyer: ev.buyerHint,
+            buyer: buyerHint,
             offsetMs: ev.offsetMs,
             eventId: ev.id,
             matched: ev.matched,
@@ -2820,11 +3015,18 @@ export function reconcileMezatWindows(
           pendingDualReview = win.dualClaimPending;
         }
       }
-      if (ev.buyerHint || ev.amountTry != null) {
+      // Reject non-claim chatter that only looked like aldım («gec kaldim»).
+      const meaningfulBid =
+        ev.amountTry != null ||
+        (isAldimClaim && buyerHint) ||
+        (buyerHint &&
+          reason !== "aldim_claim" &&
+          reason !== "descriptor_aldim_claim");
+      if (meaningfulBid && (buyerHint || ev.amountTry != null)) {
         win.bids.push({
           offsetMs: ev.offsetMs,
           amountTry: ev.amountTry,
-          buyerHint: ev.buyerHint,
+          buyerHint: buyerHint,
           source: ev.source,
           reason: ev.reason,
           eventId: ev.id,
@@ -2834,6 +3036,21 @@ export function reconcileMezatWindows(
     }
 
     if (ev.eventType === "sold") {
+      // Seller flower emoji closes the open lot (pey escalate or aldım claim).
+      if (reason === "seller_flower_end") {
+        const openWin = win && !win.closed ? win : null;
+        if (openWin) {
+          if (emitAldimSale(openWin)) {
+            openWin.closed = true;
+            win = null;
+          } else {
+            parkUnclaimedLot(openWin, ev.offsetMs);
+            win = null;
+          }
+        }
+        continue;
+      }
+
       // Nunus: «1 numara Gamze hanım» closes that tray number (first claim or verbal).
       if (
         reason === "numbered_lot_verbal_confirm" &&
@@ -2899,7 +3116,7 @@ export function reconcileMezatWindows(
       }
 
       // Correlate with open window
-      let buyer = ev.buyerHint;
+      let buyer = isSellerBuyer(ev.buyerHint) ? undefined : ev.buyerHint;
       let amount = ev.amountTry;
       const isVerbal =
         reason.includes("verbal_win") ||
@@ -2927,7 +3144,9 @@ export function reconcileMezatWindows(
           const counters = openWin.bids.filter(
             (b) =>
               b.reason === "counter_offer" ||
-              (b.amountTry != null && b.buyerHint),
+              (b.amountTry != null &&
+                b.buyerHint &&
+                !isSellerBuyer(b.buyerHint)),
           );
           const last = counters[counters.length - 1];
           if (last) {
@@ -3003,10 +3222,28 @@ export function reconcileMezatWindows(
           }
         }
 
+        // Pey escalate on seller confirm: highest bid above ask beats first aldım.
+        if (!buyer && !verbalNameMiss && openWin) {
+          const pey = pickHighestPeyBid(openWin);
+          if (pey) {
+            buyer = pey.buyer;
+            amount = pey.amountTry;
+            if (pey.eventId) evidence.push(pey.eventId);
+            if (openWin.aldimClaim) evidence.push(openWin.aldimClaim.eventId);
+            method = isVerbal ? "verbal_win_confirm" : "bid_win_confirm";
+          }
+        }
+
         // Aldım claim + seller later confirms (incl. bare «hayırlı olsun»)
         // Prefer the frozen claimer over later chat bids (glam: «ikisi de sizin»
-        // must not steal @iyiymis via @gnshsgl arithmetic chatter).
-        if (!buyer && !verbalNameMiss && openWin.aldimClaim) {
+        // must not steal @iyiymis via @gnshsgl arithmetic chatter) — unless pey
+        // already escalated above.
+        if (
+          !buyer &&
+          !verbalNameMiss &&
+          openWin.aldimClaim &&
+          !isSellerBuyer(openWin.aldimClaim.buyer)
+        ) {
           buyer = openWin.aldimClaim.buyer;
           amount = amount ?? lotAsk;
           evidence.push(openWin.aldimClaim.eventId);
@@ -3473,7 +3710,22 @@ export function reconcileMezatWindows(
     }
   }
 
-  return dedupeSaleCandidates(sales);
+  // Hard rule: never leave seller / brand-sibling as buyerUsername.
+  const scrubbed = sales.flatMap((s) => {
+    if (!isSellerBuyer(s.buyerUsername)) return [s];
+    // Drop confident auto-sales; keep priced needs_review without seller buyer.
+    if (!s.needsReview && s.confidence >= 0.78) return [];
+    return [
+      {
+        ...s,
+        buyerUsername: undefined,
+        needsReview: true,
+        confidence: Math.min(s.confidence, 0.5),
+        reason: `${s.reason}+seller_buyer_stripped`,
+      },
+    ];
+  });
+  return dedupeSaleCandidates(scrubbed);
 }
 
 function isPricedAskEvent(ev: TimelineEvent): boolean {

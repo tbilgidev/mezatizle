@@ -102,6 +102,9 @@ export {
   matchSpokenNameToBuyer,
   matchSpokenNameHits,
   normalizeClaimOrthography,
+  isSellerFlowerLotEnd,
+  isSellerSideHandle,
+  ALDIM_WORD_RE,
   ALDIM_PRE_ASK_MS,
   ALDIM_CARRY_AFTER_CORRECTION_MS,
   isSellerAldimClosing,
@@ -134,6 +137,7 @@ export {
   type SaleCandidate,
   type SaleMethod,
   type ProductLot,
+  type ReconcileMezatOpts,
 } from "./auction.ts";
 export {
   parseLiveSourceInput,

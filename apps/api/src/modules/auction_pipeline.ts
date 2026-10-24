@@ -4,6 +4,7 @@ import type { Sql } from "@mezatizle/db";
 import {
   explainSaleTr,
   isSaleWorthy,
+  isSellerSideHandle,
   parseAuctionTexts,
   reconcileMezatWindows,
   SALE_MIN_CONFIDENCE,
@@ -201,9 +202,12 @@ export async function segmentAuctionFromSignals(
   const [recMeta] = await sql<{
     duration_seconds: number | null;
     capture_started_at: Date | string | null;
+    instagram_username: string | null;
   }[]>`
-    SELECT duration_seconds, capture_started_at FROM recordings
-    WHERE id = ${recordingId}
+    SELECT r.duration_seconds, r.capture_started_at, s.instagram_username
+    FROM recordings r
+    LEFT JOIN sellers s ON s.id = r.seller_id
+    WHERE r.id = ${recordingId}
   `;
   const durationMs =
     recMeta?.duration_seconds != null &&
@@ -216,6 +220,9 @@ export async function segmentAuctionFromSignals(
   const captureStartedMs = recMeta?.capture_started_at
     ? new Date(recMeta.capture_started_at).getTime()
     : null;
+  const sellerUsername =
+    recMeta?.instagram_username?.trim().replace(/^@/, "").toLowerCase() ||
+    undefined;
 
   const segments = await sql<{
     id: string;
@@ -299,12 +306,13 @@ export async function segmentAuctionFromSignals(
         c.author_username && /^[A-Za-z0-9._]{1,30}$/.test(c.author_username)
           ? c.author_username.toLowerCase()
           : undefined;
-      // Never attach co-host/seller ask authors as buyers; only real bid events
+      // Never attach seller / brand-sibling handles as buyers (ask posts, flowers).
       if (
         author &&
         !signal.buyerHint &&
         signal.eventType === "bid" &&
-        signal.reason !== "seller_aldim_ask"
+        signal.reason !== "seller_aldim_ask" &&
+        !isSellerSideHandle(author, sellerUsername)
       ) {
         signal = { ...signal, buyerHint: author };
       }
@@ -342,13 +350,20 @@ export async function reconcileSales(
       recorded_at: Date | string;
       duration_seconds: number | null;
       storage_path: string | null;
+      instagram_username: string | null;
     }[]
   >`
-    SELECT seller_id, recorded_at, duration_seconds, storage_path
-    FROM recordings WHERE id = ${recordingId}
+    SELECT r.seller_id, r.recorded_at, r.duration_seconds, r.storage_path,
+           s.instagram_username
+    FROM recordings r
+    LEFT JOIN sellers s ON s.id = r.seller_id
+    WHERE r.id = ${recordingId}
   `;
   if (!rec[0]) throw new Error("recording not found");
   const sellerId = rec[0].seller_id;
+  const sellerUsername =
+    rec[0].instagram_username?.trim().replace(/^@/, "").toLowerCase() ||
+    undefined;
   const recordedAt = new Date(rec[0].recorded_at);
   const durationSeconds =
     rec[0].duration_seconds != null &&
@@ -438,6 +453,17 @@ export async function reconcileSales(
     const p = r.payload ?? {};
     const source =
       p.source === "comment" ? "comment" : ("transcript" as const);
+    let buyerHint: string | undefined =
+      typeof p.buyerHint === "string"
+        ? p.buyerHint
+        : typeof p.author === "string" &&
+            p.source === "comment" &&
+            /^[A-Za-z0-9._]{1,30}$/.test(p.author)
+          ? p.author.toLowerCase()
+          : undefined;
+    if (isSellerSideHandle(buyerHint, sellerUsername)) {
+      buyerHint = undefined;
+    }
     return {
       id: r.id,
       offsetMs: Number(r.offset_ms ?? 0),
@@ -447,14 +473,7 @@ export async function reconcileSales(
         p.amountTry != null && Number.isFinite(Number(p.amountTry))
           ? Number(p.amountTry)
           : undefined,
-      buyerHint:
-        typeof p.buyerHint === "string"
-          ? p.buyerHint
-          : typeof p.author === "string" &&
-              p.source === "comment" &&
-              /^[A-Za-z0-9._]{1,30}$/.test(p.author)
-            ? p.author.toLowerCase()
-            : undefined,
+      buyerHint,
       spokenBuyerName:
         typeof p.spokenBuyerName === "string" ? p.spokenBuyerName : undefined,
       reason: typeof p.reason === "string" ? p.reason : undefined,
@@ -476,7 +495,9 @@ export async function reconcileSales(
     };
   });
 
-  const candidates = reconcileMezatWindows(timeline);
+  const candidates = reconcileMezatWindows(timeline, {
+    sellerUsernames: sellerUsername,
+  });
 
   let salesCreated = 0;
   let needsReviewCreated = 0;
