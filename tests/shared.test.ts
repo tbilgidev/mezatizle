@@ -766,11 +766,20 @@ describe("mezat window reconcile", () => {
 
     const sales = reconcileMezatWindows(
       [
+        // Prior lot must not be stolen by priced «32 aldım».
+        ev({
+          id: "prev",
+          offsetMs: 4_904_690,
+          eventType: "price_mention",
+          matched: "27500 TL efendim bunun fiyatı.",
+          amountTry: 27500,
+          reason: "price_mention",
+        }),
         ev({
           id: "ask",
-          offsetMs: 5_069_340,
+          offsetMs: 5_077_620,
           eventType: "price_mention",
-          matched: "32.000 TL.",
+          matched: "32 bin TL.",
           amountTry: 32000,
           reason: "seller_price_line",
         }),
