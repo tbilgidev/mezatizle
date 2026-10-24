@@ -1,0 +1,12 @@
+[Unit]
+Description=Run mezatizle media retention every 6 hours
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=6h
+AccuracySec=5min
+Persistent=true
+Unit=mezatizle-media-retention.service
+
+[Install]
+WantedBy=timers.target

@@ -15,19 +15,23 @@ https://tolga-mini.tailf479ba.ts.net/mezatizle/settings#ig-oturum
 
 Use **your own backup account** (watch/record only). No private API / anti-bot kits. Consent & platform rules are the operator’s responsibility. Secrets are not logged.
 
-## Default quality (disk vs analysis)
+## Default quality (watchable + analyzable)
 
 | Setting | Default | Why |
 |---------|---------|-----|
-| Max height | **720p** | Enough for comment/product OCR; not 1080p bloat |
-| FPS | **20** | Speech + overlays; long lives stay smaller |
-| Video | H.264 **CRF 28**, maxrate ~**1800 kbps**, `veryfast` | Analyzable, compact |
-| Audio | AAC **80 kbps** mono | Enough for Turkish ASR |
+| Max height | **720p** | Size via resolution; never upscale |
+| FPS | **30** CFR | Watchable; **do not** drop to 15–20 for size |
+| Video | H.264 **CRF 26**, maxrate ~**2500 kbps**, `veryfast` | Size via CRF/bitrate |
+| Audio | AAC **96 kbps** mono + `aresample=async=1` | ASR + A/V sync |
+| Capture MP4 | `frag_keyframe+empty_moov+default_base_moof` | Forced stop still readable |
+| Finalize | remux `-c copy +faststart` | Progressive moov for players |
 | yt-dlp `-f` | `best[height<=720]/…` | Prefer ≤720 before ffmpeg |
 
-Pipeline: resolve stream with yt-dlp (`-g`) → **ffmpeg** live encode to `storage/recordings/<id>.mp4`.
+Pipeline: Playwright/yt-dlp resolve → **ffmpeg** encode (fragmented part) → remux master → analysis.
 
 Override via env: `LIVE_MAX_HEIGHT`, `LIVE_FPS`, `LIVE_CRF`, `LIVE_MAXRATE_K`, `LIVE_AUDIO_K`, `LIVE_YTDLP_FORMAT`.
+
+**Comments (required, ban-safe):** Single Playwright viewer — primary `get_comment` poll **3–5s jitter**, secondary DOM scrape **8–15s**, merge by pk / fingerprint into `observed_comments` (`live_api` + `live_dom`). Periodic ~120s cursor catch-up; freeze (0 new ~3 min while live) → soft page refresh **without** killing ffmpeg. On 429 → exponential backoff up to ~12 min. UI: count + last-comment age while kaydediliyor; drought **Yorum yok** / freeze **Yorum durgun**. Ended lives cannot be backfilled. See `docs/live-comments-dual-capture.md` and project store `comment-capture-completeness.md`.
 
 ## Analysis (LOCAL, no mocks)
 
@@ -45,6 +49,10 @@ See also: `docs/ready-for-10min-test.md` (operator checklist + smoke timings).
 - Empty or **0** = record the **entire** live until it ends
 - e.g. `10`, `180` = hard-stop after N minutes (`ffmpeg -t`) even if live continues
 - Whichever comes first (live end **or** duration) → finalize MP4 → enqueue ASR/OCR/sales pipeline
+
+## Auto-follow lives (watcher following list)
+
+When **Ayarlar → Takip canlıları otomatik kaydet** is açık, the API polls the watcher IG following tray every **~5–6 minutes** (jitter) and starts the same live pipeline for a followed account that goes live — at most one concurrent auto recording; the IG scan pauses while any capture is `bekleniyor` / `kaydediliyor`. Manual **Canlı yayın ekle** still works. See Funnel settings `#auto-follow-live` and project store doc `auto-follow-live.md`. Env: `AUTO_FOLLOW_LIVE`, `AUTO_FOLLOW_LIVE_POLL_MS`.
 
 ## Screenshots
 

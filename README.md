@@ -84,7 +84,7 @@ Primary UI action: **Canlı yayın ekle** (`POST /api/recordings/live`).
 Playwright login (spare watcher account), or encrypted username/password. Used as
 `yt-dlp --cookies` / credentials. Secrets never returned after save.
 
-**Capture quality default:** ≤720p, ~20 fps, H.264 CRF 28, AAC 80 kbps mono.
+**Capture quality default:** ≤720p, **30 fps** (no frame-drop size hack), H.264 CRF 26 / ~2.5 Mbps, AAC 96 kbps mono; fragmented MP4 during capture → faststart remux on stop.
 **Duration:** optional minutes on Canlı yayın ekle (empty = entire live).
 
 **Instagram limit:** without a session many lives stay in `bekleniyor` / `engellendi`.

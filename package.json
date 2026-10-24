@@ -15,7 +15,9 @@
     "worker": "cd workers/extractor && ../../.venv/bin/python3 worker.py",
     "start:live": "bash scripts/start-live.sh",
     "synth:fixture": "./.venv/bin/python3 scripts/make-synthetic-live.py",
-    "smoke": "bun run scripts/smoke-pipeline.ts"
+    "smoke": "bun run scripts/smoke-pipeline.ts",
+    "purge:media": "bun run scripts/purge-media-retention.ts",
+    "purge:media:dry": "bun run scripts/purge-media-retention.ts --dry-run"
   },
 
   "dependencies": {

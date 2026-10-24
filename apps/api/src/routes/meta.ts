@@ -13,6 +13,15 @@ import {
 } from "../modules/ig_session.ts";
 import { playwrightIgLogin } from "../modules/ig_playwright_login.ts";
 import { CAPTURE_QUALITY } from "../modules/capture_quality.ts";
+import {
+  getAutoFollowLiveStatus,
+  setAutoFollowLiveConfig,
+  runAutoFollowPollCycle,
+} from "../modules/auto_follow_live.ts";
+import {
+  mediaRetentionDaysFromEnv,
+  mediaRetentionPolicy,
+} from "../modules/media_retention.ts";
 const CAPTURE_POLICY = LIVE_CAPTURE_POLICY;
 
 export function metaRoutes(sql: Sql, env: AppEnv) {
@@ -25,6 +34,7 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
   app.get("/settings", async (c) => {
     const spent = await totalSpendUsd(sql);
     const igSession = await getIgSessionStatus(env);
+    const autoFollowLive = await getAutoFollowLiveStatus(env, sql);
     return c.json({
       profile: env.profile,
       hardSpendLimitUsd: env.hardSpendLimitUsd,
@@ -34,6 +44,8 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
       capture: CAPTURE_POLICY,
       captureQuality: CAPTURE_QUALITY,
       igSession,
+      autoFollowLive,
+      mediaRetention: mediaRetentionPolicy(mediaRetentionDaysFromEnv()),
       storageRoot: env.storageRoot,
       localProviders: {
         asr: {
@@ -50,6 +62,45 @@ export function metaRoutes(sql: Sql, env: AppEnv) {
         },
       },
     });
+  });
+
+  app.get("/settings/auto-follow-live", async (c) => {
+    return c.json(await getAutoFollowLiveStatus(env, sql));
+  });
+
+  app.patch("/settings/auto-follow-live", async (c) => {
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as {
+        enabled?: boolean;
+        pollIntervalMs?: number;
+        priorityUsernames?: string[];
+      };
+      const status = await setAutoFollowLiveConfig(env, {
+        enabled: body.enabled,
+        pollIntervalMs: body.pollIntervalMs,
+        priorityUsernames: body.priorityUsernames,
+      });
+      return c.json(status);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
+  });
+
+  /** Operator dry-run / force one poll cycle (does not require live). */
+  app.post("/settings/auto-follow-live/poll-now", async (c) => {
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as {
+        dryRun?: boolean;
+      };
+      const dryRun = body.dryRun !== false; // default dry-run for safety
+      const cycle = await runAutoFollowPollCycle(sql, env, { dryRun });
+      const status = await getAutoFollowLiveStatus(env, sql);
+      return c.json({ ...status, cycle, dryRun });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return c.json({ error: msg }, 400);
+    }
   });
 
   app.get("/settings/ig-session", async (c) => {

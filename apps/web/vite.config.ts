@@ -1,5 +1,7 @@
+import path from "node:path";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 /**
  * Funnel: https://…ts.net/mezatizle → :43128 (Tailscale path prefix is STRIPPED).
@@ -49,12 +51,16 @@ const proxy = {
 
 export default defineConfig({
   base: BASE,
-  plugins: [react(), funnelBasePlugin()],
+  plugins: [react(), tailwindcss(), funnelBasePlugin()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
   server: {
     host: "127.0.0.1",
     port: 43128,
     allowedHosts: true,
-    // Path Funnel terminates TLS on :443; keep HMR from breaking remote browsers.
     hmr: {
       protocol: "wss",
       clientPort: 443,
