@@ -29,7 +29,7 @@ Last updated: real LOCAL ASR/OCR path verified on tolga-mini (no FORCE_MOCK in l
 | `OCR_ENGINE` | `tesseract` |
 | Frame extract | 1 fps |
 | OCR stride / cap | 3 / 200 frames |
-| Live encode | ≤720p, 20 fps, CRF 28, AAC 80k |
+| Live encode | ≤720p, 30 fps, CRF 26, AAC 96k, frag→faststart remux |
 
 ## Start
 

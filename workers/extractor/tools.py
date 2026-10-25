@@ -79,12 +79,17 @@ def try_faster_whisper(recording_id: str, storage_root: str) -> dict:
 
     import psycopg
 
+    # Commit in batches so a multi-hour mezat ASR is crash-resilient and
+    # progress is visible (afra-class ~3h lives previously wrote 0 until the end).
+    commit_every = max(10, int(os.environ.get("ASR_COMMIT_EVERY", "40")))
+
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM transcript_segments WHERE recording_id = %s",
                 (recording_id,),
             )
+            conn.commit()
             for seg in segments_iter:
                 text = (seg.text or "").strip()
                 if not text:
@@ -110,10 +115,33 @@ def try_faster_whisper(recording_id: str, storage_root: str) -> dict:
                 )
                 texts.append(text)
                 rows += 1
+                if rows % commit_every == 0:
+                    cur.execute(
+                        """
+                        UPDATE recordings SET status = 'transcribing', updated_at = now()
+                        WHERE id = %s
+                          AND status NOT IN ('complete', 'analyzing', 'failed', 'cancelled')
+                        """,
+                        (recording_id,),
+                    )
+                    # Touch running ASR job so analysis-watchdog stale reclaim stays away.
+                    cur.execute(
+                        """
+                        UPDATE processing_jobs
+                        SET updated_at = now(), locked_at = now(),
+                            stage = 'asr',
+                            progress_percent = LEAST(95, 30 + (%s / 50))
+                        WHERE recording_id = %s AND job_type = 'transcribe'
+                          AND status = 'running'
+                        """,
+                        (rows, recording_id),
+                    )
+                    conn.commit()
             cur.execute(
                 """
                 UPDATE recordings SET status = 'transcribing', updated_at = now()
                 WHERE id = %s
+                  AND status NOT IN ('complete', 'analyzing', 'failed', 'cancelled')
                 """,
                 (recording_id,),
             )
