@@ -6,6 +6,10 @@ set -euo pipefail
 export PATH="$HOME/.bun/bin:/usr/local/bin:/usr/bin:$PATH"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Tonight+ : run evening-slot auto-follow binary; shared storage stays on main tree.
+# Without this, a watchdog restart silently reverts to continuous 5–6 min IG poll.
+CODE_ROOT="${MEZATIZLE_CODE_ROOT:-/home/tolga/projects/mezatizle-evening-scan}"
+STORAGE_ROOT="${STORAGE_ROOT:-$ROOT/storage}"
 cd "$ROOT"
 mkdir -p logs
 
@@ -65,26 +69,34 @@ start_api() {
   DATABASE_URL="${DATABASE_URL:-postgres://mezatizle:mezatizle@127.0.0.1:5433/mezatizle}"
   PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python3}"
   YT_DLP_PATH="${YT_DLP_PATH:-$ROOT/.venv/bin/yt-dlp}"
+  if [[ ! -d "$CODE_ROOT/apps/api" ]]; then
+    log "CODE_ROOT missing ($CODE_ROOT) — falling back to ROOT=$ROOT"
+    CODE_ROOT="$ROOT"
+  fi
 
-  nohup env -u FORCE_MOCK_ASR -u FORCE_MOCK_OCR \
-    PROCESSING_PROFILE="${PROCESSING_PROFILE:-LOCAL}" \
-    EMBEDDED_WORKER=1 \
-    LIVE_CAPTURE_SUPERVISOR=1 \
-    DATABASE_URL="$DATABASE_URL" \
-    PYTHON_BIN="$PYTHON_BIN" \
-    YT_DLP_PATH="$YT_DLP_PATH" \
-    WHISPER_MODEL="${WHISPER_MODEL:-small}" \
-    OCR_ENGINE="${OCR_ENGINE:-tesseract}" \
-    TESSERACT_LANG="${TESSERACT_LANG:-tur+eng}" \
-    TESSERACT_CONFIG="${TESSERACT_CONFIG:---psm 6 --oem 1}" \
-    OCR_CROP_FRAC="${OCR_CROP_FRAC:-0.02,0.48,0.62,0.94}" \
-    OCR_FPS="${OCR_FPS:-1}" \
-    FRAME_INTERVAL_SECONDS="${FRAME_INTERVAL_SECONDS:-1}" \
-    OCR_FRAME_STRIDE="${OCR_FRAME_STRIDE:-2}" \
-    OCR_MAX_FRAMES="${OCR_MAX_FRAMES:-320}" \
-    STORAGE_ROOT="$ROOT/storage" \
-    bun run apps/api/src/index.ts >>logs/api.log 2>&1 &
-  echo $! >"$API_PID_FILE"
+  (
+    cd "$CODE_ROOT"
+    nohup env -u FORCE_MOCK_ASR -u FORCE_MOCK_OCR \
+      PROCESSING_PROFILE="${PROCESSING_PROFILE:-LOCAL}" \
+      EMBEDDED_WORKER=1 \
+      LIVE_CAPTURE_SUPERVISOR=1 \
+      AUTO_FOLLOW_LIVE=1 \
+      DATABASE_URL="$DATABASE_URL" \
+      PYTHON_BIN="$PYTHON_BIN" \
+      YT_DLP_PATH="$YT_DLP_PATH" \
+      WHISPER_MODEL="${WHISPER_MODEL:-small}" \
+      OCR_ENGINE="${OCR_ENGINE:-tesseract}" \
+      TESSERACT_LANG="${TESSERACT_LANG:-tur+eng}" \
+      TESSERACT_CONFIG="${TESSERACT_CONFIG:---psm 6 --oem 1}" \
+      OCR_CROP_FRAC="${OCR_CROP_FRAC:-0.02,0.48,0.62,0.94}" \
+      OCR_FPS="${OCR_FPS:-1}" \
+      FRAME_INTERVAL_SECONDS="${FRAME_INTERVAL_SECONDS:-1}" \
+      OCR_FRAME_STRIDE="${OCR_FRAME_STRIDE:-2}" \
+      OCR_MAX_FRAMES="${OCR_MAX_FRAMES:-320}" \
+      STORAGE_ROOT="$STORAGE_ROOT" \
+      bun run apps/api/src/index.ts >>"$ROOT/logs/api.log" 2>&1 &
+    echo $! >"$API_PID_FILE"
+  )
   sleep 2
 }
 
