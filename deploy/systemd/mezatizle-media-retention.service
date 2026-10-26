@@ -1,0 +1,16 @@
+[Unit]
+Description=mezatizle video media retention purge (oneshot)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/tolga/projects/mezatizle
+Environment=HOME=/home/tolga
+Environment=PATH=/home/tolga/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=DATABASE_URL=postgres://mezatizle:mezatizle@127.0.0.1:5433/mezatizle
+Environment=MEDIA_RETENTION_DAYS=7
+Environment=STORAGE_ROOT=/home/tolga/projects/mezatizle/storage
+ExecStart=/home/tolga/projects/mezatizle/scripts/media-retention.sh
+
+[Install]
+WantedBy=default.target

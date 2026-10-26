@@ -91,13 +91,18 @@ export async function completeJob(
 }
 
 export async function failJob(sql: Sql, jobId: string, errorMessage: string) {
+  // ffmpeg banners can be multi‑MB — keep DB/UI readable
+  const msg =
+    errorMessage.length > 2000
+      ? `${errorMessage.slice(0, 500)}\n…\n${errorMessage.slice(-1200)}`
+      : errorMessage;
   await sql`
     UPDATE processing_jobs
     SET status = CASE
           WHEN attempts >= max_attempts THEN 'failed'
           ELSE 'queued'
         END,
-        error_message = ${errorMessage},
+        error_message = ${msg},
         available_at = CASE
           WHEN attempts >= max_attempts THEN available_at
           ELSE now() + interval '15 seconds'

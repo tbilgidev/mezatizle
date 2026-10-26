@@ -55,6 +55,7 @@ export async function transcribeMock(
   await sql`
     UPDATE recordings SET status = 'transcribing', updated_at = now()
     WHERE id = ${recordingId}
+      AND status NOT IN ('complete', 'analyzing', 'failed', 'cancelled')
   `;
   return { segments: lines.length, backend: "mock" };
 }
@@ -87,6 +88,7 @@ export async function tryPythonWorker(
   script: "transcribe" | "ocr",
   recordingId: string,
   env: AppEnv,
+  onHeartbeat?: () => void | Promise<void>,
 ): Promise<{ ok: boolean; backend?: string; detail?: string; [k: string]: unknown }> {
   const workerDir = join(import.meta.dir, "../../../../workers/extractor");
   const python = resolvePythonBin();
@@ -99,7 +101,7 @@ export async function tryPythonWorker(
       env: {
         ...process.env,
         DATABASE_URL: env.databaseUrl,
-        WHISPER_MODEL: process.env.WHISPER_MODEL ?? "base",
+        WHISPER_MODEL: process.env.WHISPER_MODEL ?? "small",
         OCR_ENGINE: process.env.OCR_ENGINE ?? "tesseract",
         OCR_FPS:
           process.env.OCR_FPS ??
@@ -115,9 +117,26 @@ export async function tryPythonWorker(
       },
     },
   );
-  const stdout = await new Response(proc.stdout).text();
-  const stderr = await new Response(proc.stderr).text();
-  const code = await proc.exited;
+  const hb = onHeartbeat
+    ? setInterval(() => {
+        void Promise.resolve(onHeartbeat()).catch(() => {});
+      }, 25_000)
+    : null;
+  let stdout = "";
+  let stderr = "";
+  let code = 1;
+  try {
+    const [outText, errText, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    stdout = outText;
+    stderr = errText;
+    code = exitCode;
+  } finally {
+    if (hb) clearInterval(hb);
+  }
   let parsed: Record<string, unknown> | null = null;
   try {
     const line = stdout.trim().split("\n").filter(Boolean).pop() ?? "";
@@ -126,11 +145,12 @@ export async function tryPythonWorker(
     parsed = null;
   }
   if (code !== 0 || !parsed?.ok) {
+    const detail = String(
+      parsed?.error ?? (stderr || stdout || `exit ${code}`),
+    );
     return {
       ok: false,
-      detail: String(
-        parsed?.error ?? (stderr || stdout || `exit ${code}`),
-      ),
+      detail: detail.length > 1500 ? `${detail.slice(0, 400)}…${detail.slice(-800)}` : detail,
       backend: typeof parsed?.backend === "string" ? parsed.backend : undefined,
     };
   }

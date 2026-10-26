@@ -39,6 +39,8 @@ interface SessionMeta {
   updatedAt?: string;
   lastError?: string | null;
   usernameMasked?: string | null;
+  /** Unmasked cookie-session username (server-only; not returned to clients). */
+  cookieUsername?: string | null;
   hasCookies?: boolean;
   hasCredentials?: boolean;
   externalCookiesPath?: string | null;
@@ -103,11 +105,32 @@ async function localKey(env: AppEnv): Promise<Buffer> {
   return key;
 }
 
-function maskUsername(u: string): string {
-  const s = u.trim();
+export function maskUsername(u: string): string {
+  const s = u.trim().replace(/^@/, "");
   if (s.length <= 2) return "••••";
   if (s.length <= 4) return `${s[0]}••${s[s.length - 1]}`;
   return `${s.slice(0, 2)}••••${s.slice(-2)}`;
+}
+
+/**
+ * Persist the cookie-session username (watcher account) into meta.
+ * Cookies are authoritative for live/auto-follow — not saved credentials.
+ */
+export async function setIgSessionCookieUsername(
+  env: AppEnv,
+  username: string,
+): Promise<void> {
+  const u = username.trim().replace(/^@/, "");
+  if (!u || !/^[A-Za-z0-9._]{1,30}$/.test(u)) return;
+  const meta = await loadMeta(env);
+  const masked = maskUsername(u);
+  if (meta.usernameMasked === masked && meta.cookieUsername === u.toLowerCase()) {
+    return;
+  }
+  meta.usernameMasked = masked;
+  meta.cookieUsername = u.toLowerCase();
+  meta.updatedAt = new Date().toISOString();
+  await saveMeta(env, meta);
 }
 
 function looksLikeNetscapeCookies(text: string): boolean {
@@ -206,6 +229,11 @@ export async function saveIgCookiesText(
   meta.externalCookiesPath = null;
   meta.updatedAt = new Date().toISOString();
   meta.lastError = null;
+  // Stale credential mask (e.g. old ferah*) must not outrank a fresh cookie upload.
+  // Actual cookie username is synced via whoami on auto-follow / live resolve.
+  if (!meta.cookieUsername) {
+    meta.usernameMasked = null;
+  }
   await saveMeta(env, meta);
   return getIgSessionStatus(env);
 }
@@ -296,6 +324,13 @@ export async function setIgSessionLastError(env: AppEnv, err: string | null) {
   meta.lastError = err;
   meta.updatedAt = meta.updatedAt ?? new Date().toISOString();
   await saveMeta(env, meta);
+}
+
+/** Server-side watcher username from last cookie whoami (not exposed via public status). */
+export async function getIgCookieUsername(env: AppEnv): Promise<string | null> {
+  const meta = await loadMeta(env);
+  const u = meta.cookieUsername?.trim().toLowerCase();
+  return u && /^[a-z0-9._]{1,30}$/.test(u) ? u : null;
 }
 
 /** Absolute cookies path for yt-dlp --cookies, or null. */

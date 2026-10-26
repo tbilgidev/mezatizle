@@ -1,0 +1,19 @@
+{
+  "recordingNotes": "Synthetic Turkish auction MP4 from scripts/make-synthetic-live.py",
+  "goldSales": [
+    {
+      "buyerUsername": "mehmet_demo",
+      "amountTry": 700,
+      "mustHaveEvidence": true,
+      "statusDefault": "needs_review"
+    },
+    {
+      "buyerUsername": "ayse_demo",
+      "amountTry": 450,
+      "mustHaveEvidence": true,
+      "statusDefault": "needs_review"
+    }
+  ],
+  "mustNotInventBuyers": ["Mehmet", "Ayşe", "ayse", "mehmet"],
+  "notes": "ASR may miss short phrases; OCR burned comments should carry @handles. Prefer missing sale over wrong buyer."
+}

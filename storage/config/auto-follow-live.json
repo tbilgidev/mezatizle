@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "pollIntervalMs": 330000,
+  "updatedAt": null,
+  "lastPollAt": "2026-10-21T11:44:57.396Z",
+  "lastPollOk": false,
+  "lastError": null,
+  "lastDetail": "Kayıt sürüyor (@glamvintage_ (kaydediliyor)) — takip taraması duraklatıldı.",
+  "lastLivesSeen": [],
+  "priorityUsernames": [
+    "afra.vintagetaki",
+    "glamvintage_",
+    "glamvintage"
+  ]
+}

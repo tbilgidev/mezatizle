@@ -126,8 +126,8 @@ export async function runExtractJob(
   jobId: string,
   recordingId: string,
 ) {
-  const rec = await sql<{ storage_path: string }[]>`
-    SELECT storage_path FROM recordings WHERE id = ${recordingId}
+  const rec = await sql<{ storage_path: string; duration_seconds: number | null }[]>`
+    SELECT storage_path, duration_seconds FROM recordings WHERE id = ${recordingId}
   `;
   if (!rec[0]) throw new Error("recording not found");
   await sql`UPDATE recordings SET status = 'extracting', updated_at = now() WHERE id = ${recordingId}`;
@@ -139,12 +139,21 @@ export async function runExtractJob(
   );
   const framesDir = safeJoinStorage(env.storageRoot, "frames", recordingId);
   const started = performance.now();
-  await extractAudioAndFrames({
+  const extract = await extractAudioAndFrames({
     ffmpegPath: env.ffmpegPath,
+    ffprobePath: env.ffprobePath,
     inputPath: input,
     audioOutPath: audioOut,
     framesDir,
     intervalSeconds: env.frameIntervalSeconds,
+    durationSeconds: rec[0].duration_seconds,
+    onHeartbeat: async () => {
+      await sql`
+        UPDATE processing_jobs
+        SET updated_at = now(), locked_at = now(), stage = 'ffmpeg'
+        WHERE id = ${jobId} AND status = 'running'
+      `;
+    },
   });
   const frameGlob = Array.from(
     new Bun.Glob("*.jpg").scanSync({ cwd: framesDir }),
@@ -156,11 +165,19 @@ export async function runExtractJob(
     unit: "ms",
     recordingId,
     jobId,
-    labels: { frames: frameGlob.length },
+    labels: {
+      frames: frameGlob.length,
+      audioPartial: extract.audioPartial,
+      audioDurationSec: extract.audioDurationSec,
+      frameFps: extract.frameFps,
+    },
   });
   return {
     audioPath: toStorageKey(env.storageRoot, audioOut),
     framesDir: toStorageKey(env.storageRoot, framesDir),
     frameCount: frameGlob.length,
+    audioPartial: extract.audioPartial,
+    audioDurationSec: extract.audioDurationSec,
+    frameFps: extract.frameFps,
   };
 }
