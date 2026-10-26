@@ -71,6 +71,15 @@ export const ALDIM_PRE_ASK_MS = 20_000;
 /** After a correction/void pass, re-attach the discarded aldım to the restated ask. */
 export const ALDIM_CARRY_AFTER_CORRECTION_MS = 90_000;
 
+/**
+ * After the first follower «aldım», a distinct buyer’s later «aldım» at the same
+ * ask (glam jewelry: many 2000/3000 trays in a row) is the *next* lot — confirm
+ * it, do not park as second_claim needs_review. Keep ≥90s so a quick second
+ * claim that belongs on the *next* different ask can still orphan (afra/glam
+ * 30–40s race → next ask). Camera-pan races stay needs_review.
+ */
+export const SAME_PRICE_SEQUENTIAL_MS = 90_000;
+
 const CORRECTION_RE =
   /(düzeltme|duzeltme|yanl[ıi][sş]|iptal(?:\s+edildi)?|geri\s*al|özür|ozur|hata\s*oldu|yanl[ıi][sş]\s*söyled|vazgeç|vazge[cç]|işlem\s*yok|islem\s*yok)/i;
 
@@ -200,7 +209,7 @@ const GEC_KALDIM_RE = /\bge[cç]\s+kald[ıi]m\b/i;
  * Seller end-of-lot marker: flower / bouquet emoji comment (optionally with
  * hearts/prayer). Bare 🌸 closes the open pey or claimed lot.
  */
-const FLOWER_EMOJI_RE = /[🌸🌺🌹🌻🌼💐🌷💮🏵🥀]/u;
+const FLOWER_EMOJI_RE = /[🌸🌺🌹🌻🌼💐🌷💮🏵🥀]/gu;
 
 const BID_RE =
   /((?<![A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû])ald[ıi]m(?![A-Za-zÇĞİÖŞÜçğıöşüÂâÎîÛû])|al[ıi]yorum|ben\s+ald[ıi]m|ben\s*[-:]?\s*\d+|^\s*\+?\s*\d{2,7}\s*(tl|₺|try)?\s*$|artt[ıi]r(?:d[ıi]m)?|arttir|veriyorum|veririm|\+\s*\d{2,7}|bid|benim|üstüne|ustune)/i;
@@ -258,6 +267,24 @@ export function foldTrToken(raw: string): string {
     .replace(/ş/g, "s")
     .replace(/ö/g, "o")
     .replace(/ç/g, "c");
+}
+
+/**
+ * Whisper often mangles «yüz TL» → «yusteyle / üsteyle / üstü / steyle» and
+ * «TL» → «teyle / terele». Normalize before Turkish word amount parse so
+ * «üç bin altı yusteyle» → 3600 (not phantom 3006).
+ */
+export function normalizeAsrPriceOrthography(text: string): string {
+  // Fold first so «üsteyle / ÜSTÜ» match the same ASCII patterns.
+  let t = foldTrToken(text);
+  // «yüz» garbles — ASR often glues TL onto yüz («yusteyle», «üsteyle»).
+  t = t.replace(
+    /\b(yusteyle|yustele|yuzele|yuzle|yuste|yuzte|usteyle|ustele|steyle|ustu)\b/g,
+    "yuz",
+  );
+  // «TL / lira» garbles next to amounts («bin teyle»).
+  t = t.replace(/\b(teyle|terele|tala|teyleydi)\b/g, "lira");
+  return t;
 }
 
 const TR_ONES: Record<string, number> = {
@@ -357,7 +384,7 @@ export function consumeTrNumberTokens(
 }
 
 export function parseTurkishWordAmount(text: string): number | undefined {
-  const folded = foldTrToken(text);
+  const folded = foldTrToken(normalizeAsrPriceOrthography(text));
   const tokens = folded
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
@@ -398,7 +425,7 @@ function clampPriceTry(n: number | undefined): number | undefined {
 
 /** Parse TRY amount: 700 TL, 1.500, on bin, 8 bin lira, üç bin beş yüz. */
 export function parsePriceTry(text: string): number | undefined {
-  const t = text.trim();
+  const t = normalizeAsrPriceOrthography(text).trim();
   // Market-range chatter is not a single ask amount.
   if (PRICE_RANGE_BIN_RE.test(t)) return undefined;
   if (FOREIGN_CURRENCY_RE.test(t)) return undefined;
@@ -422,8 +449,18 @@ export function parsePriceTry(text: string): number | undefined {
     return clampPriceTry(Number(dotted[1].replace(/\./g, "")));
   }
 
-  const digitBin = foldTrToken(t).match(
-    /(\d{1,3})\s*bin(?:\s+(\d{1,3}))?(?=\s|$|lira|tl|try|turk)/,
+  // Prefer word parse when «yüz» (incl. ASR-normalized) is present — «4 bin 2 yüz»
+  // must be 4200, not digitBin 4002.
+  const foldedForBin = foldTrToken(t);
+  if (/\byuz\b/.test(foldedForBin) || /\bbin\b/.test(foldedForBin)) {
+    const wordsFirst = parseTurkishWordAmount(t);
+    if (wordsFirst != null && wordsFirst >= 500) {
+      return clampPriceTry(wordsFirst);
+    }
+  }
+
+  const digitBin = foldedForBin.match(
+    /(\d{1,3})\s*bin(?:\s+(\d{1,3}))?(?=\s|$|lira|tl|try|turk|yuz)/,
   );
   if (digitBin?.[1]) {
     let n = Number(digitBin[1]) * 1000;
@@ -2105,14 +2142,15 @@ export function reconcileMezatWindows(
       });
     } else if (
       ask != null &&
+      ask % 50 === 0 &&
       bidBuyers.length === 0 &&
       !lot.namedMissReview &&
       atMs - lot.openMs >= 20_000 &&
-      ((lot.descriptorTokens?.length ?? 0) > 0 ||
-        PRODUCT_NOUN_RE.test(lot.productHint ?? ""))
+      PRODUCT_NOUN_RE.test(lot.productHint ?? "")
     ) {
       // Priced product intro that never got a clear claim — operator may know
-      // a verbal sale the ASR missed.
+      // a verbal sale the ASR missed. Require a real product noun + round TRY
+      // so ASR crumbs («santiniz unlunda teyle» @ 3005) do not flood review.
       pushNeedsReview({
         offsetMs: lot.openMs,
         amountTry: ask,
@@ -2507,14 +2545,21 @@ export function reconcileMezatWindows(
       // («700 TL.» / «anlaşmalı 190 TL») — that is the glam 2200→700 / 2000→190 bug.
       // A sane different ask (≥55% of opening, or product-cued) starts the next lot
       // so the next buyer’s aldım is not orphaned on the sold window.
+      // Same-TRY «bu da» / settle gap also opens the next glam jewelry lot.
       if (win.aldimClaim || win.claimAskTry != null) {
+        const claimAge = win.aldimClaim
+          ? ev.offsetMs - win.aldimClaim.offsetMs
+          : dtSinceOpen;
+        const samePriceNext =
+          saneAmt != null &&
+          (exactAsk || near) &&
+          (productCue || claimAge >= SAME_PRICE_SEQUENTIAL_MS);
         if (
           saneAmt != null &&
           win.askAmount != null &&
-          !near &&
-          !exactAsk &&
           dtSinceOpen >= LOT_PRODUCT_CUE_MIN_MS &&
-          (!farBelowOpening || strongAsk || productCue)
+          ((!near && !exactAsk && (!farBelowOpening || strongAsk || productCue)) ||
+            samePriceNext)
         ) {
           openLot(ev, saneAmt);
           continue;
@@ -2977,7 +3022,8 @@ export function reconcileMezatWindows(
           win.aldimClaim &&
           win.aldimClaim.buyer !== buyerHint
         ) {
-          // Second follower — try parked lot, else review + orphan for a near-future ask.
+          // Second follower — try parked lot, else same-price sequential confirm
+          // (glam: many 2000/3000 pieces back-to-back) or review for a race.
           const parked = findPendingMatch({
             offsetMs: ev.offsetMs,
             amountTry: saneAsk(ev.amountTry),
@@ -2997,27 +3043,62 @@ export function reconcileMezatWindows(
           } else {
             const ask = lotSaleAsk(win);
             const priced = saneAsk(ev.amountTry) ?? ask;
-            pushNeedsReview({
-              offsetMs: ev.offsetMs,
-              amountTry: priced,
-              buyerUsername: buyerHint,
-              confidence: 0.54,
-              reason: "second_claim_needs_review",
-              saleMethod: "aldim_first_comment",
-              evidenceEventIds: [...win.openEventIds, ev.id],
-              productHint: win.productHint ?? ev.matched.slice(0, 120),
-              askAmountTry: priced,
-              evidenceQuote: ev.matched.slice(0, 200),
-            });
-            orphanClaims.push({
-              buyer: buyerHint,
-              offsetMs: ev.offsetMs,
-              eventId: ev.id,
-              amountTry: saneAsk(ev.amountTry) ?? ev.amountTry,
-              matched: ev.matched,
-              descriptorTokens: descTokens,
-              lotNumber: ev.lotNumber,
-            });
+            const claimAge = ev.offsetMs - win.aldimClaim.offsetMs;
+            if (
+              priced != null &&
+              claimAge >= SAME_PRICE_SEQUENTIAL_MS &&
+              !isSellerBuyer(buyerHint)
+            ) {
+              // Confirm prior claimer, then open an implicit same-price
+              // continuation for this buyer (glam multi-tray at 2000/3000).
+              // Leave the new window open so a third sequential aldım can chain.
+              emitAldimSale(win);
+              win.closed = true;
+              win = {
+                openMs: ev.offsetMs,
+                askAmount: priced,
+                openingAskTry: priced,
+                productHint: win.productHint ?? ev.matched.slice(0, 120),
+                descriptorTokens:
+                  descTokens.length > 0
+                    ? descTokens
+                    : win.descriptorTokens,
+                openEventIds: [ev.id],
+                bids: [],
+                closed: false,
+              };
+              claimLot(win, {
+                buyer: buyerHint,
+                offsetMs: ev.offsetMs,
+                eventId: ev.id,
+                amountTry: priced,
+                matched: ev.matched,
+                descriptorTokens: descTokens,
+              });
+              rememberAsk(ev.offsetMs, priced, win.productHint);
+            } else {
+              pushNeedsReview({
+                offsetMs: ev.offsetMs,
+                amountTry: priced,
+                buyerUsername: buyerHint,
+                confidence: 0.54,
+                reason: "second_claim_needs_review",
+                saleMethod: "aldim_first_comment",
+                evidenceEventIds: [...win.openEventIds, ev.id],
+                productHint: win.productHint ?? ev.matched.slice(0, 120),
+                askAmountTry: priced,
+                evidenceQuote: ev.matched.slice(0, 200),
+              });
+              orphanClaims.push({
+                buyer: buyerHint,
+                offsetMs: ev.offsetMs,
+                eventId: ev.id,
+                amountTry: saneAsk(ev.amountTry) ?? ev.amountTry,
+                matched: ev.matched,
+                descriptorTokens: descTokens,
+                lotNumber: ev.lotNumber,
+              });
+            }
           }
         } else if (
           win.aldimClaim &&
@@ -3832,7 +3913,8 @@ function shouldOpenNewProductLot(opts: {
   // inside the early window (glam «bu elimdeki 2400» after 2200).
   if (productCue && opts.dtOpen >= LOT_PRODUCT_CUE_MIN_MS) {
     if (!exact) return true;
-    // Same ask + product cue («bu da 800» again) = next product, not pan.
+    // Same ask + strong product hand-off («bu da 800» again) = next product.
+    // Do NOT key on bare «olsun/diyelim/mezat» — those restatements are pans.
     if (/\bbu\s+da\b|\bbunlar(?:\s+da)?\b|\bnumara\b|elimdeki|elimde\b/i.test(opts.matched)) {
       return true;
     }
@@ -3842,6 +3924,9 @@ function shouldOpenNewProductLot(opts: {
   // Bare but clearly different ask after settle → new lot (glam «2000 TL'ymiş»
   // after a 2500 window). Prefer under-merge of distinct products.
   if (!exact && !nearOpening && !nearLast) return true;
+  // Bare same-TRY without product cue stays a re-show (camera pan). Same-price
+  // sequential lots open via product cues («bu da») or post-claim settle in
+  // reconcileMezatWindows — not here (would phantom-split dense pans).
   return false;
 }
 

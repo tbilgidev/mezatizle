@@ -300,19 +300,27 @@ export async function segmentAuctionFromSignals(
     ) {
       continue;
     }
-    const signals = parseAuctionTexts(c.body, { source: "comment" });
+    const author =
+      c.author_username && /^[A-Za-z0-9._]{1,30}$/.test(c.author_username)
+        ? c.author_username.toLowerCase()
+        : undefined;
+    const authorIsSeller = isSellerSideHandle(author, sellerUsername);
+    // Seller chat price lines («Küpe 1.500₺») parse like transcript asks.
+    const signals = parseAuctionTexts(c.body, {
+      source: authorIsSeller ? "transcript" : "comment",
+    });
     for (let signal of signals) {
-      const author =
-        c.author_username && /^[A-Za-z0-9._]{1,30}$/.test(c.author_username)
-          ? c.author_username.toLowerCase()
-          : undefined;
+      // Flower lot-end is seller-only — follower 🌸 greetings must not close lots.
+      if (signal.reason === "seller_flower_end" && !authorIsSeller) {
+        continue;
+      }
       // Never attach seller / brand-sibling handles as buyers (ask posts, flowers).
       if (
         author &&
         !signal.buyerHint &&
         signal.eventType === "bid" &&
         signal.reason !== "seller_aldim_ask" &&
-        !isSellerSideHandle(author, sellerUsername)
+        !authorIsSeller
       ) {
         signal = { ...signal, buyerHint: author };
       }

@@ -2353,6 +2353,157 @@ describe("Nunus numbered tray + descriptor claims", () => {
     expect(lots.productsOffered).toBe(3);
     expect(lots.offeredSumTry).toBe(2400);
   });
+
+  test("glam ASR: yusteyle/üsteyle → yüz (not phantom 3006)", () => {
+    expect(parsePriceTry("bu da üç bin altı yusteyle")).toBe(3600);
+    expect(parsePriceTry("iki bin altı üsteyle")).toBe(2600);
+    expect(parsePriceTry("üç bin sekiz üstü eğlen")).toBe(3800);
+    expect(parsePriceTry("Bu da bin teyle olanlardan")).toBe(1000);
+    expect(parsePriceTry("4 bin 2 steyle")).toBe(4200);
+  });
+
+  test("glam: sequential same-price aldım confirms (not needs_review flood)", () => {
+    const sales = reconcileMezatWindows(
+      [
+        ev({
+          id: "ask",
+          offsetMs: 0,
+          eventType: "price_mention",
+          matched: "2 bin lira",
+          amountTry: 2000,
+          reason: "seller_price_line",
+        }),
+        ev({
+          id: "c1",
+          offsetMs: 10_000,
+          eventType: "bid",
+          matched: "Aldım",
+          buyerHint: "roziozdana",
+          reason: "aldim_claim",
+          source: "comment",
+        }),
+        // ≥90s after first claim → next same-price lot (not orphan race)
+        ev({
+          id: "c2",
+          offsetMs: 110_000,
+          eventType: "bid",
+          matched: "Aldım",
+          buyerHint: "hazelykaya",
+          reason: "aldim_claim",
+          source: "comment",
+        }),
+        ev({
+          id: "c3",
+          offsetMs: 220_000,
+          eventType: "bid",
+          matched: "Aldım",
+          buyerHint: "shirleycurly",
+          reason: "aldim_claim",
+          source: "comment",
+        }),
+        ev({
+          id: "c4",
+          offsetMs: 330_000,
+          eventType: "bid",
+          matched: "Aldım",
+          buyerHint: "derya35yilmaz",
+          reason: "aldim_claim",
+          source: "comment",
+        }),
+        ev({
+          id: "end",
+          offsetMs: 360_000,
+          eventType: "pass",
+          matched: "geçiyoruz",
+          reason: "unsold_or_pass",
+        }),
+      ],
+      { sellerUsernames: ["glamvintage_"] },
+    );
+    const conf = sales.filter((s) => !s.needsReview);
+    const buyers = conf.map((s) => s.buyerUsername).sort();
+    expect(conf.length).toBeGreaterThanOrEqual(4);
+    expect(buyers).toContain("roziozdana");
+    expect(buyers).toContain("hazelykaya");
+    expect(buyers).toContain("shirleycurly");
+    expect(buyers).toContain("derya35yilmaz");
+    expect(conf.every((s) => s.amountTry === 2000)).toBe(true);
+    expect(
+      sales.filter((s) => s.needsReview && s.reason === "second_claim_needs_review")
+        .length,
+    ).toBe(0);
+  });
+
+  test("glam: race second aldım (<90s) stays needs_review", () => {
+    const sales = reconcileMezatWindows([
+      ev({
+        id: "ask",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "1500 lira",
+        amountTry: 1500,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "c1",
+        offsetMs: 5_000,
+        eventType: "bid",
+        matched: "Aldım",
+        buyerHint: "a_buyer",
+        reason: "aldim_claim",
+        source: "comment",
+      }),
+      ev({
+        id: "c2",
+        offsetMs: 40_000,
+        eventType: "bid",
+        matched: "Aldım",
+        buyerHint: "b_buyer",
+        reason: "aldim_claim",
+        source: "comment",
+      }),
+    ]);
+    expect(sales.some((s) => s.needsReview && s.buyerUsername === "b_buyer")).toBe(
+      true,
+    );
+  });
+
+  test("glam: post-claim same-TRY «bu da» opens next offered lot", () => {
+    const lots = summarizeOfferWindows([
+      ev({
+        id: "a1",
+        offsetMs: 0,
+        eventType: "price_mention",
+        matched: "Bu da 2000 lira",
+        amountTry: 2000,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "a2",
+        offsetMs: 50_000,
+        eventType: "price_mention",
+        matched: "Bu da 2000 lira",
+        amountTry: 2000,
+        reason: "seller_price_line",
+      }),
+      ev({
+        id: "a3",
+        offsetMs: 100_000,
+        eventType: "price_mention",
+        matched: "bu da 2000 diyelim",
+        amountTry: 2000,
+        reason: "seller_price_line",
+      }),
+    ]);
+    expect(lots.productsOffered).toBe(3);
+    expect(lots.offeredSumTry).toBe(6000);
+  });
+
+  test("glam: seller flower end only — follower 🌸 is not a lot close signal in parse alone", () => {
+    // Parse still tags bare flowers; pipeline drops non-seller authors.
+    expect(isSellerFlowerLotEnd("🌸🌸🌸")).toBe(true);
+    expect(isSellerFlowerLotEnd("Merhabalar🌺")).toBe(false);
+  });
 });
 
 describe("fixture gold labels (rules precision/recall)", () => {
