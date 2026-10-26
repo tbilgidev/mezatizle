@@ -151,13 +151,16 @@ def main() -> int:
                 SET status = 'succeeded', progress_percent = 100, stage = 'done',
                     finished_at = now(), locked_by = NULL, locked_at = NULL,
                     result_json = jsonb_build_object(
-                      'chunked', true, 'segments', %s::int, 'model', %s, 'chunk_sec', %s::int
+                      'chunked', true,
+                      'segments', %s::integer,
+                      'model', %s::text,
+                      'chunk_sec', %s::integer
                     ),
                     error_message = 'chunked ASR complete (tiny slices)',
                     updated_at = now()
                 WHERE id = %s::uuid
                 """,
-                (total_segs, MODEL, CHUNK_SEC, JOB_ID),
+                (int(total_segs), str(MODEL), int(CHUNK_SEC), JOB_ID),
             )
             conn.commit()
     log(f"DONE segs={total_segs}")
