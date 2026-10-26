@@ -22,6 +22,11 @@ const env = loadEnv();
 const sql = createSql(env.databaseUrl);
 const workerId = process.env.WORKER_ID ?? `ts-worker-${process.pid}`;
 const pollMs = Number(process.env.WORKER_POLL_INTERVAL_MS ?? "1500");
+/** Comma-separated allowlist (e.g. segment_auction,reconcile_sales). Empty = all types. */
+const jobTypeFilter = (process.env.WORKER_JOB_TYPES ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 /**
  * Pipeline prerequisites — prevent segment/reconcile from racing ahead of ASR
@@ -62,7 +67,11 @@ export async function prerequisitesMet(
 
 async function processJob() {
   await assertUnderSpendLimit(sql, env.hardSpendLimitUsd);
-  const job = await claimNextJob(sql, workerId);
+  const job = await claimNextJob(
+    sql,
+    workerId,
+    jobTypeFilter.length ? jobTypeFilter : undefined,
+  );
   if (!job) return false;
 
   try {

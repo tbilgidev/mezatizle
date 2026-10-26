@@ -54,12 +54,21 @@ def try_faster_whisper(recording_id: str, storage_root: str) -> dict:
 
     model_size = os.environ.get("WHISPER_MODEL", "base")
     compute = os.environ.get("WHISPER_COMPUTE", "int8")
+    # VAD on multi-hour wavs can thrash RAM and emit 0 segments for a long time;
+    # allow WHISPER_VAD_FILTER=0 for reclaim of long mezats.
+    vad = os.environ.get("WHISPER_VAD_FILTER", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
     model = WhisperModel(model_size, device="cpu", compute_type=compute)
     segments_iter, info = model.transcribe(
         str(audio),
         language="tr",
-        vad_filter=True,
+        vad_filter=vad,
         beam_size=int(os.environ.get("WHISPER_BEAM", "1")),
+        condition_on_previous_text=False,
     )
 
     dsn = os.environ.get("DATABASE_URL")
